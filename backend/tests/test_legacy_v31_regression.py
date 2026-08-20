@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app import SAY_TOOL_SCHEMA, app
+import app as backend_app
 from fastapi.testclient import TestClient
 import jsonschema
 import pyarrow.parquet as pq
@@ -22,6 +22,18 @@ GET_ATOMS_KEYS = {"episode_index", "atoms"}
 SET_ATOMS_KEYS = {"ok", "saved", "path"}
 TIMESTAMPS_KEYS = {"episode_index", "timestamps"}
 EXPORT_KEYS = {"output_dir", "persistent_rows", "event_rows"}
+EXPECTED_SAY_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "say",
+        "description": "Speak a short utterance to the user via the TTS executor.",
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "The verbatim text to speak."}},
+            "required": ["text"],
+        },
+    },
+}
 
 
 def _legacy_atoms() -> list[dict[str, object]]:
@@ -56,7 +68,7 @@ def _legacy_atoms() -> list[dict[str, object]]:
 def test_legacy_v31_atoms_routes_and_export_contract(legacy_v31_dataset: Path, tmp_path: Path) -> None:
     source_path = legacy_v31_dataset / "data" / "chunk-000" / "file-000.parquet"
     source_table = pq.read_table(source_path)
-    client = TestClient(app)
+    client = TestClient(backend_app.app)
     local_path = str(legacy_v31_dataset)
 
     load = client.post("/api/dataset/load", json={"local_path": local_path})
@@ -87,6 +99,19 @@ def test_legacy_v31_atoms_routes_and_export_contract(legacy_v31_dataset: Path, t
     assert saved.json()["ok"] is True
     assert saved.json()["saved"] == 7
     assert saved.json()["path"] == str(legacy_v31_dataset / "meta" / "lerobot_annotations.json")
+
+    annotation_payload = json.loads((legacy_v31_dataset / "meta" / "lerobot_annotations.json").read_text())
+    assert annotation_payload["version"] == 2
+    assert [atom["style"] for atom in annotation_payload["episodes"]["0"]["atoms"]] == [
+        "task_aug",
+        "subtask",
+        "plan",
+        "memory",
+        "interjection",
+        "vqa",
+        None,
+    ]
+    backend_app._states.clear()
 
     atoms = client.get(f"/api/episodes/0/atoms?local_path={local_path}")
     assert atoms.status_code == 200
@@ -122,6 +147,7 @@ def test_legacy_v31_atoms_routes_and_export_contract(legacy_v31_dataset: Path, t
     assert timestamps.json() == {"episode_index": 0, "timestamps": [0.0, 0.1, 0.2]}
 
     output_dir = tmp_path / "exported-legacy-v31"
+    backend_app._states.clear()
     exported = client.post("/api/export", json={"local_path": local_path, "output_dir": str(output_dir)})
     assert exported.status_code == 200
     assert set(exported.json()) == EXPORT_KEYS
@@ -153,6 +179,24 @@ def test_legacy_v31_atoms_routes_and_export_contract(legacy_v31_dataset: Path, t
     assert set(events[0][0]) == {"role", "content", "style", "camera", "tool_calls"}
 
     exported_info = json.loads((output_dir / "meta" / "info.json").read_text())
+    assert set(exported_info) == {
+        "codebase_version",
+        "fps",
+        "total_episodes",
+        "total_frames",
+        "data_path",
+        "features",
+        "tools",
+    }
+    assert set(exported_info["features"]) == {
+        "episode_index",
+        "frame_index",
+        "timestamp",
+        "observation.state",
+        "language_persistent",
+        "language_events",
+    }
+    assert "task_index" not in exported_info["features"]
     assert "tools" not in exported_info["features"]
-    assert exported_info["tools"] == [SAY_TOOL_SCHEMA]
+    assert exported_info["tools"] == [EXPECTED_SAY_TOOL_SCHEMA]
     jsonschema.Draft202012Validator.check_schema(exported_info["tools"][0]["function"]["parameters"])
