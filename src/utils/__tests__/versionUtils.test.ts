@@ -2,7 +2,18 @@ import { describe, expect, test, mock, afterEach } from "bun:test";
 import { proxyHfUrl } from "@/utils/auth";
 import { buildVersionedUrl } from "@/utils/versionUtils";
 
-const originalWindow = globalThis.window;
+const originalWindowDescriptor = Object.getOwnPropertyDescriptor(
+  globalThis,
+  "window",
+);
+
+function restoreDatasetUrl(originalDatasetUrl: string | undefined) {
+  if (originalDatasetUrl === undefined) {
+    delete process.env.DATASET_URL;
+  } else {
+    process.env.DATASET_URL = originalDatasetUrl;
+  }
+}
 
 function installSentinelToken() {
   const values = new Map<string, string>();
@@ -85,10 +96,11 @@ describe("getDatasetVersionAndInfo", () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
-    Object.defineProperty(globalThis, "window", {
-      configurable: true,
-      value: originalWindow,
-    });
+    if (originalWindowDescriptor) {
+      Object.defineProperty(globalThis, "window", originalWindowDescriptor);
+    } else {
+      delete (globalThis as { window?: unknown }).window;
+    }
   });
 
   test("does not attach the token when its final info URL is local", async () => {
@@ -119,7 +131,7 @@ describe("getDatasetVersionAndInfo", () => {
         new Headers(requests[0]?.init?.headers).get("Authorization"),
       ).toBeNull();
     } finally {
-      process.env.DATASET_URL = originalDatasetUrl;
+      restoreDatasetUrl(originalDatasetUrl);
     }
   });
 
@@ -140,7 +152,7 @@ describe("getDatasetVersionAndInfo", () => {
       );
       expect(proxyHfUrl(videoUrl)).toBe(videoUrl);
     } finally {
-      process.env.DATASET_URL = originalDatasetUrl;
+      restoreDatasetUrl(originalDatasetUrl);
     }
   });
 

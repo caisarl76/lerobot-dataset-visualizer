@@ -8,7 +8,10 @@ const localAsset =
 const localVideo =
   "http://127.0.0.1:8000/api/local-datasets/local/pnp_trash/resolve/main/videos/observation.images.ego/chunk-000/file-000.mp4";
 
-const originalWindow = globalThis.window;
+const originalWindowDescriptor = Object.getOwnPropertyDescriptor(
+  globalThis,
+  "window",
+);
 
 function installSentinelToken() {
   const values = new Map<string, string>();
@@ -30,10 +33,11 @@ function installSentinelToken() {
 beforeEach(installSentinelToken);
 
 afterEach(() => {
-  Object.defineProperty(globalThis, "window", {
-    configurable: true,
-    value: originalWindow,
-  });
+  if (originalWindowDescriptor) {
+    Object.defineProperty(globalThis, "window", originalWindowDescriptor);
+  } else {
+    delete (globalThis as { window?: unknown }).window;
+  }
 });
 
 describe("destination-aware Hugging Face authentication", () => {

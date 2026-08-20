@@ -11,8 +11,15 @@ import { PADDING } from "@/utils/constants";
 const AUTH_STORAGE_KEY = "lerobot-viz-oauth";
 const LOCAL_ASSET =
   "http://127.0.0.1:8000/api/local-datasets/local/pnp_trash/resolve/main/data/chunk-000/file-000.parquet";
-const originalWindow = globalThis.window;
+const originalWindowDescriptor = Object.getOwnPropertyDescriptor(
+  globalThis,
+  "window",
+);
 const originalFetch = globalThis.fetch;
+
+function uniqueLocalAssetUrl(suffix: string): string {
+  return `${LOCAL_ASSET}?auth-test=${crypto.randomUUID()}-${suffix}`;
+}
 
 function installSentinelToken() {
   const values = new Map<string, string>();
@@ -33,10 +40,11 @@ function installSentinelToken() {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
-  Object.defineProperty(globalThis, "window", {
-    configurable: true,
-    value: originalWindow,
-  });
+  if (originalWindowDescriptor) {
+    Object.defineProperty(globalThis, "window", originalWindowDescriptor);
+  } else {
+    delete (globalThis as { window?: unknown }).window;
+  }
 });
 
 function headerValue(init?: RequestInit): string | null {
@@ -57,7 +65,7 @@ describe("local asset requests", () => {
     }) as typeof fetch;
 
     await expect(
-      fetchJson(LOCAL_ASSET.replace(".parquet", ".json")),
+      fetchJson(uniqueLocalAssetUrl("metadata").replace(".parquet", ".json")),
     ).resolves.toEqual({
       codebase_version: "v2.1",
     });
@@ -86,7 +94,7 @@ describe("local asset requests", () => {
       );
     }) as typeof fetch;
 
-    const file = await fetchParquetFile(LOCAL_ASSET);
+    const file = await fetchParquetFile(uniqueLocalAssetUrl("whole-file"));
     await file.slice(0, 16);
 
     expect(requests).toHaveLength(2);
@@ -116,7 +124,7 @@ describe("local asset requests", () => {
       );
     }) as typeof fetch;
 
-    const file = await fetchParquetFile(`${LOCAL_ASSET}?range-response`);
+    const file = await fetchParquetFile(uniqueLocalAssetUrl("range-response"));
     await file.slice(0, 16);
 
     expect(requests).toHaveLength(2);
