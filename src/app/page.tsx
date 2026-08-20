@@ -87,10 +87,11 @@ function HomeInner() {
     setShowSuggestions(true);
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(
-          `https://huggingface.co/api/quicksearch?q=${encodeURIComponent(query)}&type=dataset`,
-          { cache: "no-store", headers: authHeaders() },
-        );
+        const url = `https://huggingface.co/api/quicksearch?q=${encodeURIComponent(query)}&type=dataset`;
+        const res = await fetch(url, {
+          cache: "no-store",
+          headers: authHeaders(url),
+        });
         const data = await res.json();
         const ids: string[] = (
           (data.datasets as { id: string }[] | undefined) ?? []

@@ -1,6 +1,25 @@
 import { describe, expect, test, mock, afterEach } from "bun:test";
 import { buildVersionedUrl } from "@/utils/versionUtils";
 
+const originalWindow = globalThis.window;
+
+function installSentinelToken() {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      localStorage: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+      },
+    },
+  });
+  window.localStorage.setItem(
+    "lerobot-viz-oauth",
+    JSON.stringify({ accessToken: "sentinel-hf-token" }),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // buildVersionedUrl — pure function, no mocking needed
 // ---------------------------------------------------------------------------
@@ -65,6 +84,42 @@ describe("getDatasetVersionAndInfo", () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: originalWindow,
+    });
+  });
+
+  test("does not attach the token when its final info URL is local", async () => {
+    installSentinelToken();
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    const info = {
+      codebase_version: "v2.1",
+      features: { action: { dtype: "float32", shape: [1], names: null } },
+    };
+    globalThis.fetch = ((url: string, init?: RequestInit) => {
+      requests.push({ url, init });
+      return Promise.resolve(
+        new Response(JSON.stringify(info), { status: 200 }),
+      );
+    }) as typeof fetch;
+
+    const originalDatasetUrl = process.env.DATASET_URL;
+    try {
+      process.env.DATASET_URL = "http://127.0.0.1:8000/api/local-datasets";
+      const localVersionUtils = await import("../versionUtils?local-auth");
+      await localVersionUtils.getDatasetInfo("local/pnp_trash");
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.url).toBe(
+        "http://127.0.0.1:8000/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json",
+      );
+      expect(
+        new Headers(requests[0]?.init?.headers).get("Authorization"),
+      ).toBeNull();
+    } finally {
+      process.env.DATASET_URL = originalDatasetUrl;
+    }
   });
 
   test("accepts v2.0 codebase_version", async () => {

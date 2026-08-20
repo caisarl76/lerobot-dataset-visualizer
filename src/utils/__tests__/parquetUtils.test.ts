@@ -1,10 +1,99 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   formatStringWithVars,
   arrayToCSV,
+  fetchJson,
+  fetchParquetFile,
   getRows,
 } from "@/utils/parquetUtils";
 import { PADDING } from "@/utils/constants";
+
+const AUTH_STORAGE_KEY = "lerobot-viz-oauth";
+const LOCAL_ASSET =
+  "http://127.0.0.1:8000/api/local-datasets/local/pnp_trash/resolve/main/data/chunk-000/file-000.parquet";
+const originalWindow = globalThis.window;
+const originalFetch = globalThis.fetch;
+
+function installSentinelToken() {
+  const values = new Map<string, string>();
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      localStorage: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+      },
+    },
+  });
+  window.localStorage.setItem(
+    AUTH_STORAGE_KEY,
+    JSON.stringify({ accessToken: "sentinel-hf-token" }),
+  );
+}
+
+afterEach(() => {
+  globalThis.fetch = originalFetch;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: originalWindow,
+  });
+});
+
+function headerValue(init?: RequestInit): string | null {
+  return new Headers(init?.headers).get("Authorization");
+}
+
+describe("local asset requests", () => {
+  test("does not attach the Hugging Face token when fetching local JSON metadata", async () => {
+    installSentinelToken();
+    const requests: RequestInit[] = [];
+    globalThis.fetch = ((_: string, init?: RequestInit) => {
+      requests.push(init ?? {});
+      return Promise.resolve(
+        new Response(JSON.stringify({ codebase_version: "v2.1" }), {
+          status: 200,
+        }),
+      );
+    }) as typeof fetch;
+
+    await expect(
+      fetchJson(LOCAL_ASSET.replace(".parquet", ".json")),
+    ).resolves.toEqual({
+      codebase_version: "v2.1",
+    });
+    expect(requests.map(headerValue)).toEqual([null]);
+  });
+
+  test("does not attach the Hugging Face token to local full and range parquet requests", async () => {
+    installSentinelToken();
+    const requests: RequestInit[] = [];
+    const bytes = new Uint8Array(16).buffer;
+    globalThis.fetch = ((_: string, init?: RequestInit) => {
+      requests.push(init ?? {});
+      if (init?.method === "HEAD") {
+        return Promise.resolve(
+          new Response(null, {
+            status: 200,
+            headers: { "Content-Length": "16" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(bytes.slice(0), {
+          status: 206,
+          headers: { "Content-Length": "16" },
+        }),
+      );
+    }) as typeof fetch;
+
+    const file = await fetchParquetFile(LOCAL_ASSET);
+    await file.slice(0, 16);
+
+    expect(requests).toHaveLength(2);
+    expect(requests.map(headerValue)).toEqual([null, null]);
+    expect(new Headers(requests[1]?.headers).get("Range")).toBe("bytes=0-15");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // formatStringWithVars — used to build v2.x data / video paths at runtime

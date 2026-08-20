@@ -84,7 +84,7 @@ export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
       method: "GET",
       cache: "no-store",
       signal: controller.signal,
-      headers: authHeaders(),
+      headers: authHeaders(testUrl),
     });
 
     clearTimeout(timeoutId);
