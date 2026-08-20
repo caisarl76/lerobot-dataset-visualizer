@@ -51,3 +51,6 @@ backend/__pycache__/
 
 # claude code local settings
 .claude/
+
+# Local Git worktrees
+.worktrees/
