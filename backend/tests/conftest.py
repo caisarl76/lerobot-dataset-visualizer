@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 import sys
 
@@ -16,8 +17,8 @@ if str(TESTS_ROOT) not in sys.path:
 from fixtures import legacy_v31_dataset  # noqa: E402, F401
 
 
-@pytest.fixture(autouse=True)
-def clear_dataset_state() -> None:
+@pytest.fixture
+def clear_dataset_state() -> Iterator[None]:
     """Keep the module-level app cache from crossing test fixture boundaries."""
     import app
 

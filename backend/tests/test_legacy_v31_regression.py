@@ -65,7 +65,9 @@ def _legacy_atoms() -> list[dict[str, object]]:
     ]
 
 
-def test_legacy_v31_atoms_routes_and_export_contract(legacy_v31_dataset: Path, tmp_path: Path) -> None:
+def test_legacy_v31_atoms_routes_and_export_contract(
+    clear_dataset_state: None, legacy_v31_dataset: Path, tmp_path: Path
+) -> None:
     source_path = legacy_v31_dataset / "data" / "chunk-000" / "file-000.parquet"
     source_table = pq.read_table(source_path)
     client = TestClient(backend_app.app)
@@ -139,7 +141,31 @@ def test_legacy_v31_atoms_routes_and_export_contract(legacy_v31_dataset: Path, t
         0.1,
         0.2,
     ]
-    assert atoms.json()["atoms"][-1]["tool_calls"][0]["function"]["name"] == "say"
+    assert [atom["role"] for atom in atoms.json()["atoms"]] == [
+        "user",
+        "assistant",
+        "assistant",
+        "assistant",
+        "user",
+        "user",
+        "assistant",
+    ]
+    assert [atom["content"] for atom in atoms.json()["atoms"]] == [
+        "Sort the table",
+        "Reach for the can",
+        "Then place it in the bin",
+        "The bin is on the right",
+        "Be careful",
+        "Where is the can?",
+        None,
+    ]
+    assert atoms.json()["atoms"][5]["camera"] == "observation.images.front"
+    assert atoms.json()["atoms"][6]["tool_calls"] == [
+        {
+            "type": "function",
+            "function": {"name": "say", "arguments": {"text": "I found it."}},
+        }
+    ]
 
     timestamps = client.get(f"/api/episodes/0/frame_timestamps?local_path={local_path}")
     assert timestamps.status_code == 200
@@ -169,12 +195,75 @@ def test_legacy_v31_atoms_routes_and_export_contract(legacy_v31_dataset: Path, t
 
     persistent = export_table.column("language_persistent").to_pylist()
     events = export_table.column("language_events").to_pylist()
-    assert [atom["style"] for atom in persistent[0]] == ["task_aug", "subtask", "plan", "memory"]
+    assert persistent[0] == [
+        {
+            "role": "user",
+            "content": "Sort the table",
+            "style": "task_aug",
+            "timestamp": 0.0,
+            "camera": None,
+            "tool_calls": None,
+        },
+        {
+            "role": "assistant",
+            "content": "Reach for the can",
+            "style": "subtask",
+            "timestamp": 0.01,
+            "camera": None,
+            "tool_calls": None,
+        },
+        {
+            "role": "assistant",
+            "content": "Then place it in the bin",
+            "style": "plan",
+            "timestamp": 0.02,
+            "camera": None,
+            "tool_calls": None,
+        },
+        {
+            "role": "assistant",
+            "content": "The bin is on the right",
+            "style": "memory",
+            "timestamp": 0.03,
+            "camera": None,
+            "tool_calls": None,
+        },
+    ]
     assert all(rows == persistent[0] for rows in persistent[1:])
-    assert [atom["style"] for atom in events[0]] == ["interjection"]
-    assert [atom["style"] for atom in events[1]] == ["vqa"]
-    assert events[2][0]["style"] is None
-    assert events[2][0]["tool_calls"][0]["function"]["name"] == "say"
+    assert events == [
+        [
+            {
+                "role": "user",
+                "content": "Be careful",
+                "style": "interjection",
+                "camera": None,
+                "tool_calls": None,
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": "Where is the can?",
+                "style": "vqa",
+                "camera": "observation.images.front",
+                "tool_calls": None,
+            }
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "style": None,
+                "camera": None,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "say", "arguments": {"text": "I found it."}},
+                    }
+                ],
+            }
+        ],
+    ]
     assert set(persistent[0][0]) == {"role", "content", "style", "timestamp", "camera", "tool_calls"}
     assert set(events[0][0]) == {"role", "content", "style", "camera", "tool_calls"}
 
