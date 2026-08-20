@@ -31,22 +31,33 @@ Then in another terminal:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import logging
 import os
-import shutil
-from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import Any
 
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pydantic import BaseModel
+
+try:  # Supports both ``import backend.app`` and the legacy ``import app`` entrypoint.
+    from .curation.assets import LocalAssetService
+    from .curation.config import CurationSettings, curation_is_configured
+    from .curation.router import build_curation_router
+    from .curation.source import SourceRegistry
+except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
+    from curation.assets import LocalAssetService
+    from curation.config import CurationSettings, curation_is_configured
+    from curation.router import build_curation_router
+    from curation.source import SourceRegistry
 
 logger = logging.getLogger("lerobot-annotate")
 logging.basicConfig(level=logging.INFO)
@@ -709,13 +720,30 @@ def _do_export(state: DatasetState, output_dir: str | None, copy_videos: bool) -
 
 # --- FastAPI app --------------------------------------------------------------
 
+# Curation is opt-in so an unchanged visualizer installation keeps serving its
+# v3.1 annotation routes. Once any curation variable is provided, settings are
+# deliberately all-or-nothing and source registration happens before serving.
+_curation_settings: CurationSettings | None = None
+_local_asset_service: LocalAssetService | None = None
+if curation_is_configured():
+    _curation_settings = CurationSettings.from_env()
+    _local_asset_service = LocalAssetService(
+        SourceRegistry.from_paths(
+            _curation_settings.dataset_aliases, workspace=_curation_settings.workspace
+        )
+    )
+
 app = FastAPI(title="LeRobot dataset visualizer — annotation backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Never reflect arbitrary origins. A non-curation legacy install does not
+    # expose local assets, so it has no browser origins to allow here.
+    allow_origins=[_curation_settings.browser_origin] if _curation_settings else [],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Accept-Ranges", "Content-Range", "Content-Length", "ETag"],
 )
+app.include_router(build_curation_router(_local_asset_service))
 
 
 @app.get("/api/health")
