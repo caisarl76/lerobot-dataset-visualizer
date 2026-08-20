@@ -64,7 +64,37 @@ describe("local asset requests", () => {
     expect(requests.map(headerValue)).toEqual([null]);
   });
 
-  test("does not attach the Hugging Face token to local full and range parquet requests", async () => {
+  test("does not attach the Hugging Face token when a local parquet server falls back to a whole-file response", async () => {
+    installSentinelToken();
+    const requests: RequestInit[] = [];
+    const bytes = new Uint8Array(16).buffer;
+    globalThis.fetch = ((_: string, init?: RequestInit) => {
+      requests.push(init ?? {});
+      if (init?.method === "HEAD") {
+        return Promise.resolve(
+          new Response(null, {
+            status: 200,
+            headers: { "Content-Length": "16" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(bytes.slice(0), {
+          status: 200,
+          headers: { "Content-Length": "16" },
+        }),
+      );
+    }) as typeof fetch;
+
+    const file = await fetchParquetFile(LOCAL_ASSET);
+    await file.slice(0, 16);
+
+    expect(requests).toHaveLength(2);
+    expect(requests.map(headerValue)).toEqual([null, null]);
+    expect(new Headers(requests[1]?.headers).get("Range")).toBe("bytes=0-15");
+  });
+
+  test("does not attach the Hugging Face token to local parquet range responses", async () => {
     installSentinelToken();
     const requests: RequestInit[] = [];
     const bytes = new Uint8Array(16).buffer;
@@ -86,7 +116,7 @@ describe("local asset requests", () => {
       );
     }) as typeof fetch;
 
-    const file = await fetchParquetFile(LOCAL_ASSET);
+    const file = await fetchParquetFile(`${LOCAL_ASSET}?range-response`);
     await file.slice(0, 16);
 
     expect(requests).toHaveLength(2);

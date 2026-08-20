@@ -1,4 +1,5 @@
 import { describe, expect, test, mock, afterEach } from "bun:test";
+import { proxyHfUrl } from "@/utils/auth";
 import { buildVersionedUrl } from "@/utils/versionUtils";
 
 const originalWindow = globalThis.window;
@@ -117,6 +118,27 @@ describe("getDatasetVersionAndInfo", () => {
       expect(
         new Headers(requests[0]?.init?.headers).get("Authorization"),
       ).toBeNull();
+    } finally {
+      process.env.DATASET_URL = originalDatasetUrl;
+    }
+  });
+
+  test("keeps a video URL built from a local dataset base out of the Hugging Face proxy", async () => {
+    installSentinelToken();
+    const originalDatasetUrl = process.env.DATASET_URL;
+    try {
+      process.env.DATASET_URL = "http://127.0.0.1:8000/api/local-datasets";
+      const localVersionUtils = await import("../versionUtils?local-video");
+      const videoUrl = localVersionUtils.buildVersionedUrl(
+        "local/pnp_trash",
+        "v2.1",
+        "videos/observation.images.ego/chunk-000/file-000.mp4",
+      );
+
+      expect(videoUrl).toBe(
+        "http://127.0.0.1:8000/api/local-datasets/local/pnp_trash/resolve/main/videos/observation.images.ego/chunk-000/file-000.mp4",
+      );
+      expect(proxyHfUrl(videoUrl)).toBe(videoUrl);
     } finally {
       process.env.DATASET_URL = originalDatasetUrl;
     }
