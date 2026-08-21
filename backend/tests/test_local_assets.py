@@ -653,6 +653,21 @@ def test_manifest_rejects_an_existing_workspace_symlink(tmp_path: Path) -> None:
         SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=workspace)
 
 
+def test_manifest_lock_rejects_a_dangling_symlink_without_touching_source(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "asset").write_bytes(b"asset")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside_target = source / "must-not-be-created"
+    (workspace / "source-files.sha256.lock").symlink_to(outside_target)
+
+    with pytest.raises(ValueError, match="manifest lock path must be a regular file"):
+        SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=workspace)
+
+    assert not outside_target.exists()
+
+
 def test_manifest_bytes_are_utf8_path_byte_sorted_and_restart_rejects_source_change(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -705,3 +720,39 @@ def test_manifest_creation_is_serialized_and_recovers_after_failed_install(
     assert not list(workspace.glob(".source-files.sha256.*.tmp"))
     monkeypatch.setattr(source_module, "_install_manifest_no_clobber", original_install)
     assert register()
+
+
+def test_restart_fsyncs_manifest_parent_after_post_link_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "asset").write_bytes(b"asset")
+    workspace = tmp_path / "workspace"
+
+    def register() -> str:
+        return (
+            SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=workspace)
+            .resolve_alias("local", "pnp_trash")
+            .fingerprint
+        )
+
+    real_fsync_directory = source_module._fsync_directory
+    monkeypatch.setattr(
+        source_module,
+        "_fsync_directory",
+        lambda _: (_ for _ in ()).throw(OSError("crash after link")),
+    )
+    with pytest.raises(OSError, match="crash after link"):
+        register()
+    assert (workspace / "source-files.sha256").is_file()
+
+    fsynced: list[Path] = []
+
+    def track_fsync(directory: Path) -> None:
+        fsynced.append(directory)
+        real_fsync_directory(directory)
+
+    monkeypatch.setattr(source_module, "_fsync_directory", track_fsync)
+    assert register()
+    assert fsynced == [workspace]

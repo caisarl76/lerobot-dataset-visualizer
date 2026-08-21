@@ -89,14 +89,41 @@ def _sha256_file(path: Path) -> tuple[str, SourceFileIdentity]:
 
 @contextmanager
 def _manifest_lock(manifest_path: Path) -> Iterator[None]:
-    lock_path = manifest_path.with_name(f"{manifest_path.name}.lock")
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
+    parent_fd = -1
+    lock_fd = -1
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            parent_fd = os.open(
+                manifest_path.parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            if not stat.S_ISDIR(os.fstat(parent_fd).st_mode):
+                raise CurationConfigurationError("manifest parent must be a directory")
+            lock_fd = os.open(
+                f"{manifest_path.name}.lock",
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                raise CurationConfigurationError("manifest lock path must be a regular file")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as error:
+            raise CurationConfigurationError("manifest lock path must be a regular file") from error
         yield
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        if lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -149,6 +176,7 @@ def _persist_manifest(manifest_path: Path, contents: bytes) -> None:
         if _manifest_exists(manifest_path):
             if _read_existing_manifest(manifest_path) != contents:
                 raise CurationConfigurationError("source manifest changed for registered alias")
+            _fsync_directory(manifest_path.parent)
             return
         temporary_fd, temporary_name = tempfile.mkstemp(
             prefix=f".{manifest_path.name}.", suffix=".tmp", dir=manifest_path.parent
@@ -164,6 +192,7 @@ def _persist_manifest(manifest_path: Path, contents: bytes) -> None:
             except FileExistsError:
                 if _read_existing_manifest(manifest_path) != contents:
                     raise CurationConfigurationError("source manifest changed for registered alias")
+                _fsync_directory(manifest_path.parent)
             else:
                 _fsync_directory(manifest_path.parent)
         finally:
