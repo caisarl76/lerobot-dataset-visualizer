@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import importlib.util
+import json
 from pathlib import Path
+import sys
+from uuid import uuid4
 
 from curation.assets import LocalAssetService, _read_interval
 from curation.source import SourceRegistry
+from fastapi.testclient import TestClient
 import pytest
 
 
@@ -129,6 +134,10 @@ def test_asset_full_head_ranges_and_revalidation(local_assets: tuple[LocalAssetS
         ("main", "data/episode.parquet", {"range": "bytes=0-1,3-4"}, 416),
         ("main", "data/episode.parquet", {"range": "letters=0-1"}, 416),
         ("main", "data/episode.parquet", {"range": "bytes=20-30"}, 416),
+        ("main", "data/episode.parquet", {"range": "bytes=+1-2"}, 416),
+        ("main", "data/episode.parquet", {"range": "bytes= 1-2"}, 416),
+        ("main", "data/episode.parquet", {"range": "bytes=1-2 "}, 416),
+        ("main", "data/episode.parquet", {"range": "bytes=١-2"}, 416),
     ],
 )
 def test_asset_rejects_unsafe_requests(
@@ -159,3 +168,100 @@ def test_metadata_is_no_store_and_unknown_alias_is_not_exposed(
     assert episode_metadata.headers["cache-control"] == "no-store"
     unknown = service.serve("local", "not_registered", "main", "meta/info.json", method="GET", headers={})
     assert unknown.status_code == 404
+
+
+@pytest.fixture
+def configured_curation_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Load an isolated app module so curation config cannot touch legacy state."""
+    source = tmp_path / "source"
+    (source / "meta").mkdir(parents=True)
+    (source / "data").mkdir()
+    (source / "meta" / "info.json").write_text(json.dumps({"fps": 50}))
+    (source / "data" / "episode.parquet").write_bytes(b"abcdefghij")
+    isaac = tmp_path / "isaac"
+    isaac.mkdir()
+    environment = {
+        "CURATION_DATASET_ALIASES_JSON": json.dumps({"local/pnp_trash": str(source)}),
+        "CURATION_WORKSPACE": str(tmp_path / "workspace"),
+        "CURATION_OUTPUT": str(tmp_path / "output"),
+        "CURATION_BROWSER_ORIGIN": "http://127.0.0.1:3000",
+        "CURATION_BEARER_TOKEN": "test-token",
+        "COSMOS_BASE_URL": "http://127.0.0.1:8001/v1",
+        "COSMOS_MODEL": "cosmos3-nano",
+        "COSMOS_API_KEY_ENV": "COSMOS_API_KEY",
+        "COSMOS_ENDPOINT_IDENTITY": "h100-cosmos",
+        "ISAAC_GROOT_ROOT": str(isaac),
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    module_name = f"curation_route_test_{uuid4().hex}"
+    app_path = Path(__file__).parents[1] / "app.py"
+    spec = importlib.util.spec_from_file_location(module_name, app_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        with TestClient(module.app) as client:
+            yield client
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_local_asset_route_serves_ranges_and_preserves_head_semantics(
+    configured_curation_client: TestClient,
+) -> None:
+    path = "/api/local-datasets/local/pnp_trash/resolve/main/data/episode.parquet"
+    full = configured_curation_client.get(path)
+    assert full.status_code == 200
+    assert full.content == b"abcdefghij"
+    assert full.headers["content-length"] == "10"
+    assert full.headers["cache-control"] == "private, max-age=0, must-revalidate"
+    etag = full.headers["etag"]
+
+    ranged = configured_curation_client.get(path, headers={"Range": "bytes=2-4"})
+    assert ranged.status_code == 206
+    assert ranged.content == b"cde"
+    assert ranged.headers["content-range"] == "bytes 2-4/10"
+    assert ranged.headers["content-length"] == "3"
+    assert configured_curation_client.get(path, headers={"If-None-Match": etag}).status_code == 304
+
+    head = configured_curation_client.head(path)
+    assert head.status_code == 200
+    assert head.content == b""
+    assert head.headers["content-length"] == "10"
+
+
+def test_local_asset_route_decoding_auth_and_cors_are_fail_closed(
+    configured_curation_client: TestClient,
+) -> None:
+    metadata_path = "/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json"
+    allowed = configured_curation_client.get(metadata_path, headers={"Origin": "http://127.0.0.1:3000"})
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "http://127.0.0.1:3000"
+    exposed = allowed.headers["access-control-expose-headers"].lower()
+    assert {"accept-ranges", "content-range", "content-length", "etag"} <= set(
+        header.strip() for header in exposed.split(",")
+    )
+    assert allowed.headers["cache-control"] == "no-store"
+    encoded_metadata = configured_curation_client.get(
+        "/api/local-datasets/local/pnp_trash/resolve/main/meta%2finfo.json"
+    )
+    assert encoded_metadata.status_code == 200
+    assert encoded_metadata.headers["cache-control"] == "no-store"
+    assert (
+        configured_curation_client.get(metadata_path, headers={"Origin": "http://evil.test"}).headers.get(
+            "access-control-allow-origin"
+        )
+        is None
+    )
+    assert (
+        configured_curation_client.get(metadata_path, headers={"Authorization": "Bearer hf-token"}).status_code
+        == 400
+    )
+    assert (
+        configured_curation_client.get(
+            "/api/local-datasets/local/pnp_trash/resolve/main/%2e%2e/outside.txt"
+        ).status_code
+        == 404
+    )

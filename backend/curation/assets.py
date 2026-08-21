@@ -29,6 +29,10 @@ def _range_interval(value: str, size: int) -> tuple[int, int] | None:
     first, last = specification.split("-", 1)
     if not first and not last:
         return None
+    if first and (not first.isascii() or not first.isdecimal()):
+        return None
+    if last and (not last.isascii() or not last.isdecimal()):
+        return None
     try:
         if not first:
             suffix = int(last)
