@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import multiprocessing
 from pathlib import Path
+from queue import Empty
 import sqlite3
 import time
 from typing import Any
 
 import curation.db as db_module
-from curation.db import CurationDatabase, OptimisticConflict, RetryableDatabaseError, canonical_json
+from curation.db import (
+    CurationDatabase,
+    OptimisticConflict,
+    RetryableDatabaseError,
+    StateTransitionConflict,
+    canonical_json,
+)
 from curation.models import ExportState, JobState, ReviewState
 import pytest
 
@@ -40,9 +47,10 @@ def _hold_immediate_lock(path: str, ready: Any, release: Any) -> None:
         connection.close()
 
 
-def _concurrent_register(path: str, alias: str, ready: Any, result: Any) -> None:
+def _concurrent_register(path: str, alias: str, attempting: Any, result: Any) -> None:
     database = CurationDatabase(Path(path))
-    ready.wait(10)
+    attempting.set()
+    started = time.monotonic()
     try:
         database.register_dataset(
             alias=alias,
@@ -52,9 +60,9 @@ def _concurrent_register(path: str, alias: str, ready: Any, result: Any) -> None
             prompt_template_sha256="b" * 64,
         )
     except Exception as error:  # pragma: no cover - returned to the parent process
-        result.put(type(error).__name__)
+        result.put(("error", type(error).__name__, time.monotonic() - started))
     else:  # pragma: no cover - returned to the parent process
-        result.put("ok")
+        result.put(("ok", None, time.monotonic() - started))
 
 
 def _snapshot_from_order(path: str, order: tuple[int, ...], result: Any) -> None:
@@ -164,6 +172,40 @@ def test_failed_migration_rolls_back_schema_and_user_version(
             ).fetchone()
             is None
         )
+
+
+def test_read_lock_exhaustion_is_retryable_and_closes_the_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _db(tmp_path)
+
+    class LockedConnection:
+        closed = False
+
+        def execute(self, _statement: str, _parameters: object = ()) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = LockedConnection()
+    monkeypatch.setattr(database, "open_connection", lambda: connection)
+    with pytest.raises(RetryableDatabaseError):
+        database.get_dataset(alias="local/pnp_trash")
+    assert connection.closed
+
+
+def test_read_connection_open_lock_exhaustion_is_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _db(tmp_path)
+
+    def locked_open_connection() -> None:
+        raise sqlite3.OperationalError("database is busy")
+
+    monkeypatch.setattr(database, "open_connection", locked_open_connection)
+    with pytest.raises(RetryableDatabaseError):
+        database.get_dataset(alias="local/pnp_trash")
 
 
 def test_v1_schema_enforces_foreign_keys_states_nonnegative_values_and_uniqueness(tmp_path: Path) -> None:
@@ -300,29 +342,54 @@ def test_competing_process_updates_with_the_same_revision_yield_one_commit_and_o
 def test_partial_unique_indexes_allow_only_one_active_job_and_export_per_dataset(tmp_path: Path) -> None:
     database = _db(tmp_path)
     dataset_id = _dataset(database)
-    database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    older_job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
     with pytest.raises(sqlite3.IntegrityError):
         database.create_cosmos_job(dataset_id=dataset_id, configuration={})
-    database.set_cosmos_job_state(dataset_id=dataset_id, state=JobState.COMPLETED)
-    database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    database.set_cosmos_job_state(job_id=older_job["id"], expected_state=JobState.QUEUED, state=JobState.COMPLETED)
+    newer_job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    database.set_cosmos_job_state(job_id=older_job["id"], expected_state=JobState.COMPLETED, state=JobState.FAILED)
+    with pytest.raises(StateTransitionConflict):
+        database.set_cosmos_job_state(
+            job_id=older_job["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING
+        )
+    with database.open_connection() as connection:
+        assert (
+            connection.execute("SELECT state FROM cosmos_jobs WHERE id=?", (newer_job["id"],)).fetchone()[0]
+            == "queued"
+        )
 
     assert not hasattr(database, "create_export")
-    database.create_export_snapshot(
+    older_export = database.create_export_snapshot(
         dataset_id=dataset_id, staging_path="/tmp/staging-a", final_path="/tmp/final-a"
     )
     with pytest.raises(sqlite3.IntegrityError):
         database.create_export_snapshot(
             dataset_id=dataset_id, staging_path="/tmp/staging-b", final_path="/tmp/final-b"
         )
-    database.set_export_state(dataset_id=dataset_id, state=ExportState.FAILED)
-    database.create_export_snapshot(
+    database.set_export_state(
+        export_id=older_export["id"], expected_state=ExportState.QUEUED, state=ExportState.FAILED
+    )
+    newer_export = database.create_export_snapshot(
         dataset_id=dataset_id, staging_path="/tmp/staging-b", final_path="/tmp/final-b"
     )
+    database.set_export_state(
+        export_id=older_export["id"], expected_state=ExportState.FAILED, state=ExportState.FAILED
+    )
+    with pytest.raises(StateTransitionConflict):
+        database.set_export_state(
+            export_id=older_export["id"], expected_state=ExportState.QUEUED, state=ExportState.BUILDING
+        )
+    with database.open_connection() as connection:
+        assert (
+            connection.execute("SELECT state FROM exports WHERE id=?", (newer_export["id"],)).fetchone()[0]
+            == "queued"
+        )
 
 
 def test_audit_events_are_append_only_and_artifacts_are_workspace_relative(tmp_path: Path) -> None:
     database = _db(tmp_path)
     dataset_id = _dataset(database)
+    database.create_episode(dataset_id=dataset_id, source_episode_index=0, source_length=10)
     job_id = database.create_cosmos_job(dataset_id=dataset_id, configuration={})["id"]
     event = database.append_audit_event(dataset_id=dataset_id, actor="curator", operation="saved_draft")
 
@@ -361,6 +428,164 @@ def test_audit_events_are_append_only_and_artifacts_are_workspace_relative(tmp_p
                     """,
                     (f"artifact-{unsafe}", unsafe, "e" * 64),
                 )
+
+
+def test_schema_rejects_cross_dataset_references_and_wrong_artifact_ownership(tmp_path: Path) -> None:
+    database = _db(tmp_path)
+    first_dataset = _dataset(database, "local/first")
+    second_dataset = _dataset(database, "local/second")
+    first_episode = database.create_episode(dataset_id=first_dataset, source_episode_index=0, source_length=10)
+    second_episode = database.create_episode(dataset_id=second_dataset, source_episode_index=1, source_length=10)
+    first_job = database.create_cosmos_job(dataset_id=first_dataset, configuration={})
+    second_job = database.create_cosmos_job(dataset_id=second_dataset, configuration={})
+    first_export = database.create_export_snapshot(
+        dataset_id=first_dataset, staging_path="/tmp/first-staging", final_path="/tmp/first-final"
+    )
+    second_export = database.create_export_snapshot(
+        dataset_id=second_dataset, staging_path="/tmp/second-staging", final_path="/tmp/second-final"
+    )
+    timestamp = "2026-08-21T00:00:00Z"
+
+    with database.open_connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_jobs(
+                    id, dataset_id, parent_job_id, configuration_json, state, total_attempts,
+                    succeeded_attempts, manual_only_attempts, cancel_requested, created_at, updated_at
+                ) VALUES ('cross-parent', ?, ?, '{}', 'queued', 0, 0, 0, 0, ?, ?)
+                """,
+                (second_dataset, first_job["id"], timestamp, timestamp),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_attempts(
+                    id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+                ) VALUES ('cross-attempt', ?, 1, 0, 'queued', ?, ?)
+                """,
+                (first_job["id"], timestamp, timestamp),
+            )
+        connection.execute(
+            """
+            INSERT INTO cosmos_jobs(
+                id, dataset_id, parent_job_id, configuration_json, state, total_attempts,
+                succeeded_attempts, manual_only_attempts, cancel_requested, created_at, updated_at
+            ) VALUES ('same-parent', ?, ?, '{}', 'failed', 0, 0, 0, 0, ?, ?)
+            """,
+            (first_dataset, first_job["id"], timestamp, timestamp),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_jobs SET dataset_id=? WHERE id=?", (second_dataset, first_job["id"]))
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('first-attempt', ?, 0, 0, 'queued', ?, ?)
+            """,
+            (first_job["id"], timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('second-attempt', ?, 0, 1, 'queued', ?, ?)
+            """,
+            (first_job["id"], timestamp, timestamp),
+        )
+        for identifier, attempt_id, kind in (
+            ("first-request", "first-attempt", "request"),
+            ("first-response", "first-attempt", "response"),
+            ("second-request", "second-attempt", "request"),
+            ("first-wrong-kind", "first-attempt", "response"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, attempt_id, kind, relative_path, media_type, byte_size, sha256, created_at
+                ) VALUES (?, ?, ?, ?, 'application/json', 0, ?, ?)
+                """,
+                (identifier, attempt_id, kind, f"cosmos/{identifier}.json", "e" * 64, timestamp),
+            )
+        connection.execute(
+            """
+            UPDATE cosmos_attempts
+            SET request_artifact_id='first-request', response_artifact_id='first-response'
+            WHERE id='first-attempt'
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE cosmos_attempts SET request_artifact_id='second-request' WHERE id='first-attempt'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE cosmos_attempts SET request_artifact_id='first-wrong-kind' WHERE id='first-attempt'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE artifacts SET kind='request' WHERE id='first-response'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM artifacts WHERE id='first-response'")
+
+        for identifier, export_id, kind in (
+            ("first-structural", first_export["id"], "structural_report"),
+            ("first-stats", first_export["id"], "gr00t_stats_report"),
+            ("first-loader", first_export["id"], "gr00t_loader_report"),
+            ("first-final", first_export["id"], "final_consistency_report"),
+            ("second-structural", second_export["id"], "structural_report"),
+            ("first-wrong-export-kind", first_export["id"], "gr00t_stats_report"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, export_id, kind, relative_path, media_type, byte_size, sha256, created_at
+                ) VALUES (?, ?, ?, ?, 'application/json', 0, ?, ?)
+                """,
+                (identifier, export_id, kind, f"exports/{identifier}.json", "f" * 64, timestamp),
+            )
+        connection.execute(
+            """
+            UPDATE exports
+            SET structural_artifact_id='first-structural', gr00t_stats_artifact_id='first-stats',
+                gr00t_loader_artifact_id='first-loader', final_consistency_artifact_id='first-final'
+            WHERE id=?
+            """,
+            (first_export["id"],),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE exports SET structural_artifact_id='second-structural' WHERE id=?", (first_export["id"],)
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE exports SET structural_artifact_id='first-wrong-export-kind' WHERE id=?",
+                (first_export["id"],),
+            )
+
+        connection.execute(
+            """
+            INSERT INTO audit_events(
+                id, dataset_id, actor, operation, episode_id, job_id, export_id, details_json, created_at
+            ) VALUES ('valid-audit', ?, 'curator', 'valid_reference', ?, ?, ?, '{}', ?)
+            """,
+            (first_dataset, first_episode["id"], first_job["id"], first_export["id"], timestamp),
+        )
+
+        for identifier, column, foreign_id in (
+            ("cross-audit-episode", "episode_id", second_episode["id"]),
+            ("cross-audit-job", "job_id", second_job["id"]),
+            ("cross-audit-export", "export_id", second_export["id"]),
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    f"""
+                    INSERT INTO audit_events(id, dataset_id, actor, operation, {column}, details_json, created_at)
+                    VALUES (?, ?, 'curator', 'cross_reference', ?, '{{}}', ?)
+                    """,
+                    (identifier, first_dataset, foreign_id, timestamp),
+                )
+
+    assert first_episode["dataset_id"] == first_dataset
 
 
 def test_approval_snapshot_uses_canonical_json_and_is_independent_of_insert_order(tmp_path: Path) -> None:
@@ -428,7 +653,9 @@ def test_export_snapshot_copies_approved_rows_immutably_in_the_same_transaction(
         dataset_id=dataset_id, staging_path="/tmp/staging", final_path="/tmp/final"
     )
     assert exported["approval_snapshot_sha256"] == database.approval_snapshot(dataset_id=dataset_id)["sha256"]
-    database.set_export_state(dataset_id=dataset_id, state=ExportState.FAILED)
+    database.set_export_state(
+        export_id=exported["id"], expected_state=ExportState.QUEUED, state=ExportState.FAILED
+    )
     database.update_episode(
         dataset_id=dataset_id,
         source_episode_index=3,
@@ -440,6 +667,12 @@ def test_export_snapshot_copies_approved_rows_immutably_in_the_same_transaction(
         copied = connection.execute(
             "SELECT rejection_reason, revision FROM export_episodes WHERE export_id=?", (exported["id"],)
         ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE export_episodes SET rejection_reason='mutated' WHERE export_id=?", (exported["id"],)
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM export_episodes WHERE export_id=?", (exported["id"],))
     assert dict(copied) == {"rejection_reason": None, "revision": 1}
 
 
@@ -447,33 +680,60 @@ def test_lock_exhaustion_is_retryable_and_a_real_process_writer_waits_for_the_lo
     database = _db(tmp_path)
     path = str(database.path)
     context = multiprocessing.get_context("spawn")
-    lock_ready = context.Event()
-    lock_release = context.Event()
     result = context.Queue()
-    holder = context.Process(target=_hold_immediate_lock, args=(path, lock_ready, lock_release))
-    holder.start()
-    assert lock_ready.wait(10)
-
-    started = time.monotonic()
-    with pytest.raises(RetryableDatabaseError):
-        database.register_dataset(
-            alias="local/locked",
-            source_path="/immutable/locked",
-            source_manifest_sha256="a" * 64,
-            prompt_template_version="pnp-trash-prompts-v1",
-            prompt_template_sha256="b" * 64,
+    first_ready = context.Event()
+    first_release = context.Event()
+    second_ready = context.Event()
+    second_release = context.Event()
+    writer_attempting = context.Event()
+    first_holder = context.Process(target=_hold_immediate_lock, args=(path, first_ready, first_release))
+    second_holder: multiprocessing.Process | None = None
+    writer: multiprocessing.Process | None = None
+    try:
+        first_holder.start()
+        assert first_ready.wait(10)
+        writer = context.Process(
+            target=_concurrent_register,
+            args=(path, "local/writer", writer_attempting, result),
         )
-    assert time.monotonic() - started >= 4.5
+        writer.start()
+        assert writer_attempting.wait(10)
+        time.sleep(0.25)
+        assert writer.is_alive()
+        with pytest.raises(Empty):
+            result.get(timeout=0.05)
+        first_release.set()
+        first_holder.join(10)
+        writer.join(10)
+        assert first_holder.exitcode == 0
+        assert writer.exitcode == 0
+        writer_result = result.get(timeout=2)
+        assert writer_result[0] == "ok"
+        assert writer_result[2] >= 0.2
+        assert database.get_dataset(alias="local/writer")["alias"] == "local/writer"
 
-    writer_ready = context.Event()
-    writer = context.Process(target=_concurrent_register, args=(path, "local/writer", writer_ready, result))
-    writer.start()
-    time.sleep(0.1)
-    writer_ready.set()
-    lock_release.set()
-    holder.join(10)
-    writer.join(10)
-    assert holder.exitcode == 0
-    assert writer.exitcode == 0
-    assert result.get(timeout=2) == "ok"
-    assert database.get_dataset(alias="local/writer")["alias"] == "local/writer"
+        second_holder = context.Process(target=_hold_immediate_lock, args=(path, second_ready, second_release))
+        second_holder.start()
+        assert second_ready.wait(10)
+        started = time.monotonic()
+        with pytest.raises(RetryableDatabaseError):
+            database.register_dataset(
+                alias="local/locked",
+                source_path="/immutable/locked",
+                source_manifest_sha256="a" * 64,
+                prompt_template_version="pnp-trash-prompts-v1",
+                prompt_template_sha256="b" * 64,
+            )
+        assert time.monotonic() - started >= 4.5
+    finally:
+        first_release.set()
+        second_release.set()
+        for process in (first_holder, writer, second_holder):
+            if process is None:
+                continue
+            process.join(2)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+        result.close()
+        result.join_thread()

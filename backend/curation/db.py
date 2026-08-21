@@ -22,6 +22,12 @@ from .models import AttemptState, ExportState, JobState, ProposalState, ReviewSt
 
 SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MILLISECONDS = 5_000
+ARTIFACT_KIND_COSMOS_REQUEST = "request"
+ARTIFACT_KIND_COSMOS_RESPONSE = "response"
+ARTIFACT_KIND_STRUCTURAL_REPORT = "structural_report"
+ARTIFACT_KIND_GROOT_STATS_REPORT = "gr00t_stats_report"
+ARTIFACT_KIND_GROOT_LOADER_REPORT = "gr00t_loader_report"
+ARTIFACT_KIND_FINAL_CONSISTENCY_REPORT = "final_consistency_report"
 _STEP_COLUMNS = tuple(f"step_{step}_start_frame" for step in range(2, 8))
 _EPISODE_CHANGE_COLUMNS = frozenset(
     {
@@ -55,6 +61,22 @@ class OptimisticConflict(RuntimeError):
         self.current_episode = current_episode
         self.payload = {"error": "revision_conflict", "episode": current_episode}
         super().__init__("episode revision does not match expected_revision")
+
+
+class StateTransitionConflict(RuntimeError):
+    """A delayed worker attempted a state transition from a stale predecessor."""
+
+    status_code = 409
+
+    def __init__(self, *, entity: str, identifier: str, expected_state: str, current_state: str) -> None:
+        self.payload = {
+            "error": "state_transition_conflict",
+            "entity": entity,
+            "id": identifier,
+            "expected_state": expected_state,
+            "current_state": current_state,
+        }
+        super().__init__(f"{entity} {identifier} is {current_state}, not expected {expected_state}")
 
 
 def canonical_json(value: Any) -> str:
@@ -154,9 +176,19 @@ class CurationDatabase:
 
     @contextmanager
     def _read(self) -> Iterator[sqlite3.Connection]:
-        connection = self.open_connection()
         try:
-            yield connection
+            connection = self.open_connection()
+        except sqlite3.OperationalError as error:
+            if _is_lock_error(error):
+                raise RetryableDatabaseError("curation database is busy; retry the operation") from error
+            raise
+        try:
+            try:
+                yield connection
+            except sqlite3.OperationalError as error:
+                if _is_lock_error(error):
+                    raise RetryableDatabaseError("curation database is busy; retry the operation") from error
+                raise
         finally:
             connection.close()
 
@@ -309,15 +341,22 @@ class CurationDatabase:
                 connection.execute("SELECT * FROM cosmos_jobs WHERE id=?", (identifier,)).fetchone()
             )
 
-    def set_cosmos_job_state(self, *, dataset_id: int, state: JobState) -> dict[str, Any]:
+    def set_cosmos_job_state(self, *, job_id: str, expected_state: JobState, state: JobState) -> dict[str, Any]:
         with self._write() as connection:
             current = _require_row(
                 connection.execute(
-                    "SELECT * FROM cosmos_jobs WHERE dataset_id=? ORDER BY created_at DESC, id DESC LIMIT 1",
-                    (dataset_id,),
+                    "SELECT * FROM cosmos_jobs WHERE id=?",
+                    (job_id,),
                 ).fetchone(),
                 "Cosmos job not found",
             )
+            if current["state"] != expected_state.value:
+                raise StateTransitionConflict(
+                    entity="cosmos_job",
+                    identifier=job_id,
+                    expected_state=expected_state.value,
+                    current_state=current["state"],
+                )
             connection.execute(
                 "UPDATE cosmos_jobs SET state=?, updated_at=? WHERE id=?", (state.value, _utc_now(), current["id"])
             )
@@ -385,15 +424,24 @@ class CurationDatabase:
                 )
             return _require_row(connection.execute("SELECT * FROM exports WHERE id=?", (identifier,)).fetchone())
 
-    def set_export_state(self, *, dataset_id: int, state: ExportState) -> dict[str, Any]:
+    def set_export_state(
+        self, *, export_id: str, expected_state: ExportState, state: ExportState
+    ) -> dict[str, Any]:
         with self._write() as connection:
             current = _require_row(
                 connection.execute(
-                    "SELECT * FROM exports WHERE dataset_id=? ORDER BY created_at DESC, id DESC LIMIT 1",
-                    (dataset_id,),
+                    "SELECT * FROM exports WHERE id=?",
+                    (export_id,),
                 ).fetchone(),
                 "export not found",
             )
+            if current["state"] != expected_state.value:
+                raise StateTransitionConflict(
+                    entity="export",
+                    identifier=export_id,
+                    expected_state=expected_state.value,
+                    current_state=current["state"],
+                )
             connection.execute(
                 "UPDATE exports SET state=?, updated_at=? WHERE id=?", (state.value, _utc_now(), current["id"])
             )
@@ -726,5 +774,197 @@ def _migration_v1_statements() -> tuple[str, ...]:
         CREATE TRIGGER audit_events_no_delete
         BEFORE DELETE ON audit_events
         BEGIN SELECT RAISE(ABORT, 'audit_events are append-only'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_jobs_parent_dataset_insert
+        BEFORE INSERT ON cosmos_jobs
+        BEGIN
+            SELECT RAISE(ABORT, 'parent job must belong to the same dataset')
+            WHERE NEW.parent_job_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM cosmos_jobs AS parent
+                WHERE parent.id=NEW.parent_job_id AND parent.dataset_id=NEW.dataset_id
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_jobs_parent_dataset_update
+        BEFORE UPDATE OF parent_job_id, dataset_id ON cosmos_jobs
+        BEGIN
+            SELECT RAISE(ABORT, 'parent job must belong to the same dataset')
+            WHERE NEW.parent_job_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM cosmos_jobs AS parent
+                WHERE parent.id=NEW.parent_job_id AND parent.dataset_id=NEW.dataset_id
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_jobs_dataset_immutable
+        BEFORE UPDATE OF dataset_id ON cosmos_jobs
+        BEGIN SELECT RAISE(ABORT, 'job dataset is immutable'); END
+        """,
+        """
+        CREATE TRIGGER episodes_dataset_immutable
+        BEFORE UPDATE OF dataset_id ON episodes
+        BEGIN SELECT RAISE(ABORT, 'episode dataset is immutable'); END
+        """,
+        """
+        CREATE TRIGGER exports_dataset_immutable
+        BEFORE UPDATE OF dataset_id ON exports
+        BEGIN SELECT RAISE(ABORT, 'export dataset is immutable'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_attempts_episode_dataset_insert
+        BEFORE INSERT ON cosmos_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'attempt episode must belong to the job dataset')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM cosmos_jobs AS job
+                JOIN episodes AS episode ON episode.dataset_id=job.dataset_id
+                WHERE job.id=NEW.job_id AND episode.source_episode_index=NEW.source_episode_index
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_attempts_episode_dataset_update
+        BEFORE UPDATE OF job_id, source_episode_index ON cosmos_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'attempt episode must belong to the job dataset')
+            WHERE NOT EXISTS (
+                SELECT 1 FROM cosmos_jobs AS job
+                JOIN episodes AS episode ON episode.dataset_id=job.dataset_id
+                WHERE job.id=NEW.job_id AND episode.source_episode_index=NEW.source_episode_index
+            );
+        END
+        """,
+        f"""
+        CREATE TRIGGER cosmos_attempts_artifact_ownership_insert
+        BEFORE INSERT ON cosmos_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'request artifact must belong to this attempt and be request')
+            WHERE NEW.request_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.request_artifact_id AND attempt_id=NEW.id AND kind='{ARTIFACT_KIND_COSMOS_REQUEST}'
+            );
+            SELECT RAISE(ABORT, 'response artifact must belong to this attempt and be response')
+            WHERE NEW.response_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.response_artifact_id AND attempt_id=NEW.id AND kind='{ARTIFACT_KIND_COSMOS_RESPONSE}'
+            );
+        END
+        """,
+        f"""
+        CREATE TRIGGER cosmos_attempts_artifact_ownership_update
+        BEFORE UPDATE OF id, request_artifact_id, response_artifact_id ON cosmos_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'request artifact must belong to this attempt and be request')
+            WHERE NEW.request_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.request_artifact_id AND attempt_id=NEW.id AND kind='{ARTIFACT_KIND_COSMOS_REQUEST}'
+            );
+            SELECT RAISE(ABORT, 'response artifact must belong to this attempt and be response')
+            WHERE NEW.response_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.response_artifact_id AND attempt_id=NEW.id AND kind='{ARTIFACT_KIND_COSMOS_RESPONSE}'
+            );
+        END
+        """,
+        f"""
+        CREATE TRIGGER exports_artifact_ownership_insert
+        BEFORE INSERT ON exports
+        BEGIN
+            SELECT RAISE(ABORT, 'structural artifact must belong to this export and be structural_report')
+            WHERE NEW.structural_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.structural_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_STRUCTURAL_REPORT}'
+            );
+            SELECT RAISE(ABORT, 'stats artifact must belong to this export and be gr00t_stats_report')
+            WHERE NEW.gr00t_stats_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.gr00t_stats_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_GROOT_STATS_REPORT}'
+            );
+            SELECT RAISE(ABORT, 'loader artifact must belong to this export and be gr00t_loader_report')
+            WHERE NEW.gr00t_loader_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.gr00t_loader_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_GROOT_LOADER_REPORT}'
+            );
+            SELECT RAISE(ABORT, 'final artifact must belong to this export and be final_consistency_report')
+            WHERE NEW.final_consistency_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.final_consistency_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_FINAL_CONSISTENCY_REPORT}'
+            );
+        END
+        """,
+        f"""
+        CREATE TRIGGER exports_artifact_ownership_update
+        BEFORE UPDATE OF id, structural_artifact_id, gr00t_stats_artifact_id, gr00t_loader_artifact_id,
+            final_consistency_artifact_id ON exports
+        BEGIN
+            SELECT RAISE(ABORT, 'structural artifact must belong to this export and be structural_report')
+            WHERE NEW.structural_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.structural_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_STRUCTURAL_REPORT}'
+            );
+            SELECT RAISE(ABORT, 'stats artifact must belong to this export and be gr00t_stats_report')
+            WHERE NEW.gr00t_stats_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.gr00t_stats_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_GROOT_STATS_REPORT}'
+            );
+            SELECT RAISE(ABORT, 'loader artifact must belong to this export and be gr00t_loader_report')
+            WHERE NEW.gr00t_loader_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.gr00t_loader_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_GROOT_LOADER_REPORT}'
+            );
+            SELECT RAISE(ABORT, 'final artifact must belong to this export and be final_consistency_report')
+            WHERE NEW.final_consistency_artifact_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM artifacts
+                WHERE id=NEW.final_consistency_artifact_id AND export_id=NEW.id
+                    AND kind='{ARTIFACT_KIND_FINAL_CONSISTENCY_REPORT}'
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER audit_events_dataset_ownership_insert
+        BEFORE INSERT ON audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'audit episode must belong to the audit dataset')
+            WHERE NEW.episode_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM episodes WHERE id=NEW.episode_id AND dataset_id=NEW.dataset_id
+            );
+            SELECT RAISE(ABORT, 'audit job must belong to the audit dataset')
+            WHERE NEW.job_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM cosmos_jobs WHERE id=NEW.job_id AND dataset_id=NEW.dataset_id
+            );
+            SELECT RAISE(ABORT, 'audit export must belong to the audit dataset')
+            WHERE NEW.export_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM exports WHERE id=NEW.export_id AND dataset_id=NEW.dataset_id
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER artifacts_no_update
+        BEFORE UPDATE ON artifacts
+        BEGIN SELECT RAISE(ABORT, 'artifacts are immutable'); END
+        """,
+        """
+        CREATE TRIGGER artifacts_no_delete
+        BEFORE DELETE ON artifacts
+        BEGIN SELECT RAISE(ABORT, 'artifacts are immutable'); END
+        """,
+        """
+        CREATE TRIGGER export_episodes_no_update
+        BEFORE UPDATE ON export_episodes
+        BEGIN SELECT RAISE(ABORT, 'export_episodes are immutable'); END
+        """,
+        """
+        CREATE TRIGGER export_episodes_no_delete
+        BEFORE DELETE ON export_episodes
+        BEGIN SELECT RAISE(ABORT, 'export_episodes are immutable'); END
         """,
     )
