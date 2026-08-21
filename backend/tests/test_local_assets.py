@@ -11,6 +11,12 @@ from curation.source import SourceRegistry
 from fastapi.testclient import TestClient
 import pytest
 
+_ASSET_ROUTE = "/api/local-datasets/{org}/{dataset}/resolve/{revision}/{path}"
+
+
+def _route_path(path: str, *, org: str = "local", dataset: str = "pnp_trash", revision: str = "main") -> str:
+    return _ASSET_ROUTE.format(org=org, dataset=dataset, revision=revision, path=path)
+
 
 @pytest.fixture
 def local_assets(tmp_path: Path) -> tuple[LocalAssetService, Path, Path]:
@@ -176,8 +182,15 @@ def configured_curation_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     source = tmp_path / "source"
     (source / "meta").mkdir(parents=True)
     (source / "data").mkdir()
+    (source / "videos").mkdir()
     (source / "meta" / "info.json").write_text(json.dumps({"fps": 50}))
+    (source / "meta" / "tasks.jsonl").write_bytes(b'{"task_index": 0}\n')
     (source / "data" / "episode.parquet").write_bytes(b"abcdefghij")
+    (source / "videos" / "episode.mp4").write_bytes(b"0123456789")
+    (source / "not-a-file").mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    (source / "escaping-link").symlink_to(outside)
     isaac = tmp_path / "isaac"
     isaac.mkdir()
     environment = {
@@ -208,34 +221,110 @@ def configured_curation_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         sys.modules.pop(module_name, None)
 
 
-def test_local_asset_route_serves_ranges_and_preserves_head_semantics(
+@pytest.mark.parametrize(
+    "asset_path,expected_body,mime_type,cache_control",
+    [
+        ("meta/info.json", b'{"fps": 50}', "application/json", "no-store"),
+        ("meta/tasks.jsonl", b'{"task_index": 0}\n', "application/x-ndjson", "no-store"),
+        (
+            "data/episode.parquet",
+            b"abcdefghij",
+            "application/vnd.apache.parquet",
+            "private, max-age=0, must-revalidate",
+        ),
+        ("videos/episode.mp4", b"0123456789", "video/mp4", "private, max-age=0, must-revalidate"),
+    ],
+)
+def test_local_asset_route_get_and_head_headers_for_every_browser_asset_type(
     configured_curation_client: TestClient,
+    asset_path: str,
+    expected_body: bytes,
+    mime_type: str,
+    cache_control: str,
 ) -> None:
-    path = "/api/local-datasets/local/pnp_trash/resolve/main/data/episode.parquet"
-    full = configured_curation_client.get(path)
-    assert full.status_code == 200
-    assert full.content == b"abcdefghij"
-    assert full.headers["content-length"] == "10"
-    assert full.headers["cache-control"] == "private, max-age=0, must-revalidate"
-    etag = full.headers["etag"]
+    response = configured_curation_client.get(_route_path(asset_path))
+    assert response.status_code == 200
+    assert response.content == expected_body
+    assert response.headers["content-length"] == str(len(expected_body))
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-type"].startswith(mime_type)
+    assert response.headers["cache-control"] == cache_control
+    assert response.headers["etag"]
+    assert "content-encoding" not in response.headers
 
-    ranged = configured_curation_client.get(path, headers={"Range": "bytes=2-4"})
-    assert ranged.status_code == 206
-    assert ranged.content == b"cde"
-    assert ranged.headers["content-range"] == "bytes 2-4/10"
-    assert ranged.headers["content-length"] == "3"
-    assert configured_curation_client.get(path, headers={"If-None-Match": etag}).status_code == 304
-
-    head = configured_curation_client.head(path)
+    head = configured_curation_client.head(_route_path(asset_path))
     assert head.status_code == 200
     assert head.content == b""
-    assert head.headers["content-length"] == "10"
+    for name in ("content-length", "accept-ranges", "content-type", "cache-control", "etag"):
+        assert head.headers[name] == response.headers[name]
+    assert "content-encoding" not in head.headers
+
+
+@pytest.mark.parametrize(
+    "range_value,expected_body,content_range",
+    [
+        ("bytes=2-4", b"cde", "bytes 2-4/10"),
+        ("bytes=7-", b"hij", "bytes 7-9/10"),
+        ("bytes=-2", b"ij", "bytes 8-9/10"),
+    ],
+)
+def test_local_asset_route_supports_all_single_range_forms(
+    configured_curation_client: TestClient,
+    range_value: str,
+    expected_body: bytes,
+    content_range: str,
+) -> None:
+    response = configured_curation_client.get(_route_path("data/episode.parquet"), headers={"Range": range_value})
+    assert response.status_code == 206
+    assert response.content == expected_body
+    assert response.headers["content-range"] == content_range
+    assert response.headers["content-length"] == str(len(expected_body))
+
+
+def test_local_asset_route_revalidates_etags_and_honors_if_range(
+    configured_curation_client: TestClient,
+) -> None:
+    path = _route_path("data/episode.parquet")
+    etag = configured_curation_client.get(path).headers["etag"]
+
+    not_modified = configured_curation_client.get(path, headers={"If-None-Match": etag})
+    assert not_modified.status_code == 304
+    assert not_modified.content == b""
+    matching_range = configured_curation_client.get(path, headers={"Range": "bytes=0-1", "If-Range": etag})
+    assert matching_range.status_code == 206
+    assert matching_range.content == b"ab"
+    mismatched_range = configured_curation_client.get(
+        path, headers={"Range": "bytes=0-1", "If-Range": '"not-the-etag"'}
+    )
+    assert mismatched_range.status_code == 200
+    assert mismatched_range.content == b"abcdefghij"
+
+
+@pytest.mark.parametrize(
+    "range_value",
+    [
+        "bytes=0-1,3-4",
+        "letters=0-1",
+        "bytes=20-30",
+        "bytes=+1-2",
+        "bytes= 1-2",
+        "bytes=1-2 ",
+        b"bytes=\xd9\xa1-2",  # Raw UTF-8: httpx refuses Unicode header strings before ASGI.
+    ],
+)
+def test_local_asset_route_rejects_malformed_or_multiple_ranges(
+    configured_curation_client: TestClient, range_value: str | bytes
+) -> None:
+    response = configured_curation_client.get(_route_path("data/episode.parquet"), headers={"Range": range_value})
+    assert response.status_code == 416
+    assert response.headers["content-range"] == "bytes */10"
+    assert response.content == b""
 
 
 def test_local_asset_route_decoding_auth_and_cors_are_fail_closed(
     configured_curation_client: TestClient,
 ) -> None:
-    metadata_path = "/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json"
+    metadata_path = _route_path("meta/info.json")
     allowed = configured_curation_client.get(metadata_path, headers={"Origin": "http://127.0.0.1:3000"})
     assert allowed.status_code == 200
     assert allowed.headers["access-control-allow-origin"] == "http://127.0.0.1:3000"
@@ -244,9 +333,7 @@ def test_local_asset_route_decoding_auth_and_cors_are_fail_closed(
         header.strip() for header in exposed.split(",")
     )
     assert allowed.headers["cache-control"] == "no-store"
-    encoded_metadata = configured_curation_client.get(
-        "/api/local-datasets/local/pnp_trash/resolve/main/meta%2finfo.json"
-    )
+    encoded_metadata = configured_curation_client.get(_route_path("meta%2finfo.json"))
     assert encoded_metadata.status_code == 200
     assert encoded_metadata.headers["cache-control"] == "no-store"
     assert (
@@ -259,9 +346,27 @@ def test_local_asset_route_decoding_auth_and_cors_are_fail_closed(
         configured_curation_client.get(metadata_path, headers={"Authorization": "Bearer hf-token"}).status_code
         == 400
     )
-    assert (
-        configured_curation_client.get(
-            "/api/local-datasets/local/pnp_trash/resolve/main/%2e%2e/outside.txt"
-        ).status_code
-        == 404
-    )
+    assert configured_curation_client.get(_route_path("%2e%2e/outside.txt")).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "org,dataset,revision,asset_path",
+    [
+        ("not_registered", "pnp_trash", "main", "meta/info.json"),
+        ("local", "pnp_trash", "other", "meta/info.json"),
+        ("local", "pnp_trash", "main", "/etc/passwd"),
+        ("local", "pnp_trash", "main", "../outside.txt"),
+        ("local", "pnp_trash", "main", "%2e%2e/outside.txt"),
+        ("local", "pnp_trash", "main", "escaping-link"),
+        ("local", "pnp_trash", "main", "not-a-file"),
+    ],
+)
+def test_local_asset_route_rejects_unregistered_or_unsafe_targets(
+    configured_curation_client: TestClient,
+    org: str,
+    dataset: str,
+    revision: str,
+    asset_path: str,
+) -> None:
+    response = configured_curation_client.get(_route_path(asset_path, org=org, dataset=dataset, revision=revision))
+    assert response.status_code == 404
