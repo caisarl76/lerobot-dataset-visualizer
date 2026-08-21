@@ -325,38 +325,6 @@ class CurationDatabase:
                 connection.execute("SELECT * FROM cosmos_jobs WHERE id=?", (current["id"],)).fetchone()
             )
 
-    def create_export(
-        self,
-        *,
-        dataset_id: int,
-        approval_snapshot_sha256: str,
-        staging_path: str,
-        final_path: str,
-    ) -> dict[str, Any]:
-        identifier = str(uuid4())
-        now = _utc_now()
-        with self._write() as connection:
-            connection.execute(
-                """
-                INSERT INTO exports(
-                    id, dataset_id, state, approval_snapshot_sha256, staging_path,
-                    final_path, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    identifier,
-                    dataset_id,
-                    ExportState.QUEUED.value,
-                    approval_snapshot_sha256,
-                    staging_path,
-                    final_path,
-                    now,
-                    now,
-                ),
-            )
-            return _require_row(connection.execute("SELECT * FROM exports WHERE id=?", (identifier,)).fetchone())
-
     def create_export_snapshot(self, *, dataset_id: int, staging_path: str, final_path: str) -> dict[str, Any]:
         """Freeze approved rows and their hash before any exporter work begins."""
         identifier = str(uuid4())

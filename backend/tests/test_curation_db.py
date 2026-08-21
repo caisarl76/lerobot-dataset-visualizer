@@ -82,6 +82,34 @@ def _snapshot_from_order(path: str, order: tuple[int, ...], result: Any) -> None
     result.put(database.approval_snapshot(dataset_id=dataset_id)["sha256"])
 
 
+def _competing_episode_update(
+    path: str,
+    dataset_id: int,
+    source_episode_index: int,
+    object_name: str,
+    ready: Any,
+    release: Any,
+    result: Any,
+) -> None:
+    database = CurationDatabase(Path(path))
+    ready.set()
+    release.wait(10)
+    try:
+        episode = database.update_episode(
+            dataset_id=dataset_id,
+            source_episode_index=source_episode_index,
+            expected_revision=0,
+            changes={"review_state": ReviewState.DRAFT, "object_name": object_name},
+            actor=f"curator-{object_name}",
+        )
+    except OptimisticConflict as error:  # pragma: no cover - returned to parent process
+        result.put(("conflict", error.current_episode["object_name"], error.current_episode["revision"]))
+    except Exception as error:  # pragma: no cover - returned to parent process
+        result.put(("error", type(error).__name__, str(error)))
+    else:  # pragma: no cover - returned to parent process
+        result.put(("committed", episode["object_name"], episode["revision"]))
+
+
 def test_independent_connections_apply_required_pragmas_and_idempotent_migration(tmp_path: Path) -> None:
     path = tmp_path / "curation.sqlite3"
     database = CurationDatabase(path)
@@ -232,6 +260,43 @@ def test_episode_updates_are_optimistic_and_report_the_current_http_ready_payloa
     assert database.get_episode(dataset_id=dataset_id, source_episode_index=4) == updated
 
 
+def test_competing_process_updates_with_the_same_revision_yield_one_commit_and_one_conflict(
+    tmp_path: Path,
+) -> None:
+    database = _db(tmp_path)
+    dataset_id = _dataset(database)
+    database.create_episode(dataset_id=dataset_id, source_episode_index=4, source_length=120)
+    context = multiprocessing.get_context("spawn")
+    first_ready = context.Event()
+    second_ready = context.Event()
+    release = context.Event()
+    result = context.Queue()
+    first = context.Process(
+        target=_competing_episode_update,
+        args=(str(database.path), dataset_id, 4, "can", first_ready, release, result),
+    )
+    second = context.Process(
+        target=_competing_episode_update,
+        args=(str(database.path), dataset_id, 4, "cup", second_ready, release, result),
+    )
+    first.start()
+    second.start()
+    assert first_ready.wait(10)
+    assert second_ready.wait(10)
+    release.set()
+    first.join(15)
+    second.join(15)
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    outcomes = [result.get(timeout=2), result.get(timeout=2)]
+    assert sorted(outcome[0] for outcome in outcomes) == ["committed", "conflict"]
+    winner = next(outcome for outcome in outcomes if outcome[0] == "committed")
+    conflict = next(outcome for outcome in outcomes if outcome[0] == "conflict")
+    assert winner[2] == conflict[2] == 1
+    assert winner[1] == conflict[1]
+    assert database.get_episode(dataset_id=dataset_id, source_episode_index=4)["object_name"] == winner[1]
+
+
 def test_partial_unique_indexes_allow_only_one_active_job_and_export_per_dataset(tmp_path: Path) -> None:
     database = _db(tmp_path)
     dataset_id = _dataset(database)
@@ -241,31 +306,24 @@ def test_partial_unique_indexes_allow_only_one_active_job_and_export_per_dataset
     database.set_cosmos_job_state(dataset_id=dataset_id, state=JobState.COMPLETED)
     database.create_cosmos_job(dataset_id=dataset_id, configuration={})
 
-    database.create_export(
-        dataset_id=dataset_id,
-        approval_snapshot_sha256="c" * 64,
-        staging_path="/tmp/staging-a",
-        final_path="/tmp/final-a",
+    assert not hasattr(database, "create_export")
+    database.create_export_snapshot(
+        dataset_id=dataset_id, staging_path="/tmp/staging-a", final_path="/tmp/final-a"
     )
     with pytest.raises(sqlite3.IntegrityError):
-        database.create_export(
-            dataset_id=dataset_id,
-            approval_snapshot_sha256="d" * 64,
-            staging_path="/tmp/staging-b",
-            final_path="/tmp/final-b",
+        database.create_export_snapshot(
+            dataset_id=dataset_id, staging_path="/tmp/staging-b", final_path="/tmp/final-b"
         )
     database.set_export_state(dataset_id=dataset_id, state=ExportState.FAILED)
-    database.create_export(
-        dataset_id=dataset_id,
-        approval_snapshot_sha256="d" * 64,
-        staging_path="/tmp/staging-b",
-        final_path="/tmp/final-b",
+    database.create_export_snapshot(
+        dataset_id=dataset_id, staging_path="/tmp/staging-b", final_path="/tmp/final-b"
     )
 
 
 def test_audit_events_are_append_only_and_artifacts_are_workspace_relative(tmp_path: Path) -> None:
     database = _db(tmp_path)
     dataset_id = _dataset(database)
+    job_id = database.create_cosmos_job(dataset_id=dataset_id, configuration={})["id"]
     event = database.append_audit_event(dataset_id=dataset_id, actor="curator", operation="saved_draft")
 
     with database.open_connection() as connection:
@@ -283,6 +341,26 @@ def test_audit_events_are_append_only_and_artifacts_are_workspace_relative(tmp_p
                 byte_size=0,
                 sha256="e" * 64,
             )
+
+    with database.open_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('artifact-owner', ?, 0, 0, 'queued', '2026-08-21T00:00:00Z', '2026-08-21T00:00:00Z')
+            """,
+            (job_id,),
+        )
+        for unsafe in ("/absolute/request.json", "../escape.json", "cosmos/../escape.json"):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO artifacts(
+                        id, attempt_id, kind, relative_path, media_type, byte_size, sha256, created_at
+                    ) VALUES (?, 'artifact-owner', 'request', ?, 'application/json', 0, ?, '2026-08-21T00:00:00Z')
+                    """,
+                    (f"artifact-{unsafe}", unsafe, "e" * 64),
+                )
 
 
 def test_approval_snapshot_uses_canonical_json_and_is_independent_of_insert_order(tmp_path: Path) -> None:
