@@ -833,12 +833,13 @@ def test_attempt_history_evidence_and_proposals_are_append_only_and_source_uniqu
                 """,
                 (timestamp,),
             )
+        connection.execute("UPDATE cosmos_jobs SET state='failed' WHERE id=?", (job["id"],))
         connection.execute(
             """
             INSERT INTO cosmos_jobs(
                 id, dataset_id, parent_job_id, configuration_json, state, total_attempts,
                 succeeded_attempts, manual_only_attempts, cancel_requested, created_at, updated_at
-            ) VALUES ('retry-job', ?, ?, '{}', 'failed', 0, 0, 0, 0, ?, ?)
+            ) VALUES ('retry-job', ?, ?, '{}', 'queued', 0, 0, 0, 0, ?, ?)
             """,
             (dataset_id, job["id"], timestamp, timestamp),
         )
@@ -885,6 +886,212 @@ def test_attempt_history_evidence_and_proposals_are_append_only_and_source_uniqu
         ):
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute(statement)
+
+
+def test_terminal_attempts_and_jobs_reject_late_mutations_and_evidence(tmp_path: Path) -> None:
+    database = _db(tmp_path)
+    dataset_id = _dataset(database)
+    database.create_episode(dataset_id=dataset_id, source_episode_index=0, source_length=10)
+    timestamp = "2026-08-21T00:00:00Z"
+    exchange = {
+        "phase": "initial",
+        "started_at": timestamp,
+        "finished_at": timestamp,
+        "request": {"method": "POST", "url": "https://cosmos.example/v1", "body_sha256": "a" * 64},
+        "response": None,
+        "error": {"class": "TimeoutError", "summary": "request timed out"},
+    }
+    terminal_parent = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    database.set_cosmos_job_state(
+        job_id=terminal_parent["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING
+    )
+    with database.open_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('parent-terminal-attempt', ?, 0, 0, 'queued', ?, ?)
+            """,
+            (terminal_parent["id"], timestamp, timestamp),
+        )
+    database.set_cosmos_job_state(
+        job_id=terminal_parent["id"], expected_state=JobState.RUNNING, state=JobState.COMPLETED
+    )
+    empty_terminal_job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    database.set_cosmos_job_state(
+        job_id=empty_terminal_job["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING
+    )
+    database.set_cosmos_job_state(
+        job_id=empty_terminal_job["id"], expected_state=JobState.RUNNING, state=JobState.COMPLETED
+    )
+    with database.open_connection() as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_jobs SET owner='late' WHERE id=?", (terminal_parent["id"],))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM cosmos_jobs WHERE id=?", (empty_terminal_job["id"],))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET lease_owner='late' WHERE id='parent-terminal-attempt'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_attempts(
+                    id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+                ) VALUES ('late-attempt', ?, 0, 1, 'queued', ?, ?)
+                """,
+                (terminal_parent["id"], timestamp, timestamp),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, attempt_id, kind, relative_path, media_type, byte_size, sha256, created_at
+                ) VALUES ('late-parent-artifact', 'parent-terminal-attempt', 'request',
+                    'cosmos/late-parent.json', 'application/json', 0, ?, ?)
+                """,
+                ("b" * 64, timestamp),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_proposals(
+                    id, attempt_id, model_response_json, validation_warnings_json, state, created_at
+                ) VALUES ('late-parent-proposal', 'parent-terminal-attempt', '{}', '[]', 'active', ?)
+                """,
+                (timestamp,),
+            )
+    with pytest.raises(sqlite3.IntegrityError):
+        database.append_http_exchange_history(attempt_id="parent-terminal-attempt", exchange=exchange)
+
+    running_parent = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    database.set_cosmos_job_state(
+        job_id=running_parent["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING
+    )
+    with database.open_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('terminal-attempt', ?, 0, 0, 'queued', ?, ?)
+            """,
+            (running_parent["id"], timestamp, timestamp),
+        )
+        connection.execute("UPDATE cosmos_attempts SET state='succeeded' WHERE id='terminal-attempt'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET error_class='late' WHERE id='terminal-attempt'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, attempt_id, kind, relative_path, media_type, byte_size, sha256, created_at
+                ) VALUES ('late-attempt-artifact', 'terminal-attempt', 'request',
+                    'cosmos/late-attempt.json', 'application/json', 0, ?, ?)
+                """,
+                ("c" * 64, timestamp),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_proposals(
+                    id, attempt_id, model_response_json, validation_warnings_json, state, created_at
+                ) VALUES ('late-attempt-proposal', 'terminal-attempt', '{}', '[]', 'active', ?)
+                """,
+                (timestamp,),
+            )
+        for attempt_number, terminal_state in enumerate(("manual_only", "cancelled"), start=1):
+            attempt_id = f"terminal-{terminal_state}-attempt"
+            connection.execute(
+                """
+                INSERT INTO cosmos_attempts(
+                    id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+                ) VALUES (?, ?, 0, ?, 'queued', ?, ?)
+                """,
+                (attempt_id, running_parent["id"], attempt_number, timestamp, timestamp),
+            )
+            connection.execute("UPDATE cosmos_attempts SET state=? WHERE id=?", (terminal_state, attempt_id))
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute("UPDATE cosmos_attempts SET error_class='late' WHERE id=?", (attempt_id,))
+
+
+def test_nonterminal_atomic_finalization_can_attach_evidence_and_finish(tmp_path: Path) -> None:
+    database = _db(tmp_path)
+    dataset_id = _dataset(database)
+    database.create_episode(dataset_id=dataset_id, source_episode_index=0, source_length=10)
+    timestamp = "2026-08-21T00:00:00Z"
+    exchange = {
+        "phase": "initial",
+        "started_at": timestamp,
+        "finished_at": timestamp,
+        "request": {"method": "POST", "url": "https://cosmos.example/v1", "body_sha256": "d" * 64},
+        "response": None,
+        "error": {"class": "TimeoutError", "summary": "request timed out"},
+    }
+    job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    database.set_cosmos_job_state(job_id=job["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING)
+    with database.open_connection() as connection:
+        connection.execute(
+            "UPDATE cosmos_jobs SET owner='worker-1', lease_expires_at=? WHERE id=?", (timestamp, job["id"])
+        )
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, lease_owner, lease_expires_at,
+                error_class, error_summary, created_at, updated_at
+            ) VALUES ('finalizing-attempt', ?, 0, 0, 'requesting', 'worker-1', ?, 'transport', 'stale', ?, ?)
+            """,
+            (job["id"], timestamp, timestamp, timestamp),
+        )
+
+    with database._write() as connection:
+        connection.execute(
+            """
+            INSERT INTO artifacts(
+                id, attempt_id, kind, relative_path, media_type, byte_size, sha256, created_at
+            ) VALUES ('finalizing-request', 'finalizing-attempt', 'request',
+                'cosmos/finalizing-request.json', 'application/json', 0, ?, ?)
+            """,
+            ("e" * 64, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO cosmos_proposals(
+                id, attempt_id, model_response_json, validation_warnings_json, state, created_at
+            ) VALUES ('finalizing-proposal', 'finalizing-attempt', '{}', '[]', 'active', ?)
+            """,
+            (timestamp,),
+        )
+        connection.execute(
+            """
+            UPDATE cosmos_attempts
+            SET request_artifact_id='finalizing-request', http_exchange_history_json=?,
+                lease_owner=NULL, lease_expires_at=NULL, error_class=NULL, error_summary=NULL, state='succeeded'
+            WHERE id='finalizing-attempt'
+            """,
+            (canonical_json([exchange]),),
+        )
+        connection.execute(
+            """
+            UPDATE cosmos_jobs
+            SET succeeded_attempts=1, owner=NULL, lease_expires_at=NULL, state='completed'
+            WHERE id=?
+            """,
+            (job["id"],),
+        )
+
+    with database.open_connection() as connection:
+        assert tuple(
+            connection.execute(
+                "SELECT state, request_artifact_id, http_exchange_history_json, lease_owner, lease_expires_at, "
+                "error_class, error_summary "
+                "FROM cosmos_attempts WHERE id='finalizing-attempt'"
+            ).fetchone()
+        ) == ("succeeded", "finalizing-request", canonical_json([exchange]), None, None, None, None)
+        assert tuple(
+            connection.execute(
+                "SELECT state, succeeded_attempts, owner, lease_expires_at FROM cosmos_jobs WHERE id=?",
+                (job["id"],),
+            ).fetchone()
+        ) == ("completed", 1, None, None)
+        connection.execute("UPDATE cosmos_proposals SET state='superseded' WHERE id='finalizing-proposal'")
 
 
 def test_approval_snapshot_uses_canonical_json_and_is_independent_of_insert_order(tmp_path: Path) -> None:

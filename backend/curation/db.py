@@ -932,6 +932,17 @@ def _migration_v1_statements() -> tuple[str, ...]:
         BEGIN SELECT RAISE(ABORT, 'job parent is immutable'); END
         """,
         """
+        CREATE TRIGGER cosmos_jobs_terminal_immutable
+        BEFORE UPDATE ON cosmos_jobs
+        WHEN OLD.state IN ('completed', 'completed_with_failures', 'cancelled', 'failed')
+        BEGIN SELECT RAISE(ABORT, 'terminal Cosmos jobs are immutable'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_jobs_no_delete
+        BEFORE DELETE ON cosmos_jobs
+        BEGIN SELECT RAISE(ABORT, 'Cosmos jobs are append-only'); END
+        """,
+        """
         CREATE TRIGGER episodes_dataset_immutable
         BEFORE UPDATE OF dataset_id ON episodes
         BEGIN SELECT RAISE(ABORT, 'episode dataset is immutable'); END
@@ -972,6 +983,18 @@ def _migration_v1_statements() -> tuple[str, ...]:
                 SELECT 1 FROM cosmos_jobs AS job
                 JOIN episodes AS episode ON episode.dataset_id=job.dataset_id
                 WHERE job.id=NEW.job_id AND episode.source_episode_index=NEW.source_episode_index
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_attempts_terminal_parent_no_insert
+        BEFORE INSERT ON cosmos_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'cannot create an attempt for a terminal Cosmos job')
+            WHERE EXISTS (
+                SELECT 1 FROM cosmos_jobs
+                WHERE id=NEW.job_id
+                    AND state IN ('completed', 'completed_with_failures', 'cancelled', 'failed')
             );
         END
         """,
@@ -1030,6 +1053,17 @@ def _migration_v1_statements() -> tuple[str, ...]:
         BEGIN SELECT RAISE(ABORT, 'attempt identity is immutable'); END
         """,
         """
+        CREATE TRIGGER cosmos_attempts_terminal_immutable
+        BEFORE UPDATE ON cosmos_attempts
+        WHEN OLD.state IN ('succeeded', 'manual_only', 'cancelled')
+            OR EXISTS (
+                SELECT 1 FROM cosmos_jobs
+                WHERE id=OLD.job_id
+                    AND state IN ('completed', 'completed_with_failures', 'cancelled', 'failed')
+            )
+        BEGIN SELECT RAISE(ABORT, 'terminal Cosmos attempt or job is immutable'); END
+        """,
+        """
         CREATE TRIGGER cosmos_attempts_no_delete
         BEFORE DELETE ON cosmos_attempts
         BEGIN SELECT RAISE(ABORT, 'attempts are immutable evidence records'); END
@@ -1057,6 +1091,23 @@ def _migration_v1_statements() -> tuple[str, ...]:
         CREATE TRIGGER cosmos_proposals_no_delete
         BEFORE DELETE ON cosmos_proposals
         BEGIN SELECT RAISE(ABORT, 'proposals are immutable evidence records'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_proposals_terminal_attempt_no_insert
+        BEFORE INSERT ON cosmos_proposals
+        BEGIN
+            SELECT RAISE(ABORT, 'cannot add a proposal to a terminal Cosmos attempt or job')
+            WHERE EXISTS (
+                SELECT 1
+                FROM cosmos_attempts AS attempt
+                JOIN cosmos_jobs AS job ON job.id=attempt.job_id
+                WHERE attempt.id=NEW.attempt_id
+                    AND (
+                        attempt.state IN ('succeeded', 'manual_only', 'cancelled')
+                        OR job.state IN ('completed', 'completed_with_failures', 'cancelled', 'failed')
+                    )
+            );
+        END
         """,
         """
         CREATE TRIGGER cosmos_proposals_payload_immutable
@@ -1187,6 +1238,24 @@ def _migration_v1_statements() -> tuple[str, ...]:
             SELECT RAISE(ABORT, 'audit export must belong to the audit dataset')
             WHERE NEW.export_id IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM exports WHERE id=NEW.export_id AND dataset_id=NEW.dataset_id
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER artifacts_terminal_attempt_no_insert
+        BEFORE INSERT ON artifacts
+        WHEN NEW.attempt_id IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'cannot add an artifact to a terminal Cosmos attempt or job')
+            WHERE EXISTS (
+                SELECT 1
+                FROM cosmos_attempts AS attempt
+                JOIN cosmos_jobs AS job ON job.id=attempt.job_id
+                WHERE attempt.id=NEW.attempt_id
+                    AND (
+                        attempt.state IN ('succeeded', 'manual_only', 'cancelled')
+                        OR job.state IN ('completed', 'completed_with_failures', 'cancelled', 'failed')
+                    )
             );
         END
         """,
