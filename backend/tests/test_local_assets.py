@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 from uuid import uuid4
 
 from curation.assets import LocalAssetService, _read_interval
+from curation.config import _REQUIRED, legacy_browser_origin
+from curation.security import CurationLoopbackGuard
+import curation.source as source_module
 from curation.source import SourceRegistry
 from fastapi.testclient import TestClient
 import pytest
@@ -60,7 +67,7 @@ def test_manifest_rejects_source_paths_with_line_breaks(tmp_path: Path) -> None:
 
 def test_asset_full_head_ranges_and_revalidation(local_assets: tuple[LocalAssetService, Path, Path]) -> None:
     service, _, _ = local_assets
-    full = service.serve("local", "pnp_trash", "main", "data/episode.parquet", method="GET", headers={})
+    full = service.serve("local", "pnp_trash", "main", "data/episode.parquet", method="HEAD", headers={})
     assert full.status_code == 200
     assert full.headers["content-length"] == "10"
     assert full.headers["accept-ranges"] == "bytes"
@@ -83,23 +90,26 @@ def test_asset_full_head_ranges_and_revalidation(local_assets: tuple[LocalAssetS
             "pnp_trash",
             "main",
             "data/episode.parquet",
-            method="GET",
+            method="HEAD",
             headers={"range": header},
         )
         assert ranged.status_code == 206
         assert ranged.headers["content-range"] == content_range
         assert ranged.headers["content-length"] == str(len(expected))
 
-    asset = service.registry.resolve_alias("local", "pnp_trash").root / "data" / "episode.parquet"
-    assert b"".join(_read_interval(asset, 0, 10)) == b"abcdefghij"
-    assert b"".join(_read_interval(asset, 2, 3)) == b"cde"
+    record = service.registry.resolve_alias("local", "pnp_trash")
+    full_asset = record.open_asset("data/episode.parquet")
+    ranged_asset = record.open_asset("data/episode.parquet")
+    assert full_asset is not None and ranged_asset is not None
+    assert b"".join(_read_interval(full_asset, 0, 10)) == b"abcdefghij"
+    assert b"".join(_read_interval(ranged_asset, 2, 3)) == b"cde"
 
     not_modified = service.serve(
         "local",
         "pnp_trash",
         "main",
         "data/episode.parquet",
-        method="GET",
+        method="HEAD",
         headers={"if-none-match": etag},
     )
     assert not_modified.status_code == 304
@@ -108,7 +118,7 @@ def test_asset_full_head_ranges_and_revalidation(local_assets: tuple[LocalAssetS
         "pnp_trash",
         "main",
         "data/episode.parquet",
-        method="GET",
+        method="HEAD",
         headers={"range": "bytes=0-1", "if-range": '"different"'},
     )
     assert fallback.status_code == 200
@@ -117,12 +127,12 @@ def test_asset_full_head_ranges_and_revalidation(local_assets: tuple[LocalAssetS
         "pnp_trash",
         "main",
         "data/episode.parquet",
-        method="GET",
+        method="HEAD",
         headers={"range": "bytes=0-1", "if-range": etag},
     )
     assert matching.status_code == 206
 
-    video = service.serve("local", "pnp_trash", "main", "videos/episode.mp4", method="GET", headers={})
+    video = service.serve("local", "pnp_trash", "main", "videos/episode.mp4", method="HEAD", headers={})
     assert video.headers["cache-control"] == "private, max-age=0, must-revalidate"
     assert video.headers["content-type"].startswith("video/mp4")
 
@@ -215,7 +225,7 @@ def configured_curation_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     sys.modules[module_name] = module
     try:
         spec.loader.exec_module(module)
-        with TestClient(module.app) as client:
+        with TestClient(module.app, base_url="http://127.0.0.1") as client:
             yield client
     finally:
         sys.modules.pop(module_name, None)
@@ -287,9 +297,10 @@ def test_local_asset_route_revalidates_etags_and_honors_if_range(
     path = _route_path("data/episode.parquet")
     etag = configured_curation_client.get(path).headers["etag"]
 
-    not_modified = configured_curation_client.get(path, headers={"If-None-Match": etag})
-    assert not_modified.status_code == 304
-    assert not_modified.content == b""
+    for if_none_match in (etag, "*", f"W/{etag}", f'"other", {etag}'):
+        not_modified = configured_curation_client.get(path, headers={"If-None-Match": if_none_match})
+        assert not_modified.status_code == 304
+        assert not_modified.content == b""
     matching_range = configured_curation_client.get(path, headers={"Range": "bytes=0-1", "If-Range": etag})
     assert matching_range.status_code == 206
     assert matching_range.content == b"ab"
@@ -370,3 +381,327 @@ def test_local_asset_route_rejects_unregistered_or_unsafe_targets(
 ) -> None:
     response = configured_curation_client.get(_route_path(asset_path, org=org, dataset=dataset, revision=revision))
     assert response.status_code == 404
+
+
+@pytest.fixture
+def legacy_cors_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Load an isolated legacy app, with all curation configuration absent."""
+    for name in _REQUIRED:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LEROBOT_ANNOTATE_BROWSER_ORIGIN", "http://127.0.0.1:3000")
+    module_name = f"legacy_cors_test_{uuid4().hex}"
+    app_path = Path(__file__).parents[1] / "app.py"
+    spec = importlib.util.spec_from_file_location(module_name, app_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        with TestClient(module.app, base_url="http://127.0.0.1") as client:
+            yield client
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_legacy_backend_uses_one_explicit_origin_for_requests_and_preflights(
+    legacy_cors_client: TestClient,
+) -> None:
+    origin = "http://127.0.0.1:3000"
+    allowed = legacy_cors_client.get("/api/health", headers={"Origin": origin})
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == origin
+    preflight = legacy_cors_client.options(
+        "/api/health",
+        headers={"Origin": origin, "Access-Control-Request-Method": "GET"},
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == origin
+    denied = legacy_cors_client.get("/api/health", headers={"Origin": "http://evil.test"})
+    assert denied.headers.get("access-control-allow-origin") is None
+
+
+def test_loopback_guard_rejects_a_nonloopback_server_scope() -> None:
+    invoked = False
+
+    async def inner(scope: object, receive: object, send: object) -> None:
+        nonlocal invoked
+        invoked = True
+
+    async def invoke() -> list[dict[str, object]]:
+        messages: list[dict[str, object]] = []
+
+        async def receive() -> dict[str, object]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict[str, object]) -> None:
+            messages.append(message)
+
+        guard = CurationLoopbackGuard(inner)
+        await guard(
+            {
+                "type": "http",
+                "path": "/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json",
+                "method": "GET",
+                "headers": [],
+                "server": ("0.0.0.0", 8000),
+            },
+            receive,
+            send,
+        )
+        return messages
+
+    messages = asyncio.run(invoke())
+    assert invoked is False
+    assert messages[0]["status"] == 403
+
+
+def test_loopback_guard_accepts_the_asgi_list_server_representation() -> None:
+    invoked = False
+
+    async def inner(scope: object, receive: object, send: object) -> None:
+        nonlocal invoked
+        invoked = True
+
+    async def invoke() -> None:
+        async def receive() -> dict[str, object]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict[str, object]) -> None:
+            return None
+
+        guard = CurationLoopbackGuard(inner)
+        await guard(
+            {
+                "type": "http",
+                "path": "/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json",
+                "method": "GET",
+                "headers": [],
+                "server": ["127.0.0.1", 8000],
+            },
+            receive,
+            send,
+        )
+
+    asyncio.run(invoke())
+    assert invoked is True
+
+
+def test_legacy_browser_origin_default_matches_the_documented_nextjs_url() -> None:
+    assert legacy_browser_origin({}) == "http://localhost:3000"
+
+
+def test_opened_asset_uses_one_descriptor_and_closes_after_streaming(
+    local_assets: tuple[LocalAssetService, Path, Path],
+) -> None:
+    service, _, _ = local_assets
+    record = service.registry.resolve_alias("local", "pnp_trash")
+    opened = record.open_asset("data/episode.parquet")
+    assert opened is not None
+    stream = _read_interval(opened, 2, 3)
+    assert next(stream) == b"cde"
+    stream.close()
+    assert opened.closed is True
+    with pytest.raises(OSError):
+        os.fstat(opened.fd)
+
+
+def test_head_and_nonbody_outcomes_close_opened_descriptors(
+    local_assets: tuple[LocalAssetService, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, _ = local_assets
+    opened = []
+    real_open = source_module.open_regular_file_beneath
+
+    def track_open(*args: object):
+        asset = real_open(*args)
+        if asset is not None:
+            opened.append(asset)
+        return asset
+
+    monkeypatch.setattr(source_module, "open_regular_file_beneath", track_open)
+    head = service.serve("local", "pnp_trash", "main", "data/episode.parquet", method="HEAD", headers={})
+    assert head.status_code == 200
+    ranged_head = service.serve(
+        "local", "pnp_trash", "main", "data/episode.parquet", method="HEAD", headers={"Range": "bytes=2-4"}
+    )
+    assert ranged_head.status_code == 206
+    assert ranged_head.headers["content-range"] == "bytes 2-4/10"
+    not_modified = service.serve(
+        "local", "pnp_trash", "main", "data/episode.parquet", method="GET", headers={"If-None-Match": "*"}
+    )
+    assert not_modified.status_code == 304
+    malformed = service.serve(
+        "local", "pnp_trash", "main", "data/episode.parquet", method="GET", headers={"Range": "bytes=1-2,4-5"}
+    )
+    assert malformed.status_code == 416
+    assert opened and all(asset.closed for asset in opened)
+
+
+def test_streaming_response_cleanup_closes_an_unconsumed_descriptor(
+    local_assets: tuple[LocalAssetService, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, _ = local_assets
+    opened = []
+    real_open = source_module.open_regular_file_beneath
+
+    def track_open(*args: object):
+        asset = real_open(*args)
+        if asset is not None:
+            opened.append(asset)
+        return asset
+
+    monkeypatch.setattr(source_module, "open_regular_file_beneath", track_open)
+    response = service.serve("local", "pnp_trash", "main", "data/episode.parquet", method="GET", headers={})
+    assert response.background is not None
+    response.background.func(*response.background.args, **response.background.kwargs)
+    assert opened and all(asset.closed for asset in opened)
+
+
+@pytest.mark.parametrize("if_none_match", ["*", 'W/"etag"', '"other", W/"etag"'])
+def test_if_none_match_accepts_wildcards_weak_tags_and_lists(
+    local_assets: tuple[LocalAssetService, Path, Path], if_none_match: str
+) -> None:
+    service, _, _ = local_assets
+    etag = service.serve("local", "pnp_trash", "main", "data/episode.parquet", method="HEAD", headers={}).headers[
+        "etag"
+    ]
+    value = if_none_match.replace('"etag"', etag)
+    response = service.serve(
+        "local", "pnp_trash", "main", "data/episode.parquet", method="GET", headers={"If-None-Match": value}
+    )
+    assert response.status_code == 304
+
+
+def test_open_asset_rejects_a_regular_file_swapped_to_an_in_root_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "data").mkdir(parents=True)
+    target = source / "data" / "episode.parquet"
+    target.write_bytes(b"same bytes")
+    (source / "data" / "replacement.parquet").write_bytes(b"same bytes")
+    registry = SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=tmp_path / "workspace")
+    target.unlink()
+    target.symlink_to("replacement.parquet")
+
+    response = LocalAssetService(registry).serve(
+        "local", "pnp_trash", "main", "data/episode.parquet", method="GET", headers={}
+    )
+    assert response.status_code == 404
+
+
+def test_open_asset_rejects_same_size_mutation_with_restored_mtime(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "data").mkdir(parents=True)
+    target = source / "data" / "episode.parquet"
+    target.write_bytes(b"original")
+    registry = SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=tmp_path / "workspace")
+    original_stat = target.stat()
+    target.write_bytes(b"changed!")
+    os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert registry.resolve_alias("local", "pnp_trash").open_asset("data/episode.parquet") is None
+
+
+def test_manifest_rejects_a_source_mutated_while_its_hash_is_being_computed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    target = source / "asset"
+    target.write_bytes(b"initial")
+    real_read = source_module.os.read
+    changed = False
+
+    def mutate_after_read(fd: int, size: int) -> bytes:
+        nonlocal changed
+        chunk = real_read(fd, size)
+        if not changed:
+            changed = True
+            target.write_bytes(b"updated")
+            current = target.stat()
+            os.utime(target, ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000))
+        return chunk
+
+    monkeypatch.setattr(source_module.os, "read", mutate_after_read)
+    with pytest.raises(ValueError, match="changed while hashing"):
+        SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=tmp_path / "workspace")
+
+
+def test_open_asset_rejects_a_fifo_swap_without_blocking(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "data").mkdir(parents=True)
+    target = source / "data" / "episode.parquet"
+    target.write_bytes(b"regular")
+    registry = SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=tmp_path / "workspace")
+    target.unlink()
+    os.mkfifo(target)
+
+    assert registry.resolve_alias("local", "pnp_trash").open_asset("data/episode.parquet") is None
+
+
+def test_manifest_rejects_an_existing_workspace_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "asset").write_bytes(b"asset")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest, _, _ = source_module._manifest_bytes(source)
+    outside = tmp_path / "outside-manifest"
+    outside.write_bytes(manifest)
+    (workspace / "source-files.sha256").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="manifest path must be a regular file"):
+        SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=workspace)
+
+
+def test_manifest_bytes_are_utf8_path_byte_sorted_and_restart_rejects_source_change(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "z").write_bytes(b"z")
+    (source / "é").write_bytes(b"accent")
+    (source / "a").write_bytes(b"a")
+    workspace = tmp_path / "workspace"
+    registry = SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=workspace)
+    manifest = (workspace / "source-files.sha256").read_bytes()
+    expected = b"".join(
+        f"{hashlib.sha256(contents).hexdigest()}  {name}\n".encode("utf-8")
+        for name, contents in [("a", b"a"), ("z", b"z"), ("é", b"accent")]
+    )
+    assert manifest == expected
+    assert registry.resolve_alias("local", "pnp_trash").fingerprint == hashlib.sha256(manifest).hexdigest()
+
+    (source / "a").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="manifest changed"):
+        SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=workspace)
+
+
+def test_manifest_creation_is_serialized_and_recovers_after_failed_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "asset").write_bytes(b"asset")
+    workspace = tmp_path / "workspace"
+
+    def register() -> str:
+        return (
+            SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=workspace)
+            .resolve_alias("local", "pnp_trash")
+            .fingerprint
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        fingerprints = list(executor.map(lambda _: register(), range(2)))
+    assert len(set(fingerprints)) == 1
+
+    (workspace / "source-files.sha256").unlink()
+    original_install = source_module._install_manifest_no_clobber
+    monkeypatch.setattr(
+        source_module,
+        "_install_manifest_no_clobber",
+        lambda *_: (_ for _ in ()).throw(OSError("crash")),
+    )
+    with pytest.raises(OSError, match="crash"):
+        register()
+    assert not list(workspace.glob(".source-files.sha256.*.tmp"))
+    monkeypatch.setattr(source_module, "_install_manifest_no_clobber", original_install)
+    assert register()

@@ -27,6 +27,9 @@ _REQUIRED = (
     "ISAAC_GROOT_ROOT",
 )
 
+_LEGACY_BROWSER_ORIGIN_ENV = "LEROBOT_ANNOTATE_BROWSER_ORIGIN"
+_LEGACY_BROWSER_ORIGIN_DEFAULT = "http://localhost:3000"
+
 
 def _canonical_absolute(value: str, name: str) -> Path:
     path = Path(value).expanduser()
@@ -54,6 +57,12 @@ def _single_origin(value: str) -> str:
     ):
         raise CurationConfigurationError("CURATION_BROWSER_ORIGIN must be one origin without a path")
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def legacy_browser_origin(environment: Mapping[str, str] | None = None) -> str:
+    """Return the one non-public browser origin used by the legacy backend."""
+    env = os.environ if environment is None else environment
+    return _single_origin(env.get(_LEGACY_BROWSER_ORIGIN_ENV, _LEGACY_BROWSER_ORIGIN_DEFAULT))
 
 
 def _validate_loopback(host: str) -> str:

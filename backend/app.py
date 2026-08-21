@@ -50,13 +50,15 @@ from pydantic import BaseModel
 
 try:  # Supports both ``import backend.app`` and the legacy ``import app`` entrypoint.
     from .curation.assets import LocalAssetService
-    from .curation.config import CurationSettings, curation_is_configured
+    from .curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
     from .curation.router import build_curation_router
+    from .curation.security import CurationLoopbackGuard
     from .curation.source import SourceRegistry
 except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from curation.assets import LocalAssetService
-    from curation.config import CurationSettings, curation_is_configured
+    from curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
     from curation.router import build_curation_router
+    from curation.security import CurationLoopbackGuard
     from curation.source import SourceRegistry
 
 logger = logging.getLogger("lerobot-annotate")
@@ -736,13 +738,15 @@ if curation_is_configured():
 app = FastAPI(title="LeRobot dataset visualizer — annotation backend")
 app.add_middleware(
     CORSMiddleware,
-    # Never reflect arbitrary origins. A non-curation legacy install does not
-    # expose local assets, so it has no browser origins to allow here.
-    allow_origins=[_curation_settings.browser_origin] if _curation_settings else [],
+    # Curation uses its explicit origin; legacy annotation keeps its documented
+    # loopback Next.js origin rather than silently disabling browser access.
+    allow_origins=[_curation_settings.browser_origin] if _curation_settings else [legacy_browser_origin()],
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Accept-Ranges", "Content-Range", "Content-Length", "ETag"],
 )
+if _curation_settings:
+    app.add_middleware(CurationLoopbackGuard)
 app.include_router(build_curation_router(_local_asset_service))
 
 
