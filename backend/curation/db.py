@@ -803,14 +803,46 @@ def _migration_v1_statements() -> tuple[str, ...]:
         BEGIN SELECT RAISE(ABORT, 'job dataset is immutable'); END
         """,
         """
+        CREATE TRIGGER cosmos_jobs_configuration_immutable
+        BEFORE UPDATE OF configuration_json ON cosmos_jobs
+        BEGIN SELECT RAISE(ABORT, 'job configuration is immutable'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_jobs_parent_immutable
+        BEFORE UPDATE OF parent_job_id ON cosmos_jobs
+        BEGIN SELECT RAISE(ABORT, 'job parent is immutable'); END
+        """,
+        """
         CREATE TRIGGER episodes_dataset_immutable
         BEFORE UPDATE OF dataset_id ON episodes
         BEGIN SELECT RAISE(ABORT, 'episode dataset is immutable'); END
         """,
         """
+        CREATE TRIGGER episodes_source_index_immutable
+        BEFORE UPDATE OF source_episode_index ON episodes
+        BEGIN SELECT RAISE(ABORT, 'episode source index is immutable'); END
+        """,
+        """
+        CREATE TRIGGER episodes_attempt_referenced_no_delete
+        BEFORE DELETE ON episodes
+        BEGIN
+            SELECT RAISE(ABORT, 'episode referenced by a Cosmos attempt')
+            WHERE EXISTS (
+                SELECT 1 FROM cosmos_attempts AS attempt
+                JOIN cosmos_jobs AS job ON job.id=attempt.job_id
+                WHERE job.dataset_id=OLD.dataset_id AND attempt.source_episode_index=OLD.source_episode_index
+            );
+        END
+        """,
+        """
         CREATE TRIGGER exports_dataset_immutable
         BEFORE UPDATE OF dataset_id ON exports
         BEGIN SELECT RAISE(ABORT, 'export dataset is immutable'); END
+        """,
+        """
+        CREATE TRIGGER exports_snapshot_identity_immutable
+        BEFORE UPDATE OF approval_snapshot_sha256, staging_path, final_path ON exports
+        BEGIN SELECT RAISE(ABORT, 'export approval snapshot and paths are immutable'); END
         """,
         """
         CREATE TRIGGER cosmos_attempts_episode_dataset_insert

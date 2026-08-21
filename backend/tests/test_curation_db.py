@@ -321,22 +321,34 @@ def test_competing_process_updates_with_the_same_revision_yield_one_commit_and_o
         target=_competing_episode_update,
         args=(str(database.path), dataset_id, 4, "cup", second_ready, release, result),
     )
-    first.start()
-    second.start()
-    assert first_ready.wait(10)
-    assert second_ready.wait(10)
-    release.set()
-    first.join(15)
-    second.join(15)
-    assert first.exitcode == 0
-    assert second.exitcode == 0
-    outcomes = [result.get(timeout=2), result.get(timeout=2)]
-    assert sorted(outcome[0] for outcome in outcomes) == ["committed", "conflict"]
-    winner = next(outcome for outcome in outcomes if outcome[0] == "committed")
-    conflict = next(outcome for outcome in outcomes if outcome[0] == "conflict")
-    assert winner[2] == conflict[2] == 1
-    assert winner[1] == conflict[1]
-    assert database.get_episode(dataset_id=dataset_id, source_episode_index=4)["object_name"] == winner[1]
+    try:
+        first.start()
+        second.start()
+        assert first_ready.wait(10)
+        assert second_ready.wait(10)
+        release.set()
+        first.join(15)
+        second.join(15)
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+        outcomes = [result.get(timeout=2), result.get(timeout=2)]
+        assert sorted(outcome[0] for outcome in outcomes) == ["committed", "conflict"]
+        winner = next(outcome for outcome in outcomes if outcome[0] == "committed")
+        conflict = next(outcome for outcome in outcomes if outcome[0] == "conflict")
+        assert winner[2] == conflict[2] == 1
+        assert winner[1] == conflict[1]
+        assert database.get_episode(dataset_id=dataset_id, source_episode_index=4)["object_name"] == winner[1]
+    finally:
+        release.set()
+        for process in (first, second):
+            if process.pid is None:
+                continue
+            process.join(2)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+        result.close()
+        result.join_thread()
 
 
 def test_partial_unique_indexes_allow_only_one_active_job_and_export_per_dataset(tmp_path: Path) -> None:
@@ -477,6 +489,12 @@ def test_schema_rejects_cross_dataset_references_and_wrong_artifact_ownership(tm
         )
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE cosmos_jobs SET dataset_id=? WHERE id=?", (second_dataset, first_job["id"]))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE cosmos_jobs SET configuration_json='{\"changed\":true}' WHERE id=?", (first_job["id"],)
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_jobs SET parent_job_id=NULL WHERE id='same-parent'")
         connection.execute(
             """
             INSERT INTO cosmos_attempts(
@@ -485,6 +503,10 @@ def test_schema_rejects_cross_dataset_references_and_wrong_artifact_ownership(tm
             """,
             (first_job["id"], timestamp, timestamp),
         )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE episodes SET source_episode_index=2 WHERE id=?", (first_episode["id"],))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM episodes WHERE id=?", (first_episode["id"],))
         connection.execute(
             """
             INSERT INTO cosmos_attempts(
@@ -623,13 +645,24 @@ def test_approval_snapshot_uses_canonical_json_and_is_independent_of_insert_orde
     second_process = context.Process(
         target=_snapshot_from_order, args=(str(tmp_path / "process-b.sqlite3"), (2, 9), result)
     )
-    first_process.start()
-    second_process.start()
-    first_process.join(10)
-    second_process.join(10)
-    assert first_process.exitcode == 0
-    assert second_process.exitcode == 0
-    assert result.get(timeout=2) == result.get(timeout=2)
+    try:
+        first_process.start()
+        second_process.start()
+        first_process.join(10)
+        second_process.join(10)
+        assert first_process.exitcode == 0
+        assert second_process.exitcode == 0
+        assert result.get(timeout=2) == result.get(timeout=2)
+    finally:
+        for process in (first_process, second_process):
+            if process.pid is None:
+                continue
+            process.join(2)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+        result.close()
+        result.join_thread()
 
 
 def test_export_snapshot_copies_approved_rows_immutably_in_the_same_transaction(tmp_path: Path) -> None:
@@ -667,6 +700,16 @@ def test_export_snapshot_copies_approved_rows_immutably_in_the_same_transaction(
         copied = connection.execute(
             "SELECT rejection_reason, revision FROM export_episodes WHERE export_id=?", (exported["id"],)
         ).fetchone()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE exports SET approval_snapshot_sha256=? WHERE id=?", ("c" * 64, exported["id"])
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE exports SET staging_path='/tmp/other-staging' WHERE id=?", (exported["id"],)
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE exports SET final_path='/tmp/other-final' WHERE id=?", (exported["id"],))
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 "UPDATE export_episodes SET rejection_reason='mutated' WHERE export_id=?", (exported["id"],)
@@ -730,6 +773,8 @@ def test_lock_exhaustion_is_retryable_and_a_real_process_writer_waits_for_the_lo
         second_release.set()
         for process in (first_holder, writer, second_holder):
             if process is None:
+                continue
+            if process.pid is None:
                 continue
             process.join(2)
             if process.is_alive():
