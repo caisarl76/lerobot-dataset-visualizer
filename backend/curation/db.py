@@ -18,7 +18,15 @@ import sqlite3
 from typing import Any
 from uuid import uuid4
 
-from .models import AttemptState, ExportState, JobState, ProposalState, ReviewState
+from .models import (
+    EXPORT_STATE_TRANSITIONS,
+    JOB_STATE_TRANSITIONS,
+    AttemptState,
+    ExportState,
+    JobState,
+    ProposalState,
+    ReviewState,
+)
 
 SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MILLISECONDS = 5_000
@@ -79,6 +87,22 @@ class StateTransitionConflict(RuntimeError):
         super().__init__(f"{entity} {identifier} is {current_state}, not expected {expected_state}")
 
 
+class IllegalStateTransition(RuntimeError):
+    """A compare-and-swap matched but the requested lifecycle edge is not legal."""
+
+    status_code = 409
+
+    def __init__(self, *, entity: str, identifier: str, current_state: str, target_state: str) -> None:
+        self.payload = {
+            "error": "illegal_state_transition",
+            "entity": entity,
+            "id": identifier,
+            "current_state": current_state,
+            "target_state": target_state,
+        }
+        super().__init__(f"{entity} {identifier} cannot transition from {current_state} to {target_state}")
+
+
 def canonical_json(value: Any) -> str:
     """Return the one JSON representation used by every hash-bearing record."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -112,6 +136,59 @@ def _safe_relative_path(value: str) -> str:
 def _is_lock_error(error: sqlite3.OperationalError) -> bool:
     message = str(error).lower()
     return "locked" in message or "busy" in message
+
+
+def _validate_http_exchange(exchange: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one neutral HTTP-envelope record before canonical append-only storage."""
+    required_keys = {"phase", "started_at", "finished_at", "request", "response", "error"}
+    if set(exchange) != required_keys:
+        raise ValueError("HTTP exchange must contain exactly phase, timing, request, response, and error")
+    phase = exchange["phase"]
+    if phase not in {"initial", "repair"}:
+        raise ValueError("HTTP exchange phase must be initial or repair")
+    if not all(isinstance(exchange[key], str) and exchange[key] for key in ("started_at", "finished_at")):
+        raise ValueError("HTTP exchange timestamps must be nonempty strings")
+    request = exchange["request"]
+    if not isinstance(request, Mapping) or set(request) != {"method", "url", "body_sha256"}:
+        raise ValueError("HTTP exchange request must contain method, url, and body_sha256")
+    if not isinstance(request["method"], str) or not request["method"]:
+        raise ValueError("HTTP exchange request method must be a nonempty string")
+    if not isinstance(request["url"], str) or not request["url"]:
+        raise ValueError("HTTP exchange request URL must be a nonempty string")
+    body_sha256 = request["body_sha256"]
+    if (
+        not isinstance(body_sha256, str)
+        or len(body_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in body_sha256)
+    ):
+        raise ValueError("HTTP exchange request body_sha256 must be lowercase SHA-256")
+
+    response = exchange["response"]
+    if response is not None:
+        response_keys = {"status_code", "id", "model", "created", "usage", "finish_reason"}
+        if not isinstance(response, Mapping) or set(response) != response_keys:
+            raise ValueError("HTTP exchange response has an invalid envelope shape")
+        if not isinstance(response["status_code"], int) or not 100 <= response["status_code"] <= 599:
+            raise ValueError("HTTP exchange response status_code must be an HTTP status")
+        if any(
+            response[key] is not None and not isinstance(response[key], str)
+            for key in ("id", "model", "finish_reason")
+        ):
+            raise ValueError("HTTP exchange response identifiers must be strings or null")
+        if response["created"] is not None and not isinstance(response["created"], int):
+            raise ValueError("HTTP exchange response created must be an integer or null")
+        if response["usage"] is not None and not isinstance(response["usage"], Mapping):
+            raise ValueError("HTTP exchange response usage must be an object or null")
+
+    error = exchange["error"]
+    if error is not None:
+        if not isinstance(error, Mapping) or set(error) != {"class", "summary"}:
+            raise ValueError("HTTP exchange error has an invalid envelope shape")
+        if not all(isinstance(error[key], str) and error[key] for key in ("class", "summary")):
+            raise ValueError("HTTP exchange error values must be nonempty strings")
+    if response is None and error is None:
+        raise ValueError("HTTP exchange must contain a response envelope or transport error")
+    return json.loads(canonical_json(dict(exchange)))
 
 
 class CurationDatabase:
@@ -357,6 +434,15 @@ class CurationDatabase:
                     expected_state=expected_state.value,
                     current_state=current["state"],
                 )
+            if state is expected_state:
+                return current
+            if state not in JOB_STATE_TRANSITIONS[expected_state]:
+                raise IllegalStateTransition(
+                    entity="cosmos_job",
+                    identifier=job_id,
+                    current_state=current["state"],
+                    target_state=state.value,
+                )
             connection.execute(
                 "UPDATE cosmos_jobs SET state=?, updated_at=? WHERE id=?", (state.value, _utc_now(), current["id"])
             )
@@ -442,11 +528,40 @@ class CurationDatabase:
                     expected_state=expected_state.value,
                     current_state=current["state"],
                 )
+            if state is expected_state:
+                return current
+            if state not in EXPORT_STATE_TRANSITIONS[expected_state]:
+                raise IllegalStateTransition(
+                    entity="export",
+                    identifier=export_id,
+                    current_state=current["state"],
+                    target_state=state.value,
+                )
             connection.execute(
                 "UPDATE exports SET state=?, updated_at=? WHERE id=?", (state.value, _utc_now(), current["id"])
             )
             return _require_row(
                 connection.execute("SELECT * FROM exports WHERE id=?", (current["id"],)).fetchone()
+            )
+
+    def append_http_exchange_history(self, *, attempt_id: str, exchange: Mapping[str, Any]) -> dict[str, Any]:
+        """Append one canonical HTTP envelope without rewriting prior exchange evidence."""
+        normalized_exchange = _validate_http_exchange(exchange)
+        with self._write() as connection:
+            current = _require_row(
+                connection.execute("SELECT * FROM cosmos_attempts WHERE id=?", (attempt_id,)).fetchone(),
+                "Cosmos attempt not found",
+            )
+            history = json.loads(current["http_exchange_history_json"])
+            if not isinstance(history, list):  # Defensive: the v1 CHECK normally makes this unreachable.
+                raise RuntimeError("attempt HTTP exchange history is not an array")
+            history.append(normalized_exchange)
+            connection.execute(
+                "UPDATE cosmos_attempts SET http_exchange_history_json=?, updated_at=? WHERE id=?",
+                (canonical_json(history), _utc_now(), attempt_id),
+            )
+            return _require_row(
+                connection.execute("SELECT * FROM cosmos_attempts WHERE id=?", (attempt_id,)).fetchone()
             )
 
     def append_audit_event(
@@ -652,6 +767,9 @@ def _migration_v1_statements() -> tuple[str, ...]:
             lease_expires_at TEXT,
             request_artifact_id TEXT REFERENCES artifacts(id) ON DELETE RESTRICT,
             response_artifact_id TEXT REFERENCES artifacts(id) ON DELETE RESTRICT,
+            http_exchange_history_json TEXT NOT NULL DEFAULT '[]' CHECK(
+                json_valid(http_exchange_history_json) AND json_type(http_exchange_history_json)='array'
+            ),
             error_class TEXT,
             error_summary TEXT,
             created_at TEXT NOT NULL DEFAULT '',
@@ -672,7 +790,8 @@ def _migration_v1_statements() -> tuple[str, ...]:
             step_7_start_frame INTEGER CHECK(step_7_start_frame >= 0 OR step_7_start_frame IS NULL),
             validation_warnings_json TEXT NOT NULL,
             state TEXT NOT NULL CHECK(state IN ({proposal_states})),
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            UNIQUE(attempt_id)
         )
         """,
         f"""
@@ -886,8 +1005,13 @@ def _migration_v1_statements() -> tuple[str, ...]:
         """,
         f"""
         CREATE TRIGGER cosmos_attempts_artifact_ownership_update
-        BEFORE UPDATE OF id, request_artifact_id, response_artifact_id ON cosmos_attempts
+        BEFORE UPDATE OF request_artifact_id, response_artifact_id ON cosmos_attempts
         BEGIN
+            SELECT RAISE(ABORT, 'request artifact link is write-once')
+            WHERE OLD.request_artifact_id IS NOT NULL AND NEW.request_artifact_id IS NOT OLD.request_artifact_id;
+            SELECT RAISE(ABORT, 'response artifact link is write-once')
+            WHERE OLD.response_artifact_id IS NOT NULL
+                AND NEW.response_artifact_id IS NOT OLD.response_artifact_id;
             SELECT RAISE(ABORT, 'request artifact must belong to this attempt and be request')
             WHERE NEW.request_artifact_id IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM artifacts
@@ -897,6 +1021,93 @@ def _migration_v1_statements() -> tuple[str, ...]:
             WHERE NEW.response_artifact_id IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM artifacts
                 WHERE id=NEW.response_artifact_id AND attempt_id=NEW.id AND kind='{ARTIFACT_KIND_COSMOS_RESPONSE}'
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_attempts_identity_immutable
+        BEFORE UPDATE OF id, job_id, source_episode_index, attempt_number ON cosmos_attempts
+        BEGIN SELECT RAISE(ABORT, 'attempt identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_attempts_no_delete
+        BEFORE DELETE ON cosmos_attempts
+        BEGIN SELECT RAISE(ABORT, 'attempts are immutable evidence records'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_attempts_history_append_only
+        BEFORE UPDATE OF http_exchange_history_json ON cosmos_attempts
+        BEGIN
+            SELECT RAISE(ABORT, 'HTTP exchange history must be a JSON array')
+            WHERE json_valid(NEW.http_exchange_history_json)=0
+                OR json_type(NEW.http_exchange_history_json) != 'array';
+            SELECT RAISE(ABORT, 'HTTP exchange history may append exactly one entry')
+            WHERE json_array_length(NEW.http_exchange_history_json)
+                != json_array_length(OLD.http_exchange_history_json) + 1;
+            SELECT RAISE(ABORT, 'HTTP exchange history may not rewrite prior entries')
+            WHERE EXISTS (
+                SELECT 1
+                FROM json_each(OLD.http_exchange_history_json) AS old_entry
+                LEFT JOIN json_each(NEW.http_exchange_history_json) AS new_entry ON new_entry.key=old_entry.key
+                WHERE new_entry.value IS NULL OR new_entry.value != old_entry.value
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_proposals_no_delete
+        BEFORE DELETE ON cosmos_proposals
+        BEGIN SELECT RAISE(ABORT, 'proposals are immutable evidence records'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_proposals_payload_immutable
+        BEFORE UPDATE OF id, attempt_id, model_response_json, step_2_start_frame, step_3_start_frame,
+            step_4_start_frame, step_5_start_frame, step_6_start_frame, step_7_start_frame,
+            validation_warnings_json, created_at ON cosmos_proposals
+        BEGIN SELECT RAISE(ABORT, 'proposal payload is immutable'); END
+        """,
+        """
+        CREATE TRIGGER cosmos_proposals_state_transition
+        BEFORE UPDATE OF state ON cosmos_proposals
+        BEGIN
+            SELECT RAISE(ABORT, 'proposal may only transition active to superseded')
+            WHERE OLD.state != 'active' OR NEW.state != 'superseded';
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_proposals_one_active_source_insert
+        BEFORE INSERT ON cosmos_proposals
+        WHEN NEW.state='active'
+        BEGIN
+            SELECT RAISE(ABORT, 'only one active proposal may exist per dataset episode')
+            WHERE EXISTS (
+                SELECT 1
+                FROM cosmos_proposals AS proposal
+                JOIN cosmos_attempts AS existing_attempt ON existing_attempt.id=proposal.attempt_id
+                JOIN cosmos_jobs AS existing_job ON existing_job.id=existing_attempt.job_id
+                JOIN cosmos_attempts AS new_attempt ON new_attempt.id=NEW.attempt_id
+                JOIN cosmos_jobs AS new_job ON new_job.id=new_attempt.job_id
+                WHERE proposal.state='active'
+                    AND existing_job.dataset_id=new_job.dataset_id
+                    AND existing_attempt.source_episode_index=new_attempt.source_episode_index
+            );
+        END
+        """,
+        """
+        CREATE TRIGGER cosmos_proposals_one_active_source_update
+        BEFORE UPDATE OF state, attempt_id ON cosmos_proposals
+        WHEN NEW.state='active'
+        BEGIN
+            SELECT RAISE(ABORT, 'only one active proposal may exist per dataset episode')
+            WHERE EXISTS (
+                SELECT 1
+                FROM cosmos_proposals AS proposal
+                JOIN cosmos_attempts AS existing_attempt ON existing_attempt.id=proposal.attempt_id
+                JOIN cosmos_jobs AS existing_job ON existing_job.id=existing_attempt.job_id
+                JOIN cosmos_attempts AS new_attempt ON new_attempt.id=NEW.attempt_id
+                JOIN cosmos_jobs AS new_job ON new_job.id=new_attempt.job_id
+                WHERE proposal.id != NEW.id AND proposal.state='active'
+                    AND existing_job.dataset_id=new_job.dataset_id
+                    AND existing_attempt.source_episode_index=new_attempt.source_episode_index
             );
         END
         """,

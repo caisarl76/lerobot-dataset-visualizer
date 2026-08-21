@@ -10,6 +10,7 @@ from typing import Any
 import curation.db as db_module
 from curation.db import (
     CurationDatabase,
+    IllegalStateTransition,
     OptimisticConflict,
     RetryableDatabaseError,
     StateTransitionConflict,
@@ -357,9 +358,15 @@ def test_partial_unique_indexes_allow_only_one_active_job_and_export_per_dataset
     older_job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
     with pytest.raises(sqlite3.IntegrityError):
         database.create_cosmos_job(dataset_id=dataset_id, configuration={})
-    database.set_cosmos_job_state(job_id=older_job["id"], expected_state=JobState.QUEUED, state=JobState.COMPLETED)
+    database.set_cosmos_job_state(job_id=older_job["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING)
+    database.set_cosmos_job_state(
+        job_id=older_job["id"], expected_state=JobState.RUNNING, state=JobState.COMPLETED
+    )
     newer_job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
-    database.set_cosmos_job_state(job_id=older_job["id"], expected_state=JobState.COMPLETED, state=JobState.FAILED)
+    with pytest.raises(IllegalStateTransition):
+        database.set_cosmos_job_state(
+            job_id=older_job["id"], expected_state=JobState.COMPLETED, state=JobState.FAILED
+        )
     with pytest.raises(StateTransitionConflict):
         database.set_cosmos_job_state(
             job_id=older_job["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING
@@ -384,8 +391,14 @@ def test_partial_unique_indexes_allow_only_one_active_job_and_export_per_dataset
     newer_export = database.create_export_snapshot(
         dataset_id=dataset_id, staging_path="/tmp/staging-b", final_path="/tmp/final-b"
     )
-    database.set_export_state(
+    unchanged_export = database.set_export_state(
         export_id=older_export["id"], expected_state=ExportState.FAILED, state=ExportState.FAILED
+    )
+    assert (
+        unchanged_export["updated_at"]
+        == database.set_export_state(
+            export_id=older_export["id"], expected_state=ExportState.FAILED, state=ExportState.FAILED
+        )["updated_at"]
     )
     with pytest.raises(StateTransitionConflict):
         database.set_export_state(
@@ -395,6 +408,69 @@ def test_partial_unique_indexes_allow_only_one_active_job_and_export_per_dataset
         assert (
             connection.execute("SELECT state FROM exports WHERE id=?", (newer_export["id"],)).fetchone()[0]
             == "queued"
+        )
+
+
+def test_state_graphs_reject_skips_and_terminal_mutations_without_touching_timestamps(tmp_path: Path) -> None:
+    database = _db(tmp_path)
+    dataset_id = _dataset(database)
+    job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    with pytest.raises(IllegalStateTransition):
+        database.set_cosmos_job_state(job_id=job["id"], expected_state=JobState.QUEUED, state=JobState.COMPLETED)
+    unchanged_job = database.set_cosmos_job_state(
+        job_id=job["id"], expected_state=JobState.QUEUED, state=JobState.QUEUED
+    )
+    assert unchanged_job["updated_at"] == job["updated_at"]
+    database.set_cosmos_job_state(job_id=job["id"], expected_state=JobState.QUEUED, state=JobState.RUNNING)
+    database.set_cosmos_job_state(
+        job_id=job["id"], expected_state=JobState.RUNNING, state=JobState.CANCEL_REQUESTED
+    )
+    terminal_job = database.set_cosmos_job_state(
+        job_id=job["id"], expected_state=JobState.CANCEL_REQUESTED, state=JobState.CANCELLED
+    )
+    with pytest.raises(IllegalStateTransition):
+        database.set_cosmos_job_state(job_id=job["id"], expected_state=JobState.CANCELLED, state=JobState.RUNNING)
+    assert (
+        database.set_cosmos_job_state(
+            job_id=job["id"], expected_state=JobState.CANCELLED, state=JobState.CANCELLED
+        )["updated_at"]
+        == terminal_job["updated_at"]
+    )
+
+    first_export = database.create_export_snapshot(
+        dataset_id=dataset_id, staging_path="/tmp/first-stage", final_path="/tmp/first-final"
+    )
+    with pytest.raises(IllegalStateTransition):
+        database.set_export_state(
+            export_id=first_export["id"], expected_state=ExportState.QUEUED, state=ExportState.PUBLISHED
+        )
+    database.set_export_state(
+        export_id=first_export["id"], expected_state=ExportState.QUEUED, state=ExportState.FAILED
+    )
+
+    export = database.create_export_snapshot(
+        dataset_id=dataset_id, staging_path="/tmp/stage", final_path="/tmp/final"
+    )
+    unchanged = database.set_export_state(
+        export_id=export["id"], expected_state=ExportState.QUEUED, state=ExportState.QUEUED
+    )
+    assert unchanged["updated_at"] == export["updated_at"]
+    for expected, target in (
+        (ExportState.QUEUED, ExportState.BUILDING),
+        (ExportState.BUILDING, ExportState.CORE_STRUCTURAL_VALIDATED),
+        (ExportState.CORE_STRUCTURAL_VALIDATED, ExportState.GROOT_STATS_VALIDATED),
+        (ExportState.GROOT_STATS_VALIDATED, ExportState.GROOT_LOADER_VALIDATED),
+        (ExportState.GROOT_LOADER_VALIDATED, ExportState.PROVENANCE_WRITTEN),
+        (ExportState.PROVENANCE_WRITTEN, ExportState.FINAL_CONSISTENCY_VALIDATED),
+        (ExportState.FINAL_CONSISTENCY_VALIDATED, ExportState.PUBLISHING),
+        (ExportState.PUBLISHING, ExportState.FINAL_CONSISTENCY_VALIDATED),
+        (ExportState.FINAL_CONSISTENCY_VALIDATED, ExportState.PUBLISHING),
+        (ExportState.PUBLISHING, ExportState.PUBLISHED),
+    ):
+        database.set_export_state(export_id=export["id"], expected_state=expected, state=target)
+    with pytest.raises(IllegalStateTransition):
+        database.set_export_state(
+            export_id=export["id"], expected_state=ExportState.PUBLISHED, state=ExportState.FAILED
         )
 
 
@@ -608,6 +684,207 @@ def test_schema_rejects_cross_dataset_references_and_wrong_artifact_ownership(tm
                 )
 
     assert first_episode["dataset_id"] == first_dataset
+
+
+def test_attempt_history_evidence_and_proposals_are_append_only_and_source_unique(tmp_path: Path) -> None:
+    database = _db(tmp_path)
+    dataset_id = _dataset(database)
+    database.create_episode(dataset_id=dataset_id, source_episode_index=0, source_length=10)
+    job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    timestamp = "2026-08-21T00:00:00Z"
+    exchange = {
+        "phase": "initial",
+        "started_at": timestamp,
+        "finished_at": timestamp,
+        "request": {
+            "method": "POST",
+            "url": "https://cosmos.example/v1/chat/completions",
+            "body_sha256": "a" * 64,
+        },
+        "response": None,
+        "error": {"class": "TimeoutError", "summary": "request timed out"},
+    }
+    repair_exchange = {
+        "phase": "repair",
+        "started_at": timestamp,
+        "finished_at": timestamp,
+        "request": {
+            "method": "POST",
+            "url": "https://cosmos.example/v1/chat/completions",
+            "body_sha256": "c" * 64,
+        },
+        "response": {
+            "status_code": 200,
+            "id": "chatcmpl-1",
+            "model": "cosmos3-nano",
+            "created": 1_786_992_000,
+            "usage": {"completion_tokens": 42},
+            "finish_reason": "stop",
+        },
+        "error": None,
+    }
+
+    with database.open_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('attempt-one', ?, 0, 0, 'queued', ?, ?)
+            """,
+            (job["id"], timestamp, timestamp),
+        )
+        assert (
+            connection.execute(
+                "SELECT http_exchange_history_json FROM cosmos_attempts WHERE id='attempt-one'"
+            ).fetchone()[0]
+            == "[]"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_attempts(
+                    id, job_id, source_episode_index, attempt_number, state,
+                    http_exchange_history_json, created_at, updated_at
+                ) VALUES ('bad-history', ?, 0, 1, 'queued', '{}', ?, ?)
+                """,
+                (job["id"], timestamp, timestamp),
+            )
+
+    appended = database.append_http_exchange_history(attempt_id="attempt-one", exchange=exchange)
+    assert appended["http_exchange_history_json"] == canonical_json([exchange])
+    appended = database.append_http_exchange_history(attempt_id="attempt-one", exchange=repair_exchange)
+    assert appended["http_exchange_history_json"] == canonical_json([exchange, repair_exchange])
+    with database.open_connection() as connection:
+        connection.execute(
+            """
+            UPDATE cosmos_attempts
+            SET state='leased', lease_owner='worker-1', lease_expires_at=?,
+                error_class='transport', error_summary='retrying'
+            WHERE id='attempt-one'
+            """,
+            (timestamp,),
+        )
+        assert tuple(
+            connection.execute(
+                "SELECT state, lease_owner, error_class FROM cosmos_attempts WHERE id='attempt-one'"
+            ).fetchone()
+        ) == ("leased", "worker-1", "transport")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET http_exchange_history_json='[]' WHERE id='attempt-one'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET id='attempt-renamed' WHERE id='attempt-one'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET job_id='other-job' WHERE id='attempt-one'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET source_episode_index=3 WHERE id='attempt-one'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET attempt_number=4 WHERE id='attempt-one'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM cosmos_attempts WHERE id='attempt-one'")
+
+        for identifier, kind in (
+            ("request-one", "request"),
+            ("request-replacement", "request"),
+            ("response-one", "response"),
+            ("response-replacement", "response"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, attempt_id, kind, relative_path, media_type, byte_size, sha256, created_at
+                ) VALUES (?, 'attempt-one', ?, ?, 'application/json', 0, ?, ?)
+                """,
+                (identifier, kind, f"cosmos/{identifier}.json", "b" * 64, timestamp),
+            )
+        connection.execute(
+            """
+            UPDATE cosmos_attempts
+            SET request_artifact_id='request-one', response_artifact_id='response-one'
+            WHERE id='attempt-one'
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET request_artifact_id=NULL WHERE id='attempt-one'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE cosmos_attempts SET request_artifact_id='request-replacement' WHERE id='attempt-one'"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE cosmos_attempts SET response_artifact_id=NULL WHERE id='attempt-one'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE cosmos_attempts SET response_artifact_id='response-replacement' WHERE id='attempt-one'"
+            )
+
+        connection.execute(
+            """
+            INSERT INTO cosmos_proposals(
+                id, attempt_id, model_response_json, validation_warnings_json, state, created_at
+            ) VALUES ('proposal-one', 'attempt-one', '{}', '[]', 'active', ?)
+            """,
+            (timestamp,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_proposals(
+                    id, attempt_id, model_response_json, validation_warnings_json, state, created_at
+                ) VALUES ('proposal-duplicate', 'attempt-one', '{}', '[]', 'superseded', ?)
+                """,
+                (timestamp,),
+            )
+        connection.execute(
+            """
+            INSERT INTO cosmos_jobs(
+                id, dataset_id, parent_job_id, configuration_json, state, total_attempts,
+                succeeded_attempts, manual_only_attempts, cancel_requested, created_at, updated_at
+            ) VALUES ('retry-job', ?, ?, '{}', 'failed', 0, 0, 0, 0, ?, ?)
+            """,
+            (dataset_id, job["id"], timestamp, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('attempt-two', 'retry-job', 0, 0, 'queued', ?, ?)
+            """,
+            (timestamp, timestamp),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO cosmos_proposals(
+                    id, attempt_id, model_response_json, validation_warnings_json, state, created_at
+                ) VALUES ('proposal-two', 'attempt-two', '{}', '[]', 'active', ?)
+                """,
+                (timestamp,),
+            )
+        connection.execute("UPDATE cosmos_proposals SET state='superseded' WHERE id='proposal-one'")
+        connection.execute(
+            """
+            INSERT INTO cosmos_proposals(
+                id, attempt_id, model_response_json, validation_warnings_json, state, created_at
+            ) VALUES ('proposal-two', 'attempt-two', '{}', '[]', 'active', ?)
+            """,
+            (timestamp,),
+        )
+        for statement in (
+            "UPDATE cosmos_proposals SET id='proposal-renamed' WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET model_response_json='{\"changed\":true}' WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET step_2_start_frame=1 WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET step_3_start_frame=1 WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET step_4_start_frame=1 WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET step_5_start_frame=1 WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET step_6_start_frame=1 WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET step_7_start_frame=1 WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET validation_warnings_json='[\"changed\"]' WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET attempt_id='attempt-one' WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET created_at='2026-08-22T00:00:00Z' WHERE id='proposal-two'",
+            "UPDATE cosmos_proposals SET state='active' WHERE id='proposal-one'",
+            "DELETE FROM cosmos_proposals WHERE id='proposal-two'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(statement)
 
 
 def test_approval_snapshot_uses_canonical_json_and_is_independent_of_insert_order(tmp_path: Path) -> None:
