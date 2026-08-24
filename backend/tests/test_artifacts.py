@@ -21,6 +21,13 @@ from curation.cosmos_transport import (
     build_request_artifact,
     prepare_initial_request,
 )
+from curation.db import (
+    ARTIFACT_KIND_COSMOS_PARSED,
+    ARTIFACT_KIND_COSMOS_REPAIR_RESPONSE,
+    ARTIFACT_KIND_COSMOS_REQUEST,
+    ARTIFACT_KIND_COSMOS_RESPONSE,
+    CurationDatabase,
+)
 import numpy as np
 from PIL import Image
 import pytest
@@ -217,6 +224,57 @@ def test_installed_bytes_are_rechecked_after_link_before_hash_and_database_callb
     assert callbacks == []
 
 
+def test_parent_replacement_after_link_is_detected_before_database_callback(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    destination = workspace / "artifacts/cosmos/id/response.txt"
+    displaced = workspace / "displaced-id"
+    callbacks: list[str] = []
+
+    def replace_parent_after_link(event: str, _: str) -> None:
+        if event == "artifact_linked":
+            destination.parent.rename(displaced)
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(b"complete")
+
+    store = AtomicArtifactStore(workspace, event_hook=replace_parent_after_link)
+    with pytest.raises(ArtifactSecurityError, match="changed"):
+        store.write_bytes(
+            "artifacts/cosmos/id/response.txt",
+            b"complete",
+            media_type="text/plain",
+            register=lambda _: callbacks.append("database") or "id",
+        )
+
+    assert callbacks == []
+    assert (displaced / "response.txt").read_bytes() == b"complete"
+
+
+def test_workspace_root_replacement_after_link_is_detected_before_database_callback(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    displaced = tmp_path / "displaced-workspace"
+    relative = "artifacts/cosmos/id/response.txt"
+    callbacks: list[str] = []
+
+    def replace_workspace_after_link(event: str, _: str) -> None:
+        if event == "artifact_linked":
+            workspace.rename(displaced)
+            replacement = workspace / relative
+            replacement.parent.mkdir(parents=True)
+            replacement.write_bytes(b"complete")
+
+    store = AtomicArtifactStore(workspace, event_hook=replace_workspace_after_link)
+    with pytest.raises(ArtifactSecurityError, match="workspace"):
+        store.write_bytes(
+            relative,
+            b"complete",
+            media_type="text/plain",
+            register=lambda _: callbacks.append("database") or "id",
+        )
+
+    assert callbacks == []
+    assert (displaced / relative).read_bytes() == b"complete"
+
+
 def test_crash_then_identical_replay_reconciles_complete_evidence_before_db(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     store = AtomicArtifactStore(workspace)
@@ -242,6 +300,302 @@ def test_crash_then_identical_replay_reconciles_complete_evidence_before_db(tmp_
     assert replay.database_reference == "id"
     assert callbacks == ["registered"]
     assert (workspace / replay.record.relative_path).read_bytes() == b"complete"
+
+
+def test_fresh_store_adopts_complete_crash_evidence_without_original_bytes(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    relative = "artifacts/cosmos/attempt/response.txt"
+    contents = b"complete response evidence"
+    first = AtomicArtifactStore(workspace)
+
+    with pytest.raises(RuntimeError, match="database crashed"):
+        first.write_bytes(
+            relative,
+            contents,
+            media_type="text/plain; charset=utf-8",
+            register=lambda _: (_ for _ in ()).throw(RuntimeError("database crashed")),
+        )
+
+    registered: list[object] = []
+    fresh = AtomicArtifactStore(workspace)
+    inspected = fresh.inspect_existing(
+        relative,
+        media_type="text/plain; charset=utf-8",
+        expected_sha256=hashlib.sha256(contents).hexdigest(),
+        expected_byte_size=len(contents),
+    )
+    adopted = fresh.adopt_existing(
+        relative,
+        media_type="text/plain; charset=utf-8",
+        expected_sha256=inspected.sha256,
+        expected_byte_size=inspected.byte_size,
+        register=lambda record: registered.append(record) or "artifact-id",
+    )
+
+    assert adopted.record == inspected
+    assert adopted.database_reference == "artifact-id"
+    assert registered == [inspected]
+
+
+def test_fresh_store_recovers_exact_response_bytes_for_parsing_without_http(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    relative = "artifacts/cosmos/attempt/response.txt"
+    raw_response = json.dumps(COMPLETE_RESPONSE, ensure_ascii=False)
+    first = AtomicArtifactStore(workspace)
+
+    with pytest.raises(RuntimeError, match="database crashed"):
+        first.write_text(
+            relative,
+            raw_response,
+            register=lambda _: (_ for _ in ()).throw(RuntimeError("database crashed")),
+        )
+
+    fresh = AtomicArtifactStore(workspace)
+    recovered = fresh.read_existing(
+        relative,
+        media_type="text/plain; charset=utf-8",
+        expected_sha256=hashlib.sha256(raw_response.encode("utf-8")).hexdigest(),
+        expected_byte_size=len(raw_response.encode("utf-8")),
+    )
+    parsed = build_parsed_artifact(
+        raw_response=recovered.contents.decode("utf-8"),
+        duration_s=41.2,
+        parquet_timestamps=tuple(index / 50 for index in range(2_060)),
+        validation_warnings=(),
+    )
+
+    assert recovered.record.relative_path == relative
+    assert recovered.contents == raw_response.encode("utf-8")
+    assert parsed["model_response"] == COMPLETE_RESPONSE
+
+
+def test_adoption_reconciles_all_response_evidence_without_replacing_canonical_pointer(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    database = CurationDatabase(tmp_path / "curation.sqlite3")
+    database.initialize()
+    dataset = database.register_dataset(
+        alias="local/pnp-trash",
+        source_path="/source",
+        source_manifest_sha256="a" * 64,
+        prompt_template_version="pnp-trash-v1",
+        prompt_template_sha256="b" * 64,
+    )
+    database.create_episode(dataset_id=dataset["id"], source_episode_index=0, source_length=10)
+    job = database.create_cosmos_job(dataset_id=dataset["id"], configuration={})
+    with database.open_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO cosmos_attempts(
+                id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+            ) VALUES ('attempt-adopt', ?, 0, 0, 'queued', 'now', 'now')
+            """,
+            (job["id"],),
+        )
+    evidence = (
+        (
+            ARTIFACT_KIND_COSMOS_REQUEST,
+            "request.json",
+            "application/json",
+            b'{"schema_version":1}',
+            True,
+        ),
+        (
+            ARTIFACT_KIND_COSMOS_RESPONSE,
+            "response.txt",
+            "text/plain; charset=utf-8",
+            b"complete response",
+            True,
+        ),
+        (
+            ARTIFACT_KIND_COSMOS_REPAIR_RESPONSE,
+            "repair-response.txt",
+            "text/plain; charset=utf-8",
+            b"repaired response",
+            False,
+        ),
+        (ARTIFACT_KIND_COSMOS_PARSED, "parsed.json", "application/json", b'{"schema_version":1}', False),
+    )
+    for _, name, _, contents, _ in evidence:
+        destination = workspace / "artifacts/cosmos/attempt" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(contents)
+    store = AtomicArtifactStore(workspace)
+    adopted: list[dict[str, object]] = []
+    for kind, name, media_type, _, update_pointer in evidence:
+        relative = f"artifacts/cosmos/attempt/{name}"
+
+        def reconcile(record: object) -> dict[str, object]:
+            return database.reconcile_attempt_artifact(
+                dataset_id=dataset["id"],
+                attempt_id="attempt-adopt",
+                kind=kind,
+                relative_path=getattr(record, "relative_path"),
+                media_type=getattr(record, "media_type"),
+                byte_size=getattr(record, "byte_size"),
+                sha256=getattr(record, "sha256"),
+                update_attempt_pointer=update_pointer,
+            )["artifact"]
+
+        def commit_then_raise(record: object) -> None:
+            reconcile(record)
+            raise ConnectionError("commit acknowledgement was lost")
+
+        with pytest.raises(ConnectionError, match="acknowledgement"):
+            store.adopt_existing(relative, media_type=media_type, register=commit_then_raise)
+        retried = store.adopt_existing(relative, media_type=media_type, register=reconcile)
+        adopted.append(retried.database_reference)
+
+    with database.open_connection() as connection:
+        attempt = connection.execute(
+            "SELECT request_artifact_id, response_artifact_id FROM cosmos_attempts WHERE id='attempt-adopt'"
+        ).fetchone()
+        artifact_rows = list(connection.execute("SELECT id, kind FROM artifacts ORDER BY kind"))
+
+    assert len({artifact["id"] for artifact in adopted}) == 4
+    assert {row["kind"] for row in artifact_rows} == {
+        ARTIFACT_KIND_COSMOS_REQUEST,
+        ARTIFACT_KIND_COSMOS_RESPONSE,
+        ARTIFACT_KIND_COSMOS_REPAIR_RESPONSE,
+        ARTIFACT_KIND_COSMOS_PARSED,
+    }
+    assert attempt["request_artifact_id"] == adopted[0]["id"]
+    assert attempt["response_artifact_id"] == adopted[1]["id"]
+
+
+@pytest.mark.parametrize(
+    ("expected_sha256", "expected_byte_size"),
+    [("0" * 64, None), (None, 999)],
+)
+def test_adoption_rejects_expected_hash_or_size_mismatch_before_database_callback(
+    tmp_path: Path,
+    expected_sha256: str | None,
+    expected_byte_size: int | None,
+) -> None:
+    workspace = tmp_path / "workspace"
+    destination = workspace / "artifacts/response.txt"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"evidence")
+    callbacks: list[str] = []
+    store = AtomicArtifactStore(workspace)
+
+    with pytest.raises(ArtifactConflict, match="expected"):
+        store.adopt_existing(
+            "artifacts/response.txt",
+            media_type="text/plain",
+            expected_sha256=expected_sha256,
+            expected_byte_size=expected_byte_size,
+            register=lambda _: callbacks.append("database") or "id",
+        )
+
+    assert callbacks == []
+
+
+def test_adoption_rejects_symlink_and_parent_swap_before_database_callback(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "response.txt").write_bytes(b"outside")
+    destination = workspace / "artifacts/cosmos/id/response.txt"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"evidence")
+    callbacks: list[str] = []
+
+    destination.unlink()
+    destination.symlink_to(outside / "response.txt")
+    with pytest.raises(ArtifactSecurityError):
+        AtomicArtifactStore(workspace).adopt_existing(
+            "artifacts/cosmos/id/response.txt",
+            media_type="text/plain",
+            register=lambda _: callbacks.append("symlink") or "id",
+        )
+    destination.unlink()
+    destination.write_bytes(b"evidence")
+
+    displaced = workspace / "displaced"
+
+    def swap_parent(event: str, _: str) -> None:
+        if event == "artifact_inspected":
+            destination.parent.rename(displaced)
+            destination.parent.symlink_to(outside, target_is_directory=True)
+
+    store = AtomicArtifactStore(workspace, event_hook=swap_parent)
+    with pytest.raises(ArtifactSecurityError):
+        store.adopt_existing(
+            "artifacts/cosmos/id/response.txt",
+            media_type="text/plain",
+            register=lambda _: callbacks.append("swapped") or "id",
+        )
+
+    assert callbacks == []
+
+
+def test_workspace_root_replacement_during_adoption_blocks_database_callback(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    displaced = tmp_path / "displaced-workspace"
+    relative = "artifacts/cosmos/id/response.txt"
+    destination = workspace / relative
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"evidence")
+    callbacks: list[str] = []
+
+    def replace_workspace(event: str, _: str) -> None:
+        if event == "artifact_inspected":
+            workspace.rename(displaced)
+            replacement = workspace / relative
+            replacement.parent.mkdir(parents=True)
+            replacement.write_bytes(b"evidence")
+
+    store = AtomicArtifactStore(workspace, event_hook=replace_workspace)
+    with pytest.raises(ArtifactSecurityError, match="workspace"):
+        store.adopt_existing(
+            relative,
+            media_type="text/plain",
+            register=lambda _: callbacks.append("database") or "id",
+        )
+
+    assert callbacks == []
+
+
+def test_adoption_callback_failure_can_be_retried_idempotently(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    destination = workspace / "artifacts/response.txt"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"complete")
+    store = AtomicArtifactStore(workspace)
+    calls = 0
+
+    def register(_: object) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("database unavailable")
+        return "artifact-id"
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        store.adopt_existing("artifacts/response.txt", media_type="text/plain", register=register)
+    result = store.adopt_existing(
+        "artifacts/response.txt",
+        media_type="text/plain",
+        register=register,
+    )
+
+    assert calls == 2
+    assert result.database_reference == "artifact-id"
+    assert result.record.sha256 == hashlib.sha256(b"complete").hexdigest()
+
+
+def test_adoption_never_accepts_owned_temporary_file_namespace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    store = AtomicArtifactStore(workspace)
+    temporary = workspace / f".curation-artifact-v1-{secrets.token_hex(16)}.tmp"
+    temporary.write_bytes(b"partial")
+
+    with pytest.raises(ValueError, match="temporary"):
+        store.adopt_existing(
+            temporary.name,
+            media_type="application/octet-stream",
+            register=lambda _: "id",
+        )
 
 
 def test_differing_replay_conflicts_without_overwriting_complete_evidence(tmp_path: Path) -> None:

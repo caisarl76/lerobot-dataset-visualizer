@@ -743,7 +743,60 @@ class _CallResult:
     observed_content: str | None = None
 
 
+@dataclass(frozen=True)
+class CosmosCallObservation:
+    """One immutable, persistable model-call observation for phase-level resume."""
+
+    phase: Literal["initial", "repair"]
+    content: str | None
+    observed_content: str | None
+    reason: str | None
+    retryable: bool
+    _exchange_json: bytes
+
+    def __post_init__(self) -> None:
+        if self.phase not in {"initial", "repair"}:
+            raise ValueError("observation phase is invalid")
+        if any(
+            value is not None and not _valid_utf8_string(value)
+            for value in (self.content, self.observed_content, self.reason)
+        ):
+            raise ValueError("observation strings must be valid UTF-8")
+        if type(self.retryable) is not bool or type(self._exchange_json) is not bytes:
+            raise ValueError("observation retry and exchange fields are invalid")
+        try:
+            exchange = _strict_json_document(self._exchange_json)
+        except (RecursionError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError("observation exchange must be canonical strict JSON") from error
+        if (
+            not isinstance(exchange, dict)
+            or exchange.get("phase") != self.phase
+            or _canonical_json(exchange).encode("utf-8") != self._exchange_json
+        ):
+            raise ValueError("observation exchange must be canonical and match its phase")
+
+    @classmethod
+    def _from_call(cls, phase: Literal["initial", "repair"], result: _CallResult) -> "CosmosCallObservation":
+        exchange_json = _canonical_json(result.exchange).encode("utf-8")
+        return cls(
+            phase=phase,
+            content=result.content,
+            observed_content=result.observed_content,
+            reason=result.reason,
+            retryable=result.retryable,
+            _exchange_json=exchange_json,
+        )
+
+    @property
+    def exchange(self) -> dict[str, Any]:
+        exchange = _strict_json_document(self._exchange_json)
+        if not isinstance(exchange, dict):  # pragma: no cover - guaranteed by construction
+            raise AssertionError("observation exchange invariant failed")
+        return exchange
+
+
 Clock = Callable[[], str]
+ObservationSink = Callable[[CosmosCallObservation], None]
 
 
 def _utc_now() -> str:
@@ -806,6 +859,7 @@ class CosmosTransport:
         clock: Clock = _utc_now,
         timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
         response_max_bytes: int = RESPONSE_MAX_BYTES,
+        persist_observation: ObservationSink | None = None,
     ) -> None:
         if not _valid_utf8_nonempty(model):
             raise ValueError("Cosmos model identifier is required")
@@ -822,11 +876,50 @@ class CosmosTransport:
         self.endpoint = _validated_cosmos_endpoint(base_url)
         self.model = model
         self.api_key = _validated_bearer_token(api_key)
-        self.client = httpx.Client() if client is None else client
+        if persist_observation is not None and not callable(persist_observation):
+            raise ValueError("Cosmos observation persistence hook must be callable")
+        self.client = httpx.Client(trust_env=False, follow_redirects=False) if client is None else client
         self.sleep = sleep
         self.clock = clock
         self.timeout_seconds = float(timeout_seconds)
         self.response_max_bytes = response_max_bytes
+        self.persist_observation = persist_observation
+
+    def observe_initial(self, prepared_request: PreparedInitialRequest) -> CosmosCallObservation:
+        """Perform exactly one initial call for an external durable phase orchestrator."""
+
+        if not isinstance(prepared_request, PreparedInitialRequest):
+            raise TypeError("prepared_request must be a PreparedInitialRequest")
+        if prepared_request.body.get("model") != self.model:
+            raise ValueError("prepared initial request model does not match the transport model")
+        result = self._call(
+            prepared_request.wire_bytes,
+            body_sha256=prepared_request.body_sha256,
+            phase="initial",
+        )
+        return CosmosCallObservation._from_call("initial", result)
+
+    def observe_repair(self, *, invalid_response: str, validation_errors: Sequence[str]) -> CosmosCallObservation:
+        """Perform exactly one bounded text-only repair call for durable orchestration."""
+
+        if not _valid_utf8_string(invalid_response):
+            raise ValueError("repair input must be valid UTF-8 text")
+        if len(invalid_response.encode("utf-8")) > REPAIR_INVALID_RESPONSE_MAX_BYTES:
+            raise ValueError("repair input exceeds the 64 KiB limit")
+        if any(not _valid_utf8_string(error) for error in validation_errors):
+            raise ValueError("repair validation errors must be valid UTF-8 text")
+        repair_body = _build_repair_request_body(
+            model=self.model,
+            invalid_response=invalid_response,
+            validation_errors=validation_errors,
+        )
+        repair_wire = _canonical_json(repair_body).encode("utf-8")
+        result = self._call(
+            repair_wire,
+            body_sha256=hashlib.sha256(repair_wire).hexdigest(),
+            phase="repair",
+        )
+        return CosmosCallObservation._from_call("repair", result)
 
     def annotate(self, sampling: SamplingOutcome) -> CosmosTransportResult:
         if sampling.status == "manual_only":
@@ -842,6 +935,8 @@ class CosmosTransport:
             )
         if sampling.sample is None:
             raise ValueError("ready sampling outcome must contain a prepared sample")
+        if self.persist_observation is None:
+            raise ValueError("ready Cosmos annotation requires synchronous observation persistence")
         sample = sampling.sample
         prepared_request = prepare_initial_request(
             model=self.model,
@@ -849,13 +944,10 @@ class CosmosTransport:
             sample=sample,
         )
         exchanges: list[dict[str, Any]] = []
-        initial: _CallResult | None = None
+        initial: CosmosCallObservation | None = None
         for attempt_number in range(2):
-            initial = self._call(
-                prepared_request.wire_bytes,
-                body_sha256=prepared_request.body_sha256,
-                phase="initial",
-            )
+            initial = self.observe_initial(prepared_request)
+            self.persist_observation(initial)
             exchanges.append(initial.exchange)
             if initial.content is not None or not initial.retryable:
                 break
@@ -903,17 +995,11 @@ class CosmosTransport:
                 validation_errors=validation_errors,
                 prepared_initial_request=prepared_request,
             )
-        repair_body = _build_repair_request_body(
-            model=self.model,
+        repair = self.observe_repair(
             invalid_response=invalid_content,
             validation_errors=validation_errors,
         )
-        repair_wire = _canonical_json(repair_body).encode("utf-8")
-        repair = self._call(
-            repair_wire,
-            body_sha256=hashlib.sha256(repair_wire).hexdigest(),
-            phase="repair",
-        )
+        self.persist_observation(repair)
         exchanges.append(repair.exchange)
         if repair.content is None:
             return self._manual(
@@ -997,6 +1083,7 @@ class CosmosTransport:
                 content=encoded_body,
                 headers=headers,
                 timeout=self.timeout_seconds,
+                follow_redirects=False,
             ) as response:
                 status_code = response.status_code
                 envelope = {
@@ -1316,6 +1403,20 @@ class ArtifactWriteResult(Generic[ReferenceT]):
     database_reference: ReferenceT | None
 
 
+@dataclass(frozen=True)
+class ArtifactReadResult:
+    record: ArtifactRecord
+    contents: bytes
+
+
+@dataclass(frozen=True)
+class _ArtifactSnapshot:
+    record: ArtifactRecord
+    contents: bytes
+    device: int
+    inode: int
+
+
 class ArtifactConflict(RuntimeError):
     """A complete destination exists with different or non-regular bytes."""
 
@@ -1338,6 +1439,12 @@ class AtomicArtifactStore:
         self.workspace = Path(workspace)
         self._event_hook = event_hook
         self._ensure_workspace()
+        root_fd = self._open_workspace_path()
+        try:
+            root_stat = os.fstat(root_fd)
+            self._workspace_identity = (root_stat.st_dev, root_stat.st_ino)
+        finally:
+            os.close(root_fd)
         with self._locked() as root_fd:
             self.startup_cleanup_report = self._cleanup_locked(root_fd, referenced=frozenset())
 
@@ -1357,7 +1464,7 @@ class AtomicArtifactStore:
         if not stat.S_ISDIR(workspace_stat.st_mode) or stat.S_ISLNK(workspace_stat.st_mode):
             raise ArtifactSecurityError("artifact workspace must be a real directory")
 
-    def _open_root(self) -> int:
+    def _open_workspace_path(self) -> int:
         try:
             descriptor = os.open(
                 self.workspace,
@@ -1371,6 +1478,14 @@ class AtomicArtifactStore:
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             os.close(descriptor)
             raise ArtifactSecurityError("artifact workspace must remain a directory")
+        return descriptor
+
+    def _open_root(self) -> int:
+        descriptor = self._open_workspace_path()
+        descriptor_stat = os.fstat(descriptor)
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) != self._workspace_identity:
+            os.close(descriptor)
+            raise ArtifactSecurityError("configured artifact workspace identity changed")
         return descriptor
 
     def _open_lock(self, root_fd: int) -> int:
@@ -1423,23 +1538,106 @@ class AtomicArtifactStore:
         with self._locked() as root_fd:
             parent_fd, parent_relative = self._open_or_create_directories(root_fd, parts[:-1])
             try:
-                durable_contents = self._install_no_clobber(
+                installed = self._install_no_clobber(
                     parent_fd,
                     parent_relative=parent_relative,
                     destination_name=parts[-1],
                     destination_relative=normalized,
                     contents=contents,
+                    media_type=media_type,
                 )
             finally:
                 os.close(parent_fd)
-            record = ArtifactRecord(
-                relative_path=normalized,
-                media_type=media_type,
-                byte_size=len(durable_contents),
-                sha256=hashlib.sha256(durable_contents).hexdigest(),
-            )
+            named = self._snapshot_from_root(root_fd, normalized, media_type=media_type, fsync_parent=True)
+            self._require_same_snapshot(installed, named)
+            configured = self._revalidate_configured_snapshot(named, media_type=media_type)
+            record = configured.record
             database_reference = None if register is None else register(record)
             return ArtifactWriteResult(record=record, database_reference=database_reference)
+
+    def inspect_existing(
+        self,
+        relative_path: str,
+        *,
+        media_type: str,
+        expected_sha256: str | None = None,
+        expected_byte_size: int | None = None,
+    ) -> ArtifactRecord:
+        """Descriptor-safely inspect complete evidence left before a DB reference."""
+
+        normalized = self._validated_existing_target(relative_path)
+        self._validate_expected_artifact(expected_sha256, expected_byte_size)
+        with self._locked() as root_fd:
+            snapshot = self._stable_existing_snapshot(root_fd, normalized, media_type=media_type)
+            self._require_expected_artifact(snapshot.record, expected_sha256, expected_byte_size)
+            configured = self._revalidate_configured_snapshot(snapshot, media_type=media_type)
+            return configured.record
+
+    def read_existing(
+        self,
+        relative_path: str,
+        *,
+        media_type: str,
+        expected_sha256: str | None = None,
+        expected_byte_size: int | None = None,
+    ) -> ArtifactReadResult:
+        """Recover exact immutable bytes from complete evidence without a model call."""
+
+        normalized = self._validated_existing_target(relative_path)
+        self._validate_expected_artifact(expected_sha256, expected_byte_size)
+        with self._locked() as root_fd:
+            snapshot = self._stable_existing_snapshot(root_fd, normalized, media_type=media_type)
+            self._require_expected_artifact(snapshot.record, expected_sha256, expected_byte_size)
+            configured = self._revalidate_configured_snapshot(snapshot, media_type=media_type)
+            return ArtifactReadResult(record=configured.record, contents=configured.contents)
+
+    def adopt_existing(
+        self,
+        relative_path: str,
+        *,
+        media_type: str,
+        register: Callable[[ArtifactRecord], ReferenceT],
+        expected_sha256: str | None = None,
+        expected_byte_size: int | None = None,
+    ) -> ArtifactWriteResult[ReferenceT]:
+        """Durably reconcile complete evidence, then idempotently register it."""
+
+        if not callable(register):
+            raise TypeError("artifact adoption requires a database register callback")
+        normalized = self._validated_existing_target(relative_path)
+        self._validate_expected_artifact(expected_sha256, expected_byte_size)
+        with self._locked() as root_fd:
+            snapshot = self._stable_existing_snapshot(root_fd, normalized, media_type=media_type)
+            self._require_expected_artifact(snapshot.record, expected_sha256, expected_byte_size)
+            configured = self._revalidate_configured_snapshot(snapshot, media_type=media_type)
+            reference = register(configured.record)
+            return ArtifactWriteResult(record=configured.record, database_reference=reference)
+
+    def _validated_existing_target(self, relative_path: str) -> str:
+        normalized = _safe_artifact_relative_path(relative_path)
+        if self._TEMP_PATTERN.fullmatch(PurePosixPath(normalized).name) is not None:
+            raise ValueError("artifact temporary files cannot be inspected or adopted")
+        return normalized
+
+    @staticmethod
+    def _validate_expected_artifact(expected_sha256: str | None, expected_byte_size: int | None) -> None:
+        if expected_sha256 is not None and (
+            not isinstance(expected_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        ):
+            raise ValueError("expected artifact SHA-256 must be lowercase hexadecimal")
+        if expected_byte_size is not None and (type(expected_byte_size) is not int or expected_byte_size < 0):
+            raise ValueError("expected artifact byte size must be a nonnegative built-in integer")
+
+    @staticmethod
+    def _require_expected_artifact(
+        record: ArtifactRecord,
+        expected_sha256: str | None,
+        expected_byte_size: int | None,
+    ) -> None:
+        if expected_sha256 is not None and record.sha256 != expected_sha256:
+            raise ArtifactConflict("artifact does not match the expected SHA-256")
+        if expected_byte_size is not None and record.byte_size != expected_byte_size:
+            raise ArtifactConflict("artifact does not match the expected byte size")
 
     def _open_or_create_directories(self, root_fd: int, components: Sequence[str]) -> tuple[int, str]:
         current_fd = os.dup(root_fd)
@@ -1484,6 +1682,163 @@ class AtomicArtifactStore:
             os.close(current_fd)
             raise
 
+    @staticmethod
+    def _open_existing_directories(root_fd: int, components: Sequence[str]) -> int:
+        current_fd = os.dup(root_fd)
+        try:
+            for component in components:
+                try:
+                    next_fd = os.open(
+                        component,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=current_fd,
+                    )
+                except FileNotFoundError as error:
+                    raise ArtifactConflict("artifact parent directory does not exist") from error
+                except OSError as error:
+                    raise ArtifactSecurityError("artifact parent path is unsafe") from error
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except Exception:
+            os.close(current_fd)
+            raise
+
+    def _snapshot_from_root(
+        self,
+        root_fd: int,
+        relative_path: str,
+        *,
+        media_type: str,
+        fsync_parent: bool,
+    ) -> _ArtifactSnapshot:
+        if not _valid_utf8_nonempty(media_type):
+            raise ValueError("artifact media type must be nonempty UTF-8")
+        parts = PurePosixPath(relative_path).parts
+        parent_fd = self._open_existing_directories(root_fd, parts[:-1])
+        try:
+            if fsync_parent:
+                os.fsync(parent_fd)
+            return self._snapshot_at_parent(
+                parent_fd,
+                parts[-1],
+                relative_path=relative_path,
+                media_type=media_type,
+            )
+        finally:
+            os.close(parent_fd)
+
+    @staticmethod
+    def _snapshot_at_parent(
+        parent_fd: int,
+        destination_name: str,
+        *,
+        relative_path: str,
+        media_type: str,
+    ) -> _ArtifactSnapshot:
+        try:
+            descriptor = os.open(
+                destination_name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError as error:
+            raise ArtifactConflict("artifact does not exist") from error
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise ArtifactSecurityError("artifact destination must not be a symlink") from error
+            raise ArtifactConflict("artifact destination is not a readable regular file") from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ArtifactConflict("artifact destination is not a regular file")
+            digest = hashlib.sha256()
+            byte_size = 0
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+                byte_size += len(chunk)
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            before_identity = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_identity = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if before_identity != after_identity or byte_size != after.st_size:
+                raise ArtifactSecurityError("artifact changed while it was being inspected")
+            return _ArtifactSnapshot(
+                record=ArtifactRecord(
+                    relative_path=relative_path,
+                    media_type=media_type,
+                    byte_size=byte_size,
+                    sha256=digest.hexdigest(),
+                ),
+                contents=b"".join(chunks),
+                device=after.st_dev,
+                inode=after.st_ino,
+            )
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _require_same_snapshot(expected: _ArtifactSnapshot, observed: _ArtifactSnapshot) -> None:
+        if (
+            expected.device != observed.device
+            or expected.inode != observed.inode
+            or expected.record != observed.record
+            or expected.contents != observed.contents
+        ):
+            raise ArtifactSecurityError("artifact path changed during durable verification")
+
+    def _revalidate_configured_snapshot(
+        self, expected: _ArtifactSnapshot, *, media_type: str
+    ) -> _ArtifactSnapshot:
+        configured_root_fd = self._open_root()
+        try:
+            observed = self._snapshot_from_root(
+                configured_root_fd,
+                expected.record.relative_path,
+                media_type=media_type,
+                fsync_parent=True,
+            )
+        finally:
+            os.close(configured_root_fd)
+        self._require_same_snapshot(expected, observed)
+        return observed
+
+    def _stable_existing_snapshot(self, root_fd: int, relative_path: str, *, media_type: str) -> _ArtifactSnapshot:
+        first = self._snapshot_from_root(
+            root_fd,
+            relative_path,
+            media_type=media_type,
+            fsync_parent=True,
+        )
+        self._emit("artifact_inspected", relative_path)
+        second = self._snapshot_from_root(
+            root_fd,
+            relative_path,
+            media_type=media_type,
+            fsync_parent=True,
+        )
+        self._require_same_snapshot(first, second)
+        return second
+
     def _install_no_clobber(
         self,
         parent_fd: int,
@@ -1492,7 +1847,8 @@ class AtomicArtifactStore:
         destination_name: str,
         destination_relative: str,
         contents: bytes,
-    ) -> bytes:
+        media_type: str,
+    ) -> _ArtifactSnapshot:
         temporary_name = f"{self._TEMP_PREFIX}{secrets.token_hex(16)}.tmp"
         temporary_fd = -1
         temporary_exists = False
@@ -1532,7 +1888,18 @@ class AtomicArtifactStore:
             installed = self._read_existing_artifact(parent_fd, destination_name)
             if installed != contents:
                 raise ArtifactConflict(f"installed artifact bytes changed before hashing: {destination_relative}")
-            return installed
+            snapshot = self._snapshot_at_parent(
+                parent_fd,
+                destination_name,
+                relative_path=destination_relative,
+                media_type=media_type,
+            )
+            if (
+                snapshot.record.byte_size != len(contents)
+                or snapshot.record.sha256 != hashlib.sha256(contents).hexdigest()
+            ):
+                raise ArtifactConflict(f"installed artifact bytes changed before hashing: {destination_relative}")
+            return snapshot
         finally:
             if temporary_fd >= 0:
                 os.close(temporary_fd)

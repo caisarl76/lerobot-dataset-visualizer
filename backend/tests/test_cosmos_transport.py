@@ -7,10 +7,12 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+from curation import cosmos_transport
 from curation.cosmos_contract import COSMOS_RESPONSE_V2_SCHEMA
 from curation.cosmos_transport import (
     CANONICAL_PROMPT_PREFIX,
     PROMPT_MAX_BYTES,
+    CosmosCallObservation,
     CosmosTransport,
     PreparedInitialRequest,
     PreparedSample,
@@ -118,9 +120,11 @@ def _transport(
     *,
     sleep_calls: list[float] | None = None,
     response_max_bytes: int = 2 * 1024 * 1024,
+    persist_observation: Any | None = None,
 ) -> CosmosTransport:
     client = httpx.Client(transport=httpx.MockTransport(handler))
     calls = sleep_calls if sleep_calls is not None else []
+    persisted: list[CosmosCallObservation] = []
     return CosmosTransport(
         base_url="http://cosmos.test/v1",
         model="cosmos3-nano-test",
@@ -128,6 +132,7 @@ def _transport(
         client=client,
         sleep=calls.append,
         response_max_bytes=response_max_bytes,
+        persist_observation=persisted.append if persist_observation is None else persist_observation,
     )
 
 
@@ -375,6 +380,50 @@ def test_transport_rejects_noncanonical_response_limit(limit: object) -> None:
         )
 
 
+def test_default_httpx_client_disables_environment_proxies_and_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor_kwargs: list[dict[str, Any]] = []
+
+    class ClientProbe:
+        def __init__(self, **kwargs: Any) -> None:
+            constructor_kwargs.append(kwargs)
+
+    monkeypatch.setattr(cosmos_transport.httpx, "Client", ClientProbe)
+
+    CosmosTransport(base_url="http://cosmos.test/v1", model="model", api_key="key")
+
+    assert constructor_kwargs == [{"trust_env": False, "follow_redirects": False}]
+
+
+def test_injected_redirect_following_client_cannot_forward_bearer_or_video_to_second_host() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "cosmos.test":
+            return httpx.Response(307, headers={"location": "http://evil.test/steal"})
+        return _response(json.dumps(_complete_response()))
+
+    observations: list[CosmosCallObservation] = []
+    transport = CosmosTransport(
+        base_url="http://cosmos.test/v1",
+        model="cosmos3-nano-test",
+        api_key="secret-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        ),
+        persist_observation=observations.append,
+    )
+
+    result = transport.annotate(SamplingOutcome.ready(_sample()))
+
+    assert (result.status, result.reason) == ("manual_only", "http_status")
+    assert [request.url.host for request in requests] == ["cosmos.test"]
+    assert len(observations) == 1
+
+
 @pytest.mark.parametrize(
     ("exception_type", "expected_summary"),
     [
@@ -447,6 +496,170 @@ def test_connection_and_retryable_statuses_retry_once_with_injected_one_second_d
         assert calls == 2
         assert sleep_calls == [1.0]
         assert len(result.exchanges) == 2
+
+
+def test_retry_observation_is_persisted_before_sleep_and_second_model_call() -> None:
+    events: list[str] = []
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        events.append(f"call-{calls}")
+        if calls == 1:
+            raise httpx.ConnectError("offline", request=request)
+        return _response(json.dumps(_complete_response()))
+
+    def persist(observation: CosmosCallObservation) -> None:
+        events.append(f"persist-{observation.phase}-{observation.reason}")
+        assert observation.exchange["phase"] == observation.phase
+        canonical_json(observation.exchange).encode("utf-8")
+
+    transport = _transport(handler, persist_observation=persist)
+    transport.sleep = lambda seconds: events.append(f"sleep-{seconds}")
+
+    result = transport.annotate(SamplingOutcome.ready(_sample()))
+
+    assert result.status == "succeeded"
+    assert events == [
+        "call-1",
+        "persist-initial-connection",
+        "sleep-1.0",
+        "call-2",
+        "persist-initial-None",
+    ]
+
+
+def test_initial_invalid_observation_is_persisted_before_repair_call_and_repair_return() -> None:
+    events: list[str] = []
+    observations: list[CosmosCallObservation] = []
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        events.append(f"call-{calls}")
+        if calls == 1:
+            return _response("not json")
+        return _response(json.dumps(_complete_response()))
+
+    def persist(observation: CosmosCallObservation) -> None:
+        observations.append(observation)
+        events.append(f"persist-{observation.phase}")
+
+    result = _transport(handler, persist_observation=persist).annotate(SamplingOutcome.ready(_sample()))
+    events.append("returned")
+
+    assert result.status == "succeeded"
+    assert events == ["call-1", "persist-initial", "call-2", "persist-repair", "returned"]
+    assert [(value.phase, value.content, value.observed_content) for value in observations] == [
+        ("initial", "not json", "not json"),
+        ("repair", json.dumps(_complete_response()), json.dumps(_complete_response())),
+    ]
+
+
+def test_persistence_failure_propagates_and_prevents_sleep_or_any_later_model_call() -> None:
+    calls = 0
+    sleep_calls: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("offline", request=request)
+
+    def crash(_: CosmosCallObservation) -> None:
+        raise RuntimeError("observation database crashed")
+
+    transport = _transport(handler, persist_observation=crash, sleep_calls=sleep_calls)
+    with pytest.raises(RuntimeError, match="observation database crashed"):
+        transport.annotate(SamplingOutcome.ready(_sample()))
+
+    assert calls == 1
+    assert sleep_calls == []
+
+
+def test_ready_annotation_requires_synchronous_observation_persistence_before_http() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _response(json.dumps(_complete_response()))
+
+    transport = CosmosTransport(
+        base_url="http://cosmos.test/v1",
+        model="cosmos3-nano-test",
+        api_key="secret-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(ValueError, match="persistence"):
+        transport.annotate(SamplingOutcome.ready(_sample()))
+    assert calls == 0
+
+
+def test_public_phase_observation_api_allows_resume_to_skip_an_already_observed_call() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("offline", request=request)
+
+    transport = _transport(handler)
+    prepared = prepare_initial_request(
+        model="cosmos3-nano-test",
+        prompt=build_canonical_prompt(),
+        sample=_sample(),
+    )
+
+    observation = transport.observe_initial(prepared)
+    persisted = [observation]
+    if not persisted:
+        transport.observe_initial(prepared)
+
+    assert calls == 1
+    assert observation.phase == "initial"
+    assert observation.reason == "connection"
+    assert observation.retryable is True
+
+
+def test_initial_observation_rejects_prepared_request_for_a_different_model_without_http() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _response(json.dumps(_complete_response()))
+
+    transport = _transport(handler)
+    wrong_model = prepare_initial_request(
+        model="different-cosmos-model",
+        prompt=build_canonical_prompt(),
+        sample=_sample(),
+    )
+
+    with pytest.raises(ValueError, match="model"):
+        transport.observe_initial(wrong_model)
+    assert calls == 0
+
+
+def test_public_repair_observation_preserves_the_64kib_preflight_without_http() -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return _response(json.dumps(_complete_response()))
+
+    transport = _transport(handler)
+
+    with pytest.raises(ValueError, match="64 KiB"):
+        transport.observe_repair(
+            invalid_response="x" * (64 * 1024 + 1),
+            validation_errors=("invalid",),
+        )
+    assert calls == 0
 
 
 @pytest.mark.parametrize("status_code", [400, 401, 404])

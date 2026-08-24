@@ -32,6 +32,8 @@ SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MILLISECONDS = 5_000
 ARTIFACT_KIND_COSMOS_REQUEST = "request"
 ARTIFACT_KIND_COSMOS_RESPONSE = "response"
+ARTIFACT_KIND_COSMOS_REPAIR_RESPONSE = "repair_response"
+ARTIFACT_KIND_COSMOS_PARSED = "parsed"
 ARTIFACT_KIND_STRUCTURAL_REPORT = "structural_report"
 ARTIFACT_KIND_GROOT_STATS_REPORT = "gr00t_stats_report"
 ARTIFACT_KIND_GROOT_LOADER_REPORT = "gr00t_loader_report"
@@ -118,6 +120,16 @@ class WorkspacePromptContractConflict(RuntimeError):
         self.alias = alias
         self.current_dataset = current_dataset
         super().__init__(f"workspace prompt contract does not match alias {alias}")
+
+
+class ArtifactReconciliationConflict(RuntimeError):
+    """Persisted artifact evidence or its attempt pointer differs from an exact retry."""
+
+    status_code = 409
+    payload = {"error": "artifact_reconciliation_conflict"}
+
+    def __init__(self) -> None:
+        super().__init__("persisted artifact evidence does not match the exact reconciliation request")
 
 
 class PromptMigrationConflict(RuntimeError):
@@ -1051,6 +1063,159 @@ class CurationDatabase:
                 (identifier, attempt_id, export_id, kind, path, media_type, byte_size, sha256, _utc_now()),
             )
             return _require_row(connection.execute("SELECT * FROM artifacts WHERE id=?", (identifier,)).fetchone())
+
+    def reconcile_attempt_artifact(
+        self,
+        *,
+        dataset_id: int,
+        attempt_id: str,
+        kind: str,
+        relative_path: str,
+        media_type: str,
+        byte_size: int,
+        sha256: str,
+        update_attempt_pointer: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Atomically create-or-return one exact attempt artifact and optional pointer."""
+
+        if type(dataset_id) is not int or dataset_id <= 0:
+            raise ValueError("dataset_id must be a positive built-in integer")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError("attempt_id is required")
+        allowed_kinds = {
+            ARTIFACT_KIND_COSMOS_REQUEST,
+            ARTIFACT_KIND_COSMOS_RESPONSE,
+            ARTIFACT_KIND_COSMOS_REPAIR_RESPONSE,
+            ARTIFACT_KIND_COSMOS_PARSED,
+        }
+        if kind not in allowed_kinds:
+            raise ValueError("attempt artifact kind is invalid")
+        if type(update_attempt_pointer) is not bool:
+            raise ValueError("update_attempt_pointer must be a built-in boolean")
+        pointer_columns = {
+            ARTIFACT_KIND_COSMOS_REQUEST: "request_artifact_id",
+            ARTIFACT_KIND_COSMOS_RESPONSE: "response_artifact_id",
+        }
+        pointer_column = pointer_columns.get(kind)
+        if update_attempt_pointer and pointer_column is None:
+            raise ValueError("only a canonical request or response artifact can update an attempt pointer")
+        path = _safe_relative_path(relative_path)
+        if not isinstance(media_type, str) or not media_type:
+            raise ValueError("artifact media_type is required")
+        try:
+            attempt_id.encode("utf-8")
+            media_type.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("artifact identifiers must be valid UTF-8") from error
+        if type(byte_size) is not int or byte_size < 0:
+            raise ValueError("artifact byte_size must be a nonnegative built-in integer")
+        if (
+            not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            raise ValueError("artifact sha256 must be lowercase hexadecimal")
+
+        expected = {
+            "attempt_id": attempt_id,
+            "export_id": None,
+            "kind": kind,
+            "relative_path": path,
+            "media_type": media_type,
+            "byte_size": byte_size,
+            "sha256": sha256,
+        }
+
+        def matches(artifact: Mapping[str, Any]) -> bool:
+            return all(artifact.get(key) == value for key, value in expected.items())
+
+        with self._write() as connection:
+            attempt_owner = _row(
+                connection.execute(
+                    """
+                    SELECT attempt.*, job.dataset_id AS artifact_dataset_id
+                    FROM cosmos_attempts AS attempt
+                    JOIN cosmos_jobs AS job ON job.id=attempt.job_id
+                    WHERE attempt.id=?
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+            )
+            if attempt_owner is None:
+                raise LookupError("Cosmos attempt not found")
+            if attempt_owner["artifact_dataset_id"] != dataset_id:
+                raise ArtifactReconciliationConflict()
+
+            artifact = _row(
+                connection.execute(
+                    "SELECT * FROM artifacts WHERE relative_path=?",
+                    (path,),
+                ).fetchone()
+            )
+            artifacts_for_kind = [
+                _require_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM artifacts WHERE attempt_id=? AND kind=? ORDER BY id",
+                    (attempt_id, kind),
+                ).fetchall()
+            ]
+            if len(artifacts_for_kind) > 1:
+                raise ArtifactReconciliationConflict()
+            if artifacts_for_kind and (artifact is None or artifact["id"] != artifacts_for_kind[0]["id"]):
+                raise ArtifactReconciliationConflict()
+
+            pointer_id = None if pointer_column is None else attempt_owner[pointer_column]
+            if pointer_id is not None:
+                pointed = _require_row(
+                    connection.execute("SELECT * FROM artifacts WHERE id=?", (pointer_id,)).fetchone(),
+                    "attempt artifact pointer is broken",
+                )
+                if artifact is None or artifact["id"] != pointer_id or not matches(pointed):
+                    raise ArtifactReconciliationConflict()
+                return {
+                    "artifact": pointed,
+                    "attempt": _require_row(
+                        connection.execute("SELECT * FROM cosmos_attempts WHERE id=?", (attempt_id,)).fetchone()
+                    ),
+                }
+
+            if artifact is None:
+                artifact_id = str(uuid4())
+                connection.execute(
+                    """
+                    INSERT INTO artifacts(
+                        id, attempt_id, export_id, kind, relative_path, media_type,
+                        byte_size, sha256, created_at
+                    ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact_id,
+                        attempt_id,
+                        kind,
+                        path,
+                        media_type,
+                        byte_size,
+                        sha256,
+                        _utc_now(),
+                    ),
+                )
+                artifact = _require_row(
+                    connection.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+                )
+            elif not matches(artifact):
+                raise ArtifactReconciliationConflict()
+
+            if update_attempt_pointer:
+                connection.execute(
+                    f"UPDATE cosmos_attempts SET {pointer_column}=?, updated_at=? WHERE id=?",
+                    (artifact["id"], _utc_now(), attempt_id),
+                )
+            return {
+                "artifact": artifact,
+                "attempt": _require_row(
+                    connection.execute("SELECT * FROM cosmos_attempts WHERE id=?", (attempt_id,)).fetchone()
+                ),
+            }
 
     def approval_snapshot(self, *, dataset_id: int) -> dict[str, Any]:
         """Return a stable approval snapshot independent of SQLite row insertion order."""

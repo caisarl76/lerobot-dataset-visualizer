@@ -9,6 +9,11 @@ from typing import Any
 
 import curation.db as db_module
 from curation.db import (
+    ARTIFACT_KIND_COSMOS_PARSED,
+    ARTIFACT_KIND_COSMOS_REPAIR_RESPONSE,
+    ARTIFACT_KIND_COSMOS_REQUEST,
+    ARTIFACT_KIND_COSMOS_RESPONSE,
+    ArtifactReconciliationConflict,
     CurationDatabase,
     IllegalStateTransition,
     OptimisticConflict,
@@ -516,6 +521,115 @@ def test_audit_events_are_append_only_and_artifacts_are_workspace_relative(tmp_p
                     """,
                     (f"artifact-{unsafe}", unsafe, "e" * 64),
                 )
+
+
+def test_attempt_artifact_reconciliation_is_exact_for_all_cosmos_evidence_after_unknown_commit(
+    tmp_path: Path,
+) -> None:
+    database = _db(tmp_path)
+    dataset_id = _dataset(database, "local/reconcile")
+    other_dataset_id = _dataset(database, "local/other")
+    database.create_episode(dataset_id=dataset_id, source_episode_index=0, source_length=10)
+    job = database.create_cosmos_job(dataset_id=dataset_id, configuration={})
+    with database.open_connection() as connection:
+        for attempt_id, attempt_number in (("attempt-reconcile", 0), ("attempt-other", 1)):
+            connection.execute(
+                """
+                INSERT INTO cosmos_attempts(
+                    id, job_id, source_episode_index, attempt_number, state, created_at, updated_at
+                ) VALUES (?, ?, 0, ?, 'queued', 'now', 'now')
+                """,
+                (attempt_id, job["id"], attempt_number),
+            )
+
+    common = {"dataset_id": dataset_id, "attempt_id": "attempt-reconcile"}
+    evidence = (
+        {
+            "kind": ARTIFACT_KIND_COSMOS_REQUEST,
+            "relative_path": "artifacts/cosmos/attempt-reconcile/request.json",
+            "media_type": "application/json",
+            "byte_size": 13,
+            "sha256": "b" * 64,
+            "update_attempt_pointer": True,
+        },
+        {
+            "kind": ARTIFACT_KIND_COSMOS_RESPONSE,
+            "relative_path": "artifacts/cosmos/attempt-reconcile/response.txt",
+            "media_type": "text/plain; charset=utf-8",
+            "byte_size": 17,
+            "sha256": "c" * 64,
+            "update_attempt_pointer": True,
+        },
+        {
+            "kind": ARTIFACT_KIND_COSMOS_REPAIR_RESPONSE,
+            "relative_path": "artifacts/cosmos/attempt-reconcile/repair-response.txt",
+            "media_type": "text/plain; charset=utf-8",
+            "byte_size": 19,
+            "sha256": "d" * 64,
+            "update_attempt_pointer": False,
+        },
+        {
+            "kind": ARTIFACT_KIND_COSMOS_PARSED,
+            "relative_path": "artifacts/cosmos/attempt-reconcile/parsed.json",
+            "media_type": "application/json",
+            "byte_size": 23,
+            "sha256": "e" * 64,
+            "update_attempt_pointer": False,
+        },
+    )
+    reconciled: list[dict[str, dict[str, Any]]] = []
+    for artifact in evidence:
+        exact = common | artifact
+
+        def commit_then_raise() -> None:
+            database.reconcile_attempt_artifact(**exact)
+            raise ConnectionError("commit acknowledgement was lost")
+
+        with pytest.raises(ConnectionError, match="acknowledgement"):
+            commit_then_raise()
+        retried = database.reconcile_attempt_artifact(**exact)
+        reconciled.append(retried)
+
+        for mismatch in (
+            {
+                "kind": (
+                    ARTIFACT_KIND_COSMOS_REQUEST
+                    if artifact["kind"] == ARTIFACT_KIND_COSMOS_RESPONSE
+                    else ARTIFACT_KIND_COSMOS_RESPONSE
+                )
+            },
+            {"relative_path": f"artifacts/cosmos/attempt-reconcile/other-{artifact['kind']}"},
+            {"media_type": "application/octet-stream"},
+            {"byte_size": artifact["byte_size"] + 1},
+            {"sha256": "f" * 64},
+        ):
+            with pytest.raises(ArtifactReconciliationConflict):
+                database.reconcile_attempt_artifact(**(exact | mismatch))
+
+    with database.open_connection() as connection:
+        artifacts = list(connection.execute("SELECT * FROM artifacts ORDER BY relative_path"))
+        attempt = connection.execute(
+            "SELECT request_artifact_id, response_artifact_id FROM cosmos_attempts WHERE id='attempt-reconcile'"
+        ).fetchone()
+    assert len(artifacts) == 4
+    canonical_request = reconciled[0]["artifact"]
+    canonical_response = reconciled[1]["artifact"]
+    assert attempt[0] == canonical_request["id"]
+    assert attempt[1] == canonical_response["id"]
+    assert all(result["attempt"]["request_artifact_id"] == canonical_request["id"] for result in reconciled)
+    assert all(result["attempt"]["response_artifact_id"] == canonical_response["id"] for result in reconciled[1:])
+
+    mismatches = (
+        {"dataset_id": other_dataset_id},
+        {"attempt_id": "attempt-other"},
+    )
+    for mismatch in mismatches:
+        with pytest.raises(ArtifactReconciliationConflict):
+            database.reconcile_attempt_artifact(**(common | evidence[1] | mismatch))
+
+    for artifact in evidence[2:]:
+        with pytest.raises(ValueError, match="canonical request or response"):
+            database.reconcile_attempt_artifact(**(common | artifact | {"update_attempt_pointer": True}))
 
 
 def test_schema_rejects_cross_dataset_references_and_wrong_artifact_ownership(tmp_path: Path) -> None:
