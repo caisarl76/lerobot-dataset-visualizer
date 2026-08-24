@@ -309,6 +309,37 @@ def test_nonfinite_json_numbers_are_rejected(content: str) -> None:
         _contract().parse_cosmos_response(content, duration_s=41.2)
 
 
+@pytest.mark.parametrize("field", ["start_s", "end_s", "confidence"])
+def test_huge_json_numbers_are_reported_as_contract_errors(field: str) -> None:
+    response = deepcopy(COMPLETE_RESPONSE)
+    response["segments"][0][field] = 10**1000
+    with pytest.raises(_contract().CosmosContractError):
+        _parse(response)
+
+
+def test_many_huge_json_numbers_cannot_escape_contract_validation() -> None:
+    response = deepcopy(COMPLETE_RESPONSE)
+    for segment in response["segments"]:
+        segment["start_s"] = 10**1000
+    with pytest.raises(_contract().CosmosContractError):
+        _parse(response)
+
+
+@pytest.mark.parametrize("field", ["caption", "evidence"])
+def test_segment_human_text_must_be_valid_utf8(field: str) -> None:
+    response = deepcopy(COMPLETE_RESPONSE)
+    response["segments"][0][field] = "\ud800"
+    with pytest.raises(_contract().CosmosContractError):
+        _parse(response)
+
+
+def test_uncertainties_must_be_valid_utf8() -> None:
+    response = deepcopy(INCOMPLETE_RESPONSE)
+    response["uncertainties"] = ["\ud800"]
+    with pytest.raises(_contract().CosmosContractError):
+        _parse(response)
+
+
 def test_incomplete_response_requires_an_uncertainty() -> None:
     response = deepcopy(INCOMPLETE_RESPONSE)
     response["uncertainties"] = []
@@ -340,13 +371,13 @@ def test_complete_response_requires_coverage_and_adjacency(segment_index: int, f
         _parse(response)
 
 
-def test_complete_response_requires_ordered_segment_ends() -> None:
+def test_complete_response_does_not_require_strictly_increasing_end_times() -> None:
     response = deepcopy(COMPLETE_RESPONSE)
     response["segments"][0]["end_s"] = 9.0
     response["segments"][1]["start_s"] = 8.6
     response["segments"][1]["end_s"] = 8.9
-    with pytest.raises(_contract().CosmosContractError):
-        _parse(response)
+    response["segments"][2]["start_s"] = 8.8
+    assert _parse(response) == response
 
 
 def test_complete_proposal_snaps_float64_ties_to_lower_frame_index() -> None:

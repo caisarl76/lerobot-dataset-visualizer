@@ -148,25 +148,36 @@ def _schema_error_key(error: Any) -> tuple[str, str]:
 def _validate_dynamic_contract(response: dict[str, Any], *, duration_s: float) -> None:
     if isinstance(duration_s, bool) or not isinstance(duration_s, (int, float, np.floating)):
         raise CosmosContractError("video duration must be a finite positive number")
-    duration = float(duration_s)
+    try:
+        duration = float(duration_s)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise CosmosContractError("video duration must be a finite positive number") from error
     if not math.isfinite(duration) or duration <= 0:
         raise CosmosContractError("video duration must be a finite positive number")
 
     segments = response["segments"]
     errors: list[str] = []
-    timed_segments: list[dict[str, Any]] = []
+    timed_segments: list[tuple[dict[str, Any], float, float]] = []
     for segment in segments:
+        if not _is_valid_utf8(segment["caption"]):
+            errors.append(f"step {segment['step']} caption must be valid UTF-8")
+        evidence = segment["evidence"]
+        if evidence is not None and not _is_valid_utf8(evidence):
+            errors.append(f"step {segment['step']} evidence must be valid UTF-8")
         if segment["status"] == "not_observed":
             continue
-        start_s = segment["start_s"]
-        end_s = segment["end_s"]
-        confidence = segment["confidence"]
-        if not all(math.isfinite(float(value)) for value in (start_s, end_s, confidence)):
+        start_s = _finite_float(segment["start_s"])
+        end_s = _finite_float(segment["end_s"])
+        confidence = _finite_float(segment["confidence"])
+        if start_s is None or end_s is None or confidence is None:
             errors.append(f"step {segment['step']} times and confidence must be finite")
             continue
         if not 0 <= start_s < end_s <= duration:
             errors.append(f"step {segment['step']} must satisfy 0 <= start_s < end_s <= duration")
-        timed_segments.append(segment)
+        timed_segments.append((segment, start_s, end_s))
+
+    if any(not _is_valid_utf8(uncertainty) for uncertainty in response["uncertainties"]):
+        errors.append("uncertainties must contain valid UTF-8 strings")
 
     expected_missing = [segment["step"] for segment in segments if segment["status"] != "completed"]
     if response["missing_steps"] != expected_missing:
@@ -177,27 +188,41 @@ def _validate_dynamic_contract(response: dict[str, Any], *, duration_s: float) -
     if not expected_complete and not response["uncertainties"]:
         errors.append("an incomplete response must contain at least one uncertainty")
 
-    starts = [float(segment["start_s"]) for segment in timed_segments]
+    starts = [start_s for _, start_s, _ in timed_segments]
     if not _strictly_increasing(starts):
         errors.append("non-null timed segments must have strictly increasing starts")
 
-    if expected_complete:
-        ends = [float(segment["end_s"]) for segment in timed_segments]
-        if not _strictly_increasing(ends):
-            errors.append("complete segments must have strictly increasing ends")
+    if expected_complete and len(timed_segments) == len(segments):
+        ends = [end_s for _, _, end_s in timed_segments]
         if abs(starts[0]) > 0.25:
             errors.append("a complete response must start at 0 within 0.25 seconds")
         if abs(ends[-1] - duration) > 0.5:
             errors.append("a complete response must end at duration within 0.5 seconds")
         for previous, following in zip(timed_segments, timed_segments[1:]):
-            if abs(float(previous["end_s"]) - float(following["start_s"])) > 0.5:
+            if abs(previous[2] - following[1]) > 0.5:
                 errors.append(
-                    f"complete steps {previous['step']} and {following['step']} "
+                    f"complete steps {previous[0]['step']} and {following[0]['step']} "
                     "must be adjacent within 0.5 seconds"
                 )
 
     if errors:
         raise CosmosContractError(errors)
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return normalized if math.isfinite(normalized) else None
+
+
+def _is_valid_utf8(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _strictly_increasing(values: Iterable[float | int]) -> bool:
