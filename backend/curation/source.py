@@ -34,8 +34,23 @@ class SourceRecord:
             return None
         return open_regular_file_beneath(self.root, relative, identity)
 
+    def verify_current_inventory(self) -> bool:
+        """Verify every registered file still has its manifest-time identity."""
+        try:
+            current_paths = {relative_path for _, relative_path, _ in _manifest_eligible_files(self.root)}
+        except CurationConfigurationError:
+            return False
+        if current_paths != set(self.file_identities):
+            return False
+        for relative_path in sorted(self.file_identities, key=lambda path: path.encode("utf-8")):
+            asset = self.open_asset(relative_path)
+            if asset is None:
+                return False
+            asset.close()
+        return True
 
-def _manifest_bytes(root: Path) -> tuple[bytes, dict[str, str], dict[str, SourceFileIdentity]]:
+
+def _manifest_eligible_files(root: Path) -> list[tuple[bytes, str, Path]]:
     entries: list[tuple[bytes, str, Path]] = []
     for directory, _, filenames in os.walk(root, followlinks=False):
         directory_path = Path(directory)
@@ -51,10 +66,14 @@ def _manifest_bytes(root: Path) -> tuple[bytes, dict[str, str], dict[str, Source
             except UnicodeEncodeError as error:
                 raise CurationConfigurationError("source paths must be UTF-8") from error
             entries.append((encoded, relative, path))
+    return sorted(entries, key=lambda item: item[0])
+
+
+def _manifest_bytes(root: Path) -> tuple[bytes, dict[str, str], dict[str, SourceFileIdentity]]:
     lines: list[bytes] = []
     hashes: dict[str, str] = {}
     identities: dict[str, SourceFileIdentity] = {}
-    for _, relative, path in sorted(entries, key=lambda item: item[0]):
+    for _, relative, path in _manifest_eligible_files(root):
         digest, identity = _sha256_file(path)
         hashes[relative] = digest
         identities[relative] = identity

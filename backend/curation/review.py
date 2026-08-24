@@ -14,6 +14,7 @@ from .db import (
     CurationDatabase,
     IllegalStateTransition,
     OptimisticConflict,
+    PromptContractConflict,
     WorkspaceSourceConflict,
 )
 from .models import ReviewState
@@ -230,6 +231,8 @@ class ReviewService:
                 "dataset alias is not registered",
                 {"error": "dataset_alias_not_found", "dataset_alias": dataset_alias},
             )
+        if not record.verify_current_inventory():
+            raise _source_identity_conflict(record)
         if dataset_alias in self._sources:
             current_dataset = self.database.get_dataset(alias=dataset_alias)
             if current_dataset is not None and (
@@ -411,14 +414,46 @@ class ReviewService:
             "keep_approved",
         )
         issues: list[str] = []
+        normalized_object: str | None = None
         try:
-            normalize_object_name(row["object_name"])
+            normalized_object = normalize_object_name(row["object_name"])
         except (TypeError, ValueError):
             issues.append("object_name must be nonempty")
+        else:
+            if normalized_object != row["object_name"]:
+                issues.append("object_name is not already normalized")
         if row["pickup_hand"] not in {"left", "right"}:
             issues.append("pickup_hand must be left or right")
         if row["turn_direction"] not in {"left", "right"}:
             issues.append("turn_direction must be left or right")
+        if (
+            normalized_object is not None
+            and normalized_object == row["object_name"]
+            and row["pickup_hand"] in {"left", "right"}
+            and row["turn_direction"] in {"left", "right"}
+        ):
+            canonical_prompts = expand_prompts(
+                object_name=normalized_object,
+                hand=row["pickup_hand"],
+                turn=row["turn_direction"],
+            )
+            try:
+                prompts = self._prompt_expander(
+                    object_name=normalized_object,
+                    hand=row["pickup_hand"],
+                    turn=row["turn_direction"],
+                )
+            except Exception:
+                prompts = None
+            if (
+                not isinstance(prompts, list)
+                or len(prompts) != 7
+                or any(not isinstance(prompt, str) or not prompt.strip() for prompt in prompts)
+                or prompts != canonical_prompts
+            ):
+                issues.append(
+                    "prompt expansion must yield exactly seven nonempty prompts matching the canonical generator"
+                )
         try:
             _validate_transitions(
                 [row[column] for column in _STEP_COLUMNS], source.lengths[source_episode_index], True
@@ -446,6 +481,8 @@ class ReviewService:
                 "rejection_reason": None,
             },
             "keep_approved",
+            required_prompt_template_version=self.prompt_template_version,
+            required_prompt_template_sha256=self.prompt_template_sha256,
         )
 
     def approve_reject(
@@ -533,6 +570,8 @@ class ReviewService:
                 "dataset alias is not registered",
                 {"error": "dataset_alias_not_found", "dataset_alias": dataset_alias},
             )
+        if not record.verify_current_inventory():
+            raise _source_identity_conflict(record)
         if dataset is None or source is None:
             raise ReviewConflict(
                 "workspace has not been opened",
@@ -606,6 +645,9 @@ class ReviewService:
         allowed_states: frozenset[ReviewState],
         changes: dict[str, Any],
         operation: str,
+        *,
+        required_prompt_template_version: str | None = None,
+        required_prompt_template_sha256: str | None = None,
     ) -> dict[str, Any]:
         if source_episode_index not in source.lengths:
             raise ReviewNotFound(
@@ -621,7 +663,11 @@ class ReviewService:
                 changes=changes,
                 actor=actor,
                 operation=operation,
+                required_prompt_template_version=required_prompt_template_version,
+                required_prompt_template_sha256=required_prompt_template_sha256,
             )
+        except PromptContractConflict as error:
+            raise ReviewConflict(str(error), error.payload) from error
         except OptimisticConflict as error:
             raise ReviewConflict(
                 "episode revision does not match expected_revision",
@@ -669,7 +715,7 @@ class ReviewService:
                     hand=row["pickup_hand"],
                     turn=row["turn_direction"],
                 )
-            except ValueError:
+            except Exception:
                 prompts = None
         proposal_warnings = [] if proposal is None else proposal["warnings"]
         warnings = sorted(set([*proposal_warnings, *_decision_warnings(row, dataset, source)]))
@@ -732,9 +778,12 @@ def _decision_warnings(row: dict[str, Any], dataset: dict[str, Any], source: _So
     prefix = "draft" if state is ReviewState.DRAFT else state.value
     if state in {ReviewState.DRAFT, ReviewState.APPROVED_KEEP}:
         try:
-            normalize_object_name(row["object_name"])
+            normalized_object = normalize_object_name(row["object_name"])
         except (TypeError, ValueError):
             warnings.append(f"{prefix}_object_name_invalid")
+        else:
+            if normalized_object != row["object_name"]:
+                warnings.append(f"{prefix}_object_name_invalid")
         if row["pickup_hand"] not in {"left", "right"}:
             warnings.append(f"{prefix}_pickup_hand_invalid")
         if row["turn_direction"] not in {"left", "right"}:

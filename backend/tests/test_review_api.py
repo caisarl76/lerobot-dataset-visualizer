@@ -25,6 +25,7 @@ def review_source(tmp_path: Path) -> tuple[SourceRegistry, Path]:
     source = tmp_path / "source"
     (source / "meta").mkdir(parents=True)
     (source / "data" / "chunk-000").mkdir(parents=True)
+    (source / "videos").mkdir(parents=True)
     (source / "meta" / "info.json").write_text(
         json.dumps(
             {
@@ -51,6 +52,8 @@ def review_source(tmp_path: Path) -> tuple[SourceRegistry, Path]:
             ),
             source / "data" / "chunk-000" / f"episode_{episode_index:06d}.parquet",
         )
+    (source / "videos" / "episode_000000.mp4").write_bytes(b"registered video bytes")
+    (source / "unknown.bin").write_bytes(b"registered unknown bytes")
     return SourceRegistry.from_paths({"local/pnp_trash": source}, workspace=tmp_path / "manifest"), source
 
 
@@ -259,6 +262,72 @@ def test_swapped_registered_parquet_fails_closed(
     with pytest.raises(ReviewConflict) as parquet_error:
         service.get_episode("local/pnp_trash", 0)
     assert parquet_error.value.payload["error"] == "source_fingerprint_mismatch"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "meta/episodes.jsonl",
+        "data/chunk-000/episode_000000.parquet",
+        "videos/episode_000000.mp4",
+        "unknown.bin",
+    ],
+)
+def test_every_review_path_revalidates_complete_inventory_after_timestamps_are_cached(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+    relative_path: str,
+) -> None:
+    _, source = review_source
+    review_service.get_episode("local/pnp_trash", 0)
+    target = source / relative_path
+    replacement = target.with_name(f"replacement-{target.name}")
+    replacement.write_bytes(target.read_bytes())
+    os.replace(replacement, target)
+
+    operations = [
+        lambda: review_service.open_workspace("local/pnp_trash", actor="curator"),
+        lambda: review_service.get_episode("local/pnp_trash", 0),
+        lambda: review_service.save_draft(
+            dataset_alias="local/pnp_trash",
+            source_episode_index=0,
+            expected_revision=0,
+            actor="curator",
+        ),
+    ]
+    for operation in operations:
+        with pytest.raises(ReviewConflict) as raised:
+            operation()
+        assert raised.value.payload["error"] == "source_fingerprint_mismatch"
+
+
+@pytest.mark.parametrize("change", ["added", "deleted"])
+def test_cached_review_paths_reject_added_or_deleted_regular_files(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+    change: str,
+) -> None:
+    _, source = review_source
+    review_service.get_episode("local/pnp_trash", 0)
+    if change == "added":
+        (source / "added-after-registration.bin").write_bytes(b"new inventory entry")
+    else:
+        (source / "unknown.bin").unlink()
+
+    operations = [
+        lambda: review_service.open_workspace("local/pnp_trash", actor="curator"),
+        lambda: review_service.get_episode("local/pnp_trash", 0),
+        lambda: review_service.save_draft(
+            dataset_alias="local/pnp_trash",
+            source_episode_index=0,
+            expected_revision=0,
+            actor="curator",
+        ),
+    ]
+    for operation in operations:
+        with pytest.raises(ReviewConflict) as raised:
+            operation()
+        assert raised.value.payload["error"] == "source_fingerprint_mismatch"
 
 
 def test_draft_normalizes_object_previews_prompts_and_validates_boundaries(review_service: ReviewService) -> None:
@@ -497,6 +566,73 @@ def test_prompt_change_invalidates_only_keeps_in_one_transaction(
         assert events[0]["actor"] == "template-migrator"
 
 
+def test_approval_wins_then_prompt_invalidation_reopens_the_keep(review_service: ReviewService) -> None:
+    draft = _complete_draft(review_service)
+    approved = review_service.approve_keep(
+        dataset_alias="local/pnp_trash",
+        source_episode_index=0,
+        expected_revision=draft["revision"],
+        actor="curator",
+        reviewer="reviewer",
+    )
+    dataset = review_service.database.get_dataset(alias="local/pnp_trash")
+    assert dataset is not None
+
+    invalidated = review_service.database.update_prompt_template(
+        dataset_id=dataset["id"],
+        prompt_template_version="pnp-trash-prompts-v2",
+        prompt_template_sha256="1" * 64,
+        actor="template-migrator",
+    )
+
+    assert len(invalidated) == 1
+    assert invalidated[0]["review_state"] == "draft"
+    assert invalidated[0]["revision"] == approved["revision"] + 1
+    assert invalidated[0]["approval_revision"] is None
+
+
+def test_prompt_invalidation_between_preflight_and_approval_blocks_stale_keep(
+    review_service: ReviewService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft = _complete_draft(review_service)
+    database = review_service.database
+    dataset = database.get_dataset(alias="local/pnp_trash")
+    assert dataset is not None
+    original_transition = database.transition_review_episode
+
+    def invalidate_then_transition(**arguments: Any) -> dict[str, Any]:
+        database.update_prompt_template(
+            dataset_id=dataset["id"],
+            prompt_template_version="pnp-trash-prompts-v2",
+            prompt_template_sha256="2" * 64,
+            actor="template-migrator",
+        )
+        return original_transition(**arguments)
+
+    monkeypatch.setattr(database, "transition_review_episode", invalidate_then_transition)
+    with pytest.raises(ReviewConflict) as raised:
+        review_service.approve_keep(
+            dataset_alias="local/pnp_trash",
+            source_episode_index=0,
+            expected_revision=draft["revision"],
+            actor="curator",
+            reviewer="reviewer",
+        )
+
+    assert raised.value.payload["error"] == "prompt_contract_conflict"
+    assert raised.value.payload["required_prompt_template_version"] == PROMPT_TEMPLATE_VERSION
+    assert raised.value.payload["required_prompt_template_sha256"] == PROMPT_TEMPLATE_SHA256
+    assert raised.value.payload["dataset_prompt_template_version"] == "pnp-trash-prompts-v2"
+    assert raised.value.payload["dataset_prompt_template_sha256"] == "2" * 64
+    assert raised.value.payload["episode_prompt_template_sha256"] == PROMPT_TEMPLATE_SHA256
+    current = database.get_episode(dataset_id=dataset["id"], source_episode_index=0)
+    assert current is not None
+    assert current["review_state"] == "draft"
+    assert current["revision"] == draft["revision"]
+    assert current["approval_revision"] is None
+
+
 def test_stale_service_is_blocked_after_another_service_changes_the_template(
     review_service: ReviewService, review_source: tuple[SourceRegistry, Path]
 ) -> None:
@@ -638,6 +774,67 @@ def test_stale_prompt_hash_and_empty_reviewer_cannot_be_approved(review_service:
                 actor="curator",
                 reviewer=reviewer,
             )
+
+
+def test_unnormalized_stored_object_cannot_be_approved(review_service: ReviewService) -> None:
+    draft = _complete_draft(review_service)
+    database = review_service.database
+    dataset = database.get_dataset(alias="local/pnp_trash")
+    assert dataset is not None
+    corrupted = database.update_episode(
+        dataset_id=dataset["id"],
+        source_episode_index=0,
+        expected_revision=draft["revision"],
+        changes={"object_name": "  Crumpled CAN  "},
+        actor="test-corruptor",
+    )
+
+    with pytest.raises(ReviewValidation, match="already normalized"):
+        review_service.approve_keep(
+            dataset_alias="local/pnp_trash",
+            source_episode_index=0,
+            expected_revision=corrupted["revision"],
+            actor="curator",
+            reviewer="reviewer",
+        )
+
+
+@pytest.mark.parametrize("mode", ["raises", "six", "empty", "wrong"])
+def test_invalid_or_failing_prompt_expander_cannot_be_approved(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+    mode: str,
+) -> None:
+    draft = _complete_draft(review_service)
+    calls: list[dict[str, str]] = []
+
+    def invalid_expander(**arguments: str) -> list[str]:
+        calls.append(arguments)
+        if mode == "raises":
+            raise RuntimeError("prompt expansion failed")
+        if mode == "six":
+            return ["prompt"] * 6
+        if mode == "empty":
+            return ["prompt"] * 6 + [""]
+        return ["plausible but wrong prompt"] * 7
+
+    validating = ReviewService(
+        database=review_service.database,
+        source_registry=review_source[0],
+        prompt_expander=invalid_expander,
+    )
+    validating.open_workspace("local/pnp_trash", actor="curator")
+
+    with pytest.raises(ReviewValidation, match="seven nonempty"):
+        validating.approve_keep(
+            dataset_alias="local/pnp_trash",
+            source_episode_index=0,
+            expected_revision=draft["revision"],
+            actor="curator",
+            reviewer="reviewer",
+        )
+
+    assert calls == [{"object_name": "Crumpled CAN", "hand": "left", "turn": "right"}]
 
 
 def test_optimistic_conflict_payload_returns_the_current_episode_in_both_directions(

@@ -111,6 +111,31 @@ class WorkspaceSourceConflict(RuntimeError):
         super().__init__(f"registered workspace source does not match alias {alias}")
 
 
+class PromptContractConflict(RuntimeError):
+    """Approval raced with a dataset prompt-contract update."""
+
+    status_code = 409
+
+    def __init__(
+        self,
+        *,
+        required_version: str,
+        required_sha256: str,
+        dataset_version: str,
+        dataset_sha256: str,
+        episode_sha256: str | None,
+    ) -> None:
+        self.payload = {
+            "error": "prompt_contract_conflict",
+            "required_prompt_template_version": required_version,
+            "required_prompt_template_sha256": required_sha256,
+            "dataset_prompt_template_version": dataset_version,
+            "dataset_prompt_template_sha256": dataset_sha256,
+            "episode_prompt_template_sha256": episode_sha256,
+        }
+        super().__init__("prompt contract changed before approval could be committed")
+
+
 def canonical_json(value: Any) -> str:
     """Return the one JSON representation used by every hash-bearing record."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -529,6 +554,8 @@ class CurationDatabase:
         changes: Mapping[str, Any],
         actor: str,
         operation: str,
+        required_prompt_template_version: str | None = None,
+        required_prompt_template_sha256: str | None = None,
     ) -> dict[str, Any]:
         """Apply one revisioned human-review edge in the same write lock."""
         unknown = set(changes).difference(_EPISODE_CHANGE_COLUMNS)
@@ -538,6 +565,8 @@ class CurationDatabase:
             raise ValueError("actor is required")
         if not operation:
             raise ValueError("operation is required")
+        if (required_prompt_template_version is None) != (required_prompt_template_sha256 is None):
+            raise ValueError("required prompt template version and SHA256 must be provided together")
         with self._write() as connection:
             current = _require_row(
                 connection.execute(
@@ -559,6 +588,23 @@ class CurationDatabase:
                     current_state=current_state.value,
                     target_state=str(target),
                 )
+            if required_prompt_template_version is not None:
+                dataset = _require_row(
+                    connection.execute("SELECT * FROM datasets WHERE id=?", (dataset_id,)).fetchone(),
+                    "dataset not found",
+                )
+                if (
+                    dataset["prompt_template_version"] != required_prompt_template_version
+                    or dataset["prompt_template_sha256"] != required_prompt_template_sha256
+                    or current["prompt_template_sha256"] != required_prompt_template_sha256
+                ):
+                    raise PromptContractConflict(
+                        required_version=required_prompt_template_version,
+                        required_sha256=required_prompt_template_sha256,
+                        dataset_version=dataset["prompt_template_version"],
+                        dataset_sha256=dataset["prompt_template_sha256"],
+                        episode_sha256=current["prompt_template_sha256"],
+                    )
             fields = {key: (value.value if hasattr(value, "value") else value) for key, value in changes.items()}
             fields["revision"] = expected_revision + 1
             fields["updated_at"] = _utc_now()
