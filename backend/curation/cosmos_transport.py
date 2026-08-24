@@ -26,6 +26,7 @@ import secrets
 import stat
 import time
 from typing import Any, Generic, Literal, TypeVar
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import av
@@ -52,6 +53,7 @@ MAX_PAYLOAD_BYTES = 67_108_864
 PROMPT_MAX_BYTES = 32 * 1024
 RESPONSE_MAX_BYTES = 2 * 1024 * 1024
 REPAIR_INVALID_RESPONSE_MAX_BYTES = 64 * 1024
+MAX_OUTER_JSON_DEPTH = 128
 HTTP_TIMEOUT_SECONDS = 120.0
 JPEG_QUALITY = 85
 RESIZE_MAX_LONG_EDGE = 640
@@ -123,11 +125,23 @@ def _strict_json_document(raw: bytes) -> Any:
         raise ValueError(f"nonfinite JSON constant: {value}")
 
     decoded = raw.decode("utf-8")
-    return json.loads(
+    document = json.loads(
         decoded,
         object_pairs_hook=unique_object,
         parse_constant=reject_constant,
     )
+    pending: list[tuple[Any, int]] = [(document, 1)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > MAX_OUTER_JSON_DEPTH:
+            raise ValueError("JSON nesting limit exceeded")
+        if isinstance(value, dict):
+            pending.extend((item, depth + 1) for item in value.values())
+        elif isinstance(value, list):
+            pending.extend((item, depth + 1) for item in value)
+        elif type(value) is float and not math.isfinite(value):
+            raise ValueError("JSON number is outside the finite range")
+    return document
 
 
 def build_canonical_prompt() -> str:
@@ -146,13 +160,18 @@ class SamplingLimits:
     max_payload_bytes: int = MAX_PAYLOAD_BYTES
 
     def __post_init__(self) -> None:
-        if (
-            not math.isfinite(float(self.max_duration_seconds))
-            or self.max_duration_seconds <= 0
-            or self.max_sampled_frames <= 0
-            or self.max_payload_bytes <= 0
-        ):
+        if type(self.max_duration_seconds) not in {int, float} or isinstance(self.max_duration_seconds, bool):
+            raise ValueError("max_duration_seconds must be a built-in finite and positive number")
+        try:
+            duration_is_finite = math.isfinite(self.max_duration_seconds)
+        except (OverflowError, TypeError, ValueError):
+            duration_is_finite = False
+        if not duration_is_finite or self.max_duration_seconds <= 0:
             raise ValueError("sampling limits must be finite and positive")
+        if type(self.max_sampled_frames) is not int or self.max_sampled_frames <= 0:
+            raise ValueError("max_sampled_frames must be a built-in positive integer")
+        if type(self.max_payload_bytes) is not int or self.max_payload_bytes <= 0:
+            raise ValueError("max_payload_bytes must be a built-in positive integer")
 
 
 @dataclass(frozen=True)
@@ -178,29 +197,19 @@ class PreparedSample:
     source_video_sha256: str
 
     def __post_init__(self) -> None:
+        if type(self.source_fps) is not float or not math.isfinite(self.source_fps) or self.source_fps <= 0:
+            raise ValueError("source_fps must be a canonical finite positive float")
+        if type(self.total_num_frames) is not int or self.total_num_frames <= 0:
+            raise ValueError("total_num_frames must be a canonical positive integer")
+        expected_duration = self.total_num_frames / self.source_fps
         if (
-            isinstance(self.source_fps, bool)
-            or not isinstance(self.source_fps, (int, float, np.floating))
-            or not math.isfinite(float(self.source_fps))
-            or self.source_fps <= 0
+            type(self.duration_s) is not float
+            or not math.isfinite(self.duration_s)
+            or self.duration_s != expected_duration
         ):
-            raise ValueError("source_fps must be a finite positive number")
-        if (
-            isinstance(self.total_num_frames, bool)
-            or not isinstance(self.total_num_frames, (int, np.integer))
-            or self.total_num_frames <= 0
-        ):
-            raise ValueError("total_num_frames must be a positive integer")
-        expected_duration = int(self.total_num_frames) / float(self.source_fps)
-        if (
-            isinstance(self.duration_s, bool)
-            or not isinstance(self.duration_s, (int, float, np.floating))
-            or not math.isfinite(float(self.duration_s))
-            or float(self.duration_s) != expected_duration
-        ):
-            raise ValueError("duration_s must equal total_num_frames/source_fps")
+            raise ValueError("duration_s must be a canonical float equal to total_num_frames/source_fps")
         if not all(
-            isinstance(value, tuple)
+            type(value) is tuple
             for value in (
                 self.frame_indices,
                 self.parquet_timestamps,
@@ -212,32 +221,31 @@ class PreparedSample:
         cardinality = len(self.frame_indices)
         if cardinality == 0 or len(self.parquet_timestamps) != cardinality or len(self.jpeg_frames) != cardinality:
             raise ValueError("sample indices, timestamps, and JPEGs must have equal nonzero cardinality")
-        if any(
-            isinstance(index, bool)
-            or not isinstance(index, (int, np.integer))
-            or not 0 <= int(index) < int(self.total_num_frames)
-            for index in self.frame_indices
-        ):
-            raise ValueError("sample frame indices must be in-range integers")
+        if any(type(index) is not int or not 0 <= index < self.total_num_frames for index in self.frame_indices):
+            raise ValueError("sample frame indices must be canonical in-range integers")
         if any(left >= right for left, right in zip(self.frame_indices, self.frame_indices[1:])):
             raise ValueError("sample frame indices must be strictly increasing")
-        selected_timestamps = _validated_finite_values(
+        selected_timestamps = _canonical_float_tuple(
             self.parquet_timestamps, expected_length=cardinality, name="sample timestamps"
         )
         if any(left >= right for left, right in zip(selected_timestamps, selected_timestamps[1:])):
             raise ValueError("sample timestamps must be strictly increasing")
-        all_timestamps = _validated_finite_values(
+        all_timestamps = _canonical_float_tuple(
             self.all_parquet_timestamps,
-            expected_length=int(self.total_num_frames),
+            expected_length=self.total_num_frames,
             name="all parquet timestamps",
         )
+        if any(left >= right for left, right in zip(all_timestamps, all_timestamps[1:])):
+            raise ValueError("all parquet timestamps must be strictly increasing")
+        if all_timestamps[0] < 0 or all_timestamps[-1] >= self.duration_s:
+            raise ValueError("all parquet timestamps must be within the episode duration")
         if any(
-            selected_timestamps[position] != all_timestamps[int(frame_index)]
+            selected_timestamps[position] != all_timestamps[frame_index]
             for position, frame_index in enumerate(self.frame_indices)
         ):
             raise ValueError("sample timestamps must match their source-frame timestamps")
-        if any(not isinstance(frame, bytes) or not frame for frame in self.jpeg_frames):
-            raise ValueError("sample JPEGs must be nonempty bytes")
+        for frame in self.jpeg_frames:
+            _validate_sample_jpeg(frame)
         if not _valid_utf8_nonempty(self.decoder_name) or not _valid_utf8_nonempty(self.decoder_version):
             raise ValueError("decoder name and version must be nonempty UTF-8")
         if not isinstance(self.source_video_sha256, str) or not re.fullmatch(
@@ -293,6 +301,31 @@ def _validated_finite_values(values: Iterable[Any], *, expected_length: int, nam
     return tuple(float(value) for value in vector)
 
 
+def _canonical_float_tuple(values: tuple[Any, ...], *, expected_length: int, name: str) -> tuple[float, ...]:
+    if len(values) != expected_length or any(type(value) is not float for value in values):
+        raise ValueError(f"{name} must be a canonical tuple of built-in floats with the expected length")
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError(f"{name} must contain only finite values")
+    return values
+
+
+def _validate_sample_jpeg(frame: Any) -> None:
+    if type(frame) is not bytes or not frame:
+        raise ValueError("sample JPEGs must be nonempty bytes")
+    try:
+        with Image.open(BytesIO(frame)) as image:
+            image.load()
+            if (
+                image.format != "JPEG"
+                or image.mode != "RGB"
+                or min(image.size) <= 0
+                or max(image.size) > RESIZE_MAX_LONG_EDGE
+            ):
+                raise ValueError("sample JPEGs must decode as bounded RGB JPEG images")
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ValueError("sample JPEGs must decode as bounded RGB JPEG images") from error
+
+
 def _valid_utf8_nonempty(value: Any) -> bool:
     return bool(value) and _valid_utf8_string(value)
 
@@ -310,7 +343,7 @@ def _valid_utf8_string(value: Any) -> bool:
 def _json_is_utf8_serializable(value: Any) -> bool:
     try:
         _canonical_json(value).encode("utf-8")
-    except (TypeError, ValueError, UnicodeEncodeError):
+    except (RecursionError, TypeError, ValueError, UnicodeEncodeError):
         return False
     return True
 
@@ -538,7 +571,9 @@ def prepare_episode_samples(
         video_asset.close()
 
 
-def build_initial_request_body(*, model: str, prompt: str, sample: PreparedSample) -> dict[str, Any]:
+def build_initial_request_body(*, model: str, prompt: str, sample: Any) -> dict[str, Any]:
+    """Format the approved wire shape; production proof lives in prepare_initial_request."""
+
     if not _valid_utf8_nonempty(model):
         raise ValueError("Cosmos model identifier is required")
     if not _valid_utf8_nonempty(prompt):
@@ -570,6 +605,94 @@ def build_initial_request_body(*, model: str, prompt: str, sample: PreparedSampl
             }
         },
     }
+
+
+def _validate_prepared_sample_for_request(sample: PreparedSample) -> None:
+    if not isinstance(sample, PreparedSample):
+        raise ValueError("initial request requires a PreparedSample")
+    if sample.duration_s > MAX_DURATION_SECONDS:
+        raise ValueError("prepared sampling proof exceeds the duration limit")
+    if len(sample.frame_indices) > MAX_SAMPLED_FRAMES:
+        raise ValueError("prepared sampling proof exceeds the sample count limit")
+    if len(sample.payload_ascii) > MAX_PAYLOAD_BYTES:
+        raise ValueError("prepared sampling proof exceeds the payload limit")
+    proof = prove_alignment_and_select(
+        frame_indices=range(sample.total_num_frames),
+        timestamps=sample.all_parquet_timestamps,
+        source_fps=sample.source_fps,
+        video_rate=sample.source_fps,
+        video_frame_count=sample.total_num_frames,
+    )
+    if proof.frame_indices != sample.frame_indices or proof.parquet_timestamps != sample.parquet_timestamps:
+        raise ValueError("prepared sample does not match the complete 2 fps sampling proof")
+
+
+@dataclass(frozen=True)
+class PreparedInitialRequest:
+    """One immutable source for initial wire bytes, request hash, and redaction."""
+
+    wire_bytes: bytes
+    body_sha256: str
+    sample: PreparedSample
+
+    def __post_init__(self) -> None:
+        _validate_prepared_sample_for_request(self.sample)
+        if type(self.wire_bytes) is not bytes:
+            raise ValueError("prepared initial wire must be immutable bytes")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.body_sha256):
+            raise ValueError("prepared initial request hash must be lowercase SHA-256")
+        if hashlib.sha256(self.wire_bytes).hexdigest() != self.body_sha256:
+            raise ValueError("prepared initial request hash does not match its wire bytes")
+        try:
+            document = _strict_json_document(self.wire_bytes)
+            canonical_wire = _canonical_json(document).encode("utf-8")
+        except (RecursionError, TypeError, UnicodeDecodeError, UnicodeEncodeError, ValueError) as error:
+            raise ValueError("prepared initial wire must be canonical strict UTF-8 JSON") from error
+        if canonical_wire != self.wire_bytes or not isinstance(document, dict):
+            raise ValueError("prepared initial wire must be canonical strict UTF-8 JSON")
+        try:
+            model = document["model"]
+            prompt = document["messages"][0]["content"][1]["text"]
+        except (IndexError, KeyError, TypeError) as error:
+            raise ValueError("prepared initial wire does not have the approved request shape") from error
+        if prompt != build_canonical_prompt():
+            raise ValueError("prepared initial wire must contain the canonical prompt")
+        expected = build_initial_request_body(model=model, prompt=prompt, sample=self.sample)
+        if document != expected:
+            raise ValueError("prepared initial wire diverges from its sample or approved request shape")
+
+    @property
+    def body(self) -> dict[str, Any]:
+        document = _strict_json_document(self.wire_bytes)
+        if not isinstance(document, dict):  # pragma: no cover - guaranteed by construction
+            raise AssertionError("prepared initial request invariant failed")
+        return document
+
+    @property
+    def redacted_body(self) -> dict[str, Any]:
+        document = self.body
+        payload = self.sample.payload_ascii
+        document["messages"][0]["content"][0]["video_url"]["url"] = {
+            "redacted": "base64",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "bytes": len(payload),
+        }
+        return document
+
+
+def prepare_initial_request(*, model: str, prompt: str, sample: PreparedSample) -> PreparedInitialRequest:
+    """Prove a production sample once and freeze the exact initial request bytes."""
+
+    _validate_prepared_sample_for_request(sample)
+    if prompt != build_canonical_prompt():
+        raise ValueError("production Cosmos requests must use the canonical prompt")
+    body = build_initial_request_body(model=model, prompt=prompt, sample=sample)
+    wire_bytes = _canonical_json(body).encode("utf-8")
+    return PreparedInitialRequest(
+        wire_bytes=wire_bytes,
+        body_sha256=hashlib.sha256(wire_bytes).hexdigest(),
+        sample=sample,
+    )
 
 
 def _build_repair_request_body(
@@ -607,6 +730,7 @@ class CosmosTransportResult:
     repair_content: str | None
     validation_errors: tuple[str, ...]
     exchanges: tuple[dict[str, Any], ...]
+    prepared_initial_request: PreparedInitialRequest | None
     reject_episode: bool = False
 
 
@@ -626,6 +750,44 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _validated_cosmos_endpoint(base_url: Any) -> str:
+    has_controls = isinstance(base_url, str) and any(
+        ord(character) <= 0x20 or ord(character) == 0x7F for character in base_url
+    )
+    if not _valid_utf8_nonempty(base_url) or has_controls:
+        raise ValueError("Cosmos base URL must be an absolute http/https URL without controls")
+    if "\\" in base_url:
+        raise ValueError("Cosmos base URL must not contain backslashes")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Cosmos base URL has an invalid host or port") from error
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or (port is not None and not 1 <= port <= 65_535)
+    ):
+        raise ValueError("Cosmos base URL must be absolute and contain no credentials, query, or fragment")
+    return base_url.rstrip("/") + "/chat/completions"
+
+
+def _validated_bearer_token(api_key: Any) -> str:
+    if (
+        not isinstance(api_key, str)
+        or not api_key
+        or any(not 0x21 <= ord(character) <= 0x7E for character in api_key)
+    ):
+        raise ValueError("Cosmos API key must be a nonempty visible ASCII bearer token")
+    return api_key
+
+
 class CosmosTransport:
     """Synchronous, deterministic, bounded OpenAI-compatible Cosmos client."""
 
@@ -641,20 +803,26 @@ class CosmosTransport:
         timeout_seconds: float = HTTP_TIMEOUT_SECONDS,
         response_max_bytes: int = RESPONSE_MAX_BYTES,
     ) -> None:
-        if not all(_valid_utf8_nonempty(value) for value in (base_url, model, api_key)):
-            raise ValueError("Cosmos base URL, model, and API key are required")
+        if not _valid_utf8_nonempty(model):
+            raise ValueError("Cosmos model identifier is required")
+        if type(timeout_seconds) not in {int, float} or isinstance(timeout_seconds, bool):
+            raise ValueError("Cosmos timeout must be a built-in finite positive number")
         try:
-            api_key.encode("ascii")
-        except UnicodeEncodeError as error:
-            raise ValueError("Cosmos API key must be an ASCII HTTP-header value") from error
-        self.endpoint = base_url.rstrip("/") + "/chat/completions"
+            valid_timeout = math.isfinite(timeout_seconds) and timeout_seconds > 0
+        except (OverflowError, TypeError, ValueError):
+            valid_timeout = False
+        if not valid_timeout:
+            raise ValueError("Cosmos timeout must be a built-in finite positive number")
+        if type(response_max_bytes) is not int or response_max_bytes <= 0:
+            raise ValueError("response_max_bytes must be a built-in positive integer")
+        self.endpoint = _validated_cosmos_endpoint(base_url)
         self.model = model
-        self.api_key = api_key
+        self.api_key = _validated_bearer_token(api_key)
         self.client = httpx.Client() if client is None else client
         self.sleep = sleep
         self.clock = clock
         self.timeout_seconds = float(timeout_seconds)
-        self.response_max_bytes = int(response_max_bytes)
+        self.response_max_bytes = response_max_bytes
 
     def annotate(self, sampling: SamplingOutcome) -> CosmosTransportResult:
         if sampling.status == "manual_only":
@@ -666,11 +834,12 @@ class CosmosTransport:
                 repair_content=None,
                 validation_errors=(),
                 exchanges=(),
+                prepared_initial_request=None,
             )
         if sampling.sample is None:
             raise ValueError("ready sampling outcome must contain a prepared sample")
         sample = sampling.sample
-        initial_body = build_initial_request_body(
+        prepared_request = prepare_initial_request(
             model=self.model,
             prompt=build_canonical_prompt(),
             sample=sample,
@@ -678,7 +847,11 @@ class CosmosTransport:
         exchanges: list[dict[str, Any]] = []
         initial: _CallResult | None = None
         for attempt_number in range(2):
-            initial = self._call(initial_body, phase="initial")
+            initial = self._call(
+                prepared_request.wire_bytes,
+                body_sha256=prepared_request.body_sha256,
+                phase="initial",
+            )
             exchanges.append(initial.exchange)
             if initial.content is not None or not initial.retryable:
                 break
@@ -694,6 +867,7 @@ class CosmosTransport:
                     initial.reason or "transport_failure",
                     exchanges=exchanges,
                     initial_content=initial.observed_content,
+                    prepared_initial_request=prepared_request,
                 )
         else:
             invalid_content = initial.content
@@ -714,6 +888,7 @@ class CosmosTransport:
                     repair_content=None,
                     validation_errors=(),
                     exchanges=tuple(exchanges),
+                    prepared_initial_request=prepared_request,
                 )
 
         if len(invalid_content.encode("utf-8")) > REPAIR_INVALID_RESPONSE_MAX_BYTES:
@@ -722,13 +897,19 @@ class CosmosTransport:
                 exchanges=exchanges,
                 initial_content=invalid_content,
                 validation_errors=validation_errors,
+                prepared_initial_request=prepared_request,
             )
         repair_body = _build_repair_request_body(
             model=self.model,
             invalid_response=invalid_content,
             validation_errors=validation_errors,
         )
-        repair = self._call(repair_body, phase="repair")
+        repair_wire = _canonical_json(repair_body).encode("utf-8")
+        repair = self._call(
+            repair_wire,
+            body_sha256=hashlib.sha256(repair_wire).hexdigest(),
+            phase="repair",
+        )
         exchanges.append(repair.exchange)
         if repair.content is None:
             return self._manual(
@@ -737,6 +918,7 @@ class CosmosTransport:
                 initial_content=invalid_content,
                 repair_content=repair.observed_content,
                 validation_errors=validation_errors,
+                prepared_initial_request=prepared_request,
             )
         try:
             proposal = build_cosmos_proposal(
@@ -751,6 +933,7 @@ class CosmosTransport:
                 initial_content=invalid_content,
                 repair_content=repair.content,
                 validation_errors=_safe_error_strings(repair_error.errors),
+                prepared_initial_request=prepared_request,
             )
         return CosmosTransportResult(
             status="succeeded",
@@ -760,6 +943,7 @@ class CosmosTransport:
             repair_content=repair.content,
             validation_errors=(),
             exchanges=tuple(exchanges),
+            prepared_initial_request=prepared_request,
         )
 
     def _manual(
@@ -770,6 +954,7 @@ class CosmosTransport:
         initial_content: str | None = None,
         repair_content: str | None = None,
         validation_errors: Sequence[str] = (),
+        prepared_initial_request: PreparedInitialRequest | None = None,
     ) -> CosmosTransportResult:
         return CosmosTransportResult(
             status="manual_only",
@@ -779,14 +964,22 @@ class CosmosTransport:
             repair_content=repair_content,
             validation_errors=tuple(validation_errors),
             exchanges=tuple(exchanges),
+            prepared_initial_request=prepared_initial_request,
         )
 
-    def _call(self, body: Mapping[str, Any], *, phase: Literal["initial", "repair"]) -> _CallResult:
-        encoded_body = _canonical_json(dict(body)).encode("utf-8")
+    def _call(
+        self,
+        encoded_body: bytes,
+        *,
+        body_sha256: str,
+        phase: Literal["initial", "repair"],
+    ) -> _CallResult:
+        if type(encoded_body) is not bytes or hashlib.sha256(encoded_body).hexdigest() != body_sha256:
+            raise ValueError("wire bytes and request body hash diverged")
         request_record = {
             "method": "POST",
             "url": self.endpoint,
-            "body_sha256": hashlib.sha256(encoded_body).hexdigest(),
+            "body_sha256": body_sha256,
         }
         started_at = self.clock()
         headers = {
@@ -851,7 +1044,7 @@ class CosmosTransport:
                 request_record,
                 response=None,
                 error_class=type(error).__name__,
-                error_summary=str(error) or "Cosmos request timed out",
+                error_summary="Cosmos request timed out",
             )
             return _CallResult(None, "timeout", False, exchange)
         except httpx.ConnectError as error:
@@ -861,7 +1054,7 @@ class CosmosTransport:
                 request_record,
                 response=None,
                 error_class=type(error).__name__,
-                error_summary=str(error) or "Cosmos connection failed",
+                error_summary="Cosmos connection failed",
             )
             return _CallResult(None, "connection", phase == "initial", exchange)
         except httpx.RequestError as error:
@@ -871,13 +1064,13 @@ class CosmosTransport:
                 request_record,
                 response=None,
                 error_class=type(error).__name__,
-                error_summary=str(error) or "Cosmos transport failed",
+                error_summary="Cosmos transport failed",
             )
             return _CallResult(None, "transport", False, exchange)
 
         try:
             document = _strict_json_document(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        except (RecursionError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return self._envelope_failure(
                 phase,
                 started_at,
@@ -1023,9 +1216,7 @@ def build_request_artifact(
     *,
     attempt_id: str,
     source_episode_index: int,
-    sample: PreparedSample,
-    model: str,
-    prompt: str,
+    prepared_request: PreparedInitialRequest,
 ) -> dict[str, Any]:
     try:
         UUID(attempt_id)
@@ -1037,14 +1228,11 @@ def build_request_artifact(
         or source_episode_index < 0
     ):
         raise ValueError("source_episode_index must be a nonnegative integer")
+    if not isinstance(prepared_request, PreparedInitialRequest):
+        raise TypeError("prepared_request must be a PreparedInitialRequest")
+    sample = prepared_request.sample
     payload = sample.payload_ascii
     payload_sha256 = hashlib.sha256(payload).hexdigest()
-    redacted_request = build_initial_request_body(model=model, prompt=prompt, sample=sample)
-    redacted_request["messages"][0]["content"][0]["video_url"]["url"] = {
-        "redacted": "base64",
-        "sha256": payload_sha256,
-        "bytes": len(payload),
-    }
     return {
         "schema_version": 1,
         "contract_version": CONTRACT_VERSION,
@@ -1068,7 +1256,7 @@ def build_request_artifact(
             },
             "jpeg": {"quality": JPEG_QUALITY, "optimize": False, "progressive": False},
         },
-        "request_body": redacted_request,
+        "request_body": prepared_request.redacted_body,
     }
 
 
@@ -1129,6 +1317,8 @@ class AtomicArtifactStore:
     """Cross-process-locked, durable, no-clobber artifact installation."""
 
     _LOCK_NAME = ".artifact-store.lock"
+    _TEMP_PREFIX = ".curation-artifact-v1-"
+    _TEMP_PATTERN = re.compile(r"\.curation-artifact-v1-[0-9a-f]{32}\.tmp\Z")
 
     def __init__(self, workspace: Path, *, event_hook: EventHook | None = None) -> None:
         self.workspace = Path(workspace)
@@ -1214,6 +1404,8 @@ class AtomicArtifactStore:
             raise TypeError("artifact contents must be bytes")
         normalized = _safe_artifact_relative_path(relative_path)
         parts = PurePosixPath(normalized).parts
+        if self._TEMP_PATTERN.fullmatch(parts[-1]) is not None:
+            raise ValueError("artifact destination uses the reserved temporary-file namespace")
         with self._locked() as root_fd:
             parent_fd, parent_relative = self._open_or_create_directories(root_fd, parts[:-1])
             try:
@@ -1287,7 +1479,7 @@ class AtomicArtifactStore:
         destination_relative: str,
         contents: bytes,
     ) -> bytes:
-        temporary_name = f".{destination_name}.{secrets.token_hex(16)}.tmp"
+        temporary_name = f"{self._TEMP_PREFIX}{secrets.token_hex(16)}.tmp"
         temporary_fd = -1
         temporary_exists = False
         try:
@@ -1404,12 +1596,30 @@ class AtomicArtifactStore:
 
     def _cleanup_locked(self, root_fd: int, *, referenced: frozenset[str]) -> list[dict[str, Any]]:
         report: list[dict[str, Any]] = []
-        self._cleanup_directory_fd(
-            root_fd,
-            relative_parts=(),
-            referenced=referenced,
-            report=report,
-        )
+        try:
+            artifacts_fd = os.open(
+                "artifacts",
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            return report
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
+                return report
+            raise ArtifactSecurityError("artifact subtree could not be inspected") from error
+        try:
+            self._cleanup_directory_fd(
+                artifacts_fd,
+                relative_parts=("artifacts",),
+                referenced=referenced,
+                report=report,
+            )
+        finally:
+            os.close(artifacts_fd)
         return report
 
     def _cleanup_directory_fd(
@@ -1448,7 +1658,7 @@ class AtomicArtifactStore:
                 finally:
                     os.close(child_fd)
                 continue
-            if not stat.S_ISREG(entry_stat.st_mode) or not name.startswith(".") or not name.endswith(".tmp"):
+            if not stat.S_ISREG(entry_stat.st_mode) or self._TEMP_PATTERN.fullmatch(name) is None:
                 continue
             relative = "/".join((*relative_parts, name))
             if not _valid_utf8_string(relative) or relative in referenced:

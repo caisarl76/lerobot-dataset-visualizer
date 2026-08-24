@@ -168,6 +168,31 @@ def test_float64_targets_break_nearest_ties_lower_deduplicate_and_obey_exact_bou
     assert below_boundary.frame_indices == (0, 1)
 
 
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"max_duration_seconds": True}, "finite and positive"),
+        ({"max_duration_seconds": 0}, "finite and positive"),
+        ({"max_duration_seconds": -1.0}, "finite and positive"),
+        ({"max_duration_seconds": float("nan")}, "finite and positive"),
+        ({"max_duration_seconds": float("inf")}, "finite and positive"),
+        ({"max_duration_seconds": np.float64(120)}, "built-in"),
+        ({"max_duration_seconds": 10**10_000}, "finite and positive"),
+        ({"max_sampled_frames": True}, "built-in positive integer"),
+        ({"max_sampled_frames": 240.0}, "built-in positive integer"),
+        ({"max_sampled_frames": np.int64(240)}, "built-in positive integer"),
+        ({"max_payload_bytes": True}, "built-in positive integer"),
+        ({"max_payload_bytes": 1.5}, "built-in positive integer"),
+        ({"max_payload_bytes": np.int64(100)}, "built-in positive integer"),
+    ],
+)
+def test_sampling_limits_require_canonical_built_in_finite_values(
+    changes: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        SamplingLimits(**changes)
+
+
 def test_exact_rgb_jpegs_are_deterministic_never_upscale_and_resize_long_edge(tmp_path: Path) -> None:
     small = _registered_episode(tmp_path, name="small", fps=2, frame_count=2, width=32, height=16)
     large = _registered_episode(tmp_path, name="large", fps=2, frame_count=2, width=800, height=400)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
+from io import BytesIO
 import json
+from types import SimpleNamespace
 from typing import Any
 
 from curation.cosmos_contract import COSMOS_RESPONSE_V2_SCHEMA
@@ -9,12 +12,18 @@ from curation.cosmos_transport import (
     CANONICAL_PROMPT_PREFIX,
     PROMPT_MAX_BYTES,
     CosmosTransport,
+    PreparedInitialRequest,
     PreparedSample,
     SamplingOutcome,
     build_canonical_prompt,
+    build_initial_request_body,
+    build_request_artifact,
+    prepare_initial_request,
 )
 from curation.db import _validate_http_exchange, canonical_json
 import httpx
+import numpy as np
+from PIL import Image
 import pytest
 
 
@@ -62,16 +71,29 @@ def _incomplete_response() -> dict[str, Any]:
     return response
 
 
+def _jpeg(red: int) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), (red, 0, 0)).save(
+        output,
+        format="JPEG",
+        quality=85,
+        optimize=False,
+        progressive=False,
+    )
+    return output.getvalue()
+
+
 def _sample() -> PreparedSample:
     timestamps = tuple(index / 50 for index in range(2_060))
+    indices = tuple(range(0, 2_051, 25))
     return PreparedSample(
         source_fps=50.0,
         total_num_frames=2_060,
         duration_s=41.2,
-        frame_indices=(0, 25, 50),
-        parquet_timestamps=(0.0, 0.5, 1.0),
+        frame_indices=indices,
+        parquet_timestamps=tuple(timestamps[index] for index in indices),
         all_parquet_timestamps=timestamps,
-        jpeg_frames=(b"abcd", b"efgh", b"ijkl"),
+        jpeg_frames=tuple(_jpeg(index % 256) for index in indices),
         decoder_name="PyAV",
         decoder_version="test",
         source_video_sha256="1" * 64,
@@ -127,28 +149,25 @@ def test_canonical_prompt_freezes_prefix_sorted_minified_schema_and_32kib_limit(
     assert build_canonical_prompt() == expected
     assert len(expected.encode("utf-8")) <= PROMPT_MAX_BYTES
     with pytest.raises(ValueError, match="32 KiB"):
-        from curation.cosmos_transport import build_initial_request_body
-
         build_initial_request_body(model="model", prompt="x" * (PROMPT_MAX_BYTES + 1), sample=_sample())
 
 
-def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
-    requests: list[httpx.Request] = []
+def test_approved_abbreviated_plan_wire_fixture_remains_exact_at_formatter_boundary() -> None:
+    fixture = SimpleNamespace(
+        data_url="data:video/jpeg;base64,YWJjZA==,ZWZnaA==,aWprbA==",
+        source_fps=50.0,
+        frame_indices=(0, 25, 50),
+        total_num_frames=2_060,
+        duration_s=41.2,
+    )
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return _response(json.dumps(_complete_response()))
+    body = build_initial_request_body(
+        model="cosmos3-nano-test",
+        prompt=build_canonical_prompt(),
+        sample=fixture,
+    )
 
-    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
-
-    assert result.status == "succeeded"
-    assert result.proposal is not None
-    assert len(requests) == 1
-    request = requests[0]
-    assert request.headers["authorization"] == "Bearer secret-key"
-    assert request.headers["content-type"] == "application/json"
-    assert set(request.extensions["timeout"].values()) == {120.0}
-    assert json.loads(request.content) == {
+    assert body == {
         "model": "cosmos3-nano-test",
         "messages": [
             {
@@ -170,12 +189,62 @@ def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
             "video": {
                 "fps": 50.0,
                 "frames_indices": [0, 25, 50],
+                "total_num_frames": 2_060,
+                "duration": 41.2,
+                "do_sample_frames": False,
+            }
+        },
+    }
+
+
+def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _response(json.dumps(_complete_response()))
+
+    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
+
+    assert result.status == "succeeded"
+    assert result.proposal is not None
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.headers["authorization"] == "Bearer secret-key"
+    assert request.headers["content-type"] == "application/json"
+    assert set(request.extensions["timeout"].values()) == {120.0}
+    expected = {
+        "model": "cosmos3-nano-test",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": _sample().data_url},
+                    },
+                    {"type": "text", "text": build_canonical_prompt()},
+                ],
+            }
+        ],
+        "temperature": 0,
+        "seed": 0,
+        "max_completion_tokens": 4096,
+        "stream": False,
+        "media_io_kwargs": {
+            "video": {
+                "fps": 50.0,
+                "frames_indices": list(_sample().frame_indices),
                 "total_num_frames": 2060,
                 "duration": 41.2,
                 "do_sample_frames": False,
             }
         },
     }
+    assert json.loads(request.content) == expected
+    assert result.prepared_initial_request is not None
+    assert request.content == result.prepared_initial_request.wire_bytes
+    assert result.exchanges[0]["request"]["body_sha256"] == result.prepared_initial_request.body_sha256
     assert "extra_body" not in json.loads(request.content)
     assert result.initial_content == json.dumps(_complete_response())
     assert result.repair_content is None
@@ -188,6 +257,126 @@ def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
         "usage": {"completion_tokens": 10},
         "finish_reason": "stop",
     }
+
+
+def test_prepared_initial_request_makes_wire_hash_and_artifact_impossible_to_diverge() -> None:
+    sample = _sample()
+    prepared = prepare_initial_request(
+        model="cosmos3-nano-test",
+        prompt=build_canonical_prompt(),
+        sample=sample,
+    )
+
+    artifact = build_request_artifact(
+        attempt_id="00000000-0000-0000-0000-000000000001",
+        source_episode_index=7,
+        prepared_request=prepared,
+    )
+
+    assert prepared.body_sha256 == hashlib.sha256(prepared.wire_bytes).hexdigest()
+    assert artifact["request_body"] == prepared.redacted_body
+    assert artifact["sampled_payload_sha256"] == hashlib.sha256(sample.payload_ascii).hexdigest()
+    with pytest.raises(ValueError, match="hash"):
+        PreparedInitialRequest(
+            wire_bytes=prepared.wire_bytes,
+            body_sha256="0" * 64,
+            sample=sample,
+        )
+    with pytest.raises(ValueError, match="wire"):
+        PreparedInitialRequest(
+            wire_bytes=prepared.wire_bytes + b" ",
+            body_sha256=hashlib.sha256(prepared.wire_bytes + b" ").hexdigest(),
+            sample=sample,
+        )
+
+
+def test_production_prepared_request_rejects_abbreviated_or_mismatched_sampling_proof() -> None:
+    sample = _sample()
+    abbreviated = replace(
+        sample,
+        frame_indices=sample.frame_indices[:3],
+        parquet_timestamps=sample.parquet_timestamps[:3],
+        jpeg_frames=sample.jpeg_frames[:3],
+    )
+
+    with pytest.raises(ValueError, match="sampling proof"):
+        prepare_initial_request(
+            model="cosmos3-nano-test",
+            prompt=build_canonical_prompt(),
+            sample=abbreviated,
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "cosmos.test/v1",
+        "ftp://cosmos.test/v1",
+        "http:///v1",
+        "http://user:password@cosmos.test/v1",
+        "http://cosmos.test/v1?token=secret",
+        "http://cosmos.test/v1#fragment",
+        "http://cosmos.test:99999/v1",
+        "http://cosmos.test/\nsecret",
+        "http://cosmos.test/\x00secret",
+    ],
+)
+def test_transport_rejects_noncanonical_or_credential_bearing_base_urls(base_url: str) -> None:
+    with pytest.raises(ValueError, match="base URL"):
+        CosmosTransport(base_url=base_url, model="model", api_key="key")
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    ["space key", " key", "key ", "key\r\nInjected: yes", "key\x00", "key\x1f", "key\x7f"],
+)
+def test_transport_rejects_non_visible_bearer_tokens(api_key: str) -> None:
+    with pytest.raises(ValueError, match="API key"):
+        CosmosTransport(base_url="http://cosmos.test/v1", model="model", api_key=api_key)
+
+
+@pytest.mark.parametrize("timeout", [True, 0, -1, float("nan"), float("inf"), "120", np.float64(120)])
+def test_transport_rejects_noncanonical_timeout(timeout: object) -> None:
+    with pytest.raises(ValueError, match="timeout"):
+        CosmosTransport(
+            base_url="http://cosmos.test/v1",
+            model="model",
+            api_key="key",
+            timeout_seconds=timeout,
+        )
+
+
+@pytest.mark.parametrize("limit", [True, 0, -1, 1.0, np.int64(2)])
+def test_transport_rejects_noncanonical_response_limit(limit: object) -> None:
+    with pytest.raises(ValueError, match="response_max_bytes"):
+        CosmosTransport(
+            base_url="http://cosmos.test/v1",
+            model="model",
+            api_key="key",
+            response_max_bytes=limit,
+        )
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "expected_summary"),
+    [
+        (httpx.ConnectError, "Cosmos connection failed"),
+        (httpx.ReadTimeout, "Cosmos request timed out"),
+        (httpx.ReadError, "Cosmos transport failed"),
+    ],
+)
+def test_httpx_exception_text_cannot_leak_api_key_into_persisted_exchange(
+    exception_type: type[httpx.RequestError], expected_summary: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exception_type("secret-key appeared in low-level error", request=request)
+
+    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
+    serialized = canonical_json(result.exchanges)
+
+    assert "secret-key" not in serialized
+    assert result.exchanges[-1]["error"]["summary"] == expected_summary
+    _validate_http_exchange(result.exchanges[-1])
 
 
 def test_manual_only_sampling_outcome_never_calls_http_or_rejects() -> None:
@@ -319,6 +508,7 @@ def test_response_body_limit_is_enforced_before_json_validation() -> None:
         b'{"choices":[],"choices":[]}',
         b'{"choices":NaN}',
         b'{"choices":Infinity}',
+        b'{"choices":1e999}',
         b'{"choices":[{"message":{"content":"ok","content":"duplicate"},"finish_reason":"stop"}]}',
         b'{"\\ud800":1,"\\ud800":2}',
         b'{"choices":[]}' + b"\xff",
@@ -330,6 +520,30 @@ def test_hostile_outer_json_is_bounded_manual_only_with_task4_serializable_excha
     assert (result.status, result.reason) == ("manual_only", "invalid_json")
     assert result.initial_content is None
     assert result.exchanges[0]["error"]["class"] == "CosmosEnvelopeError"
+    canonical_json(result.exchanges).encode("utf-8")
+    _validate_http_exchange(result.exchanges[0])
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        (b'{"deep":' + b"[" * 200 + b"0" + b"]" * 200 + b',"choices":[]}'),
+        (
+            b'{"usage":'
+            + b'{"nested":' * 150
+            + b"0"
+            + b"}" * 150
+            + b',"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}'
+        ),
+        (b'{"deep":' + b"[" * 1_500 + b"0" + b"]" * 1_500 + b',"choices":[]}'),
+    ],
+)
+def test_deep_outer_json_and_usage_are_bounded_without_recursion_escape(raw_body: bytes) -> None:
+    assert len(raw_body) < 2 * 1024 * 1024
+
+    result = _transport(lambda _: httpx.Response(200, content=raw_body)).annotate(SamplingOutcome.ready(_sample()))
+
+    assert (result.status, result.reason) == ("manual_only", "invalid_json")
     canonical_json(result.exchanges).encode("utf-8")
     _validate_http_exchange(result.exchanges[0])
 

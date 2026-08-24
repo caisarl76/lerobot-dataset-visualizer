@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+from io import BytesIO
 import json
+import os
 from pathlib import Path
+import secrets
 import threading
 import time
 
@@ -14,23 +17,39 @@ from curation.cosmos_transport import (
     AtomicArtifactStore,
     PreparedSample,
     build_canonical_prompt,
-    build_initial_request_body,
     build_parsed_artifact,
     build_request_artifact,
+    prepare_initial_request,
 )
+import numpy as np
+from PIL import Image
 import pytest
 from test_cosmos_contract import COMPLETE_RESPONSE
 
 
+def _jpeg(red: int) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (3, 2), (red, 0, 0)).save(
+        output,
+        format="JPEG",
+        quality=85,
+        optimize=False,
+        progressive=False,
+    )
+    return output.getvalue()
+
+
 def _sample() -> PreparedSample:
+    timestamps = tuple(index / 50 for index in range(101))
+    indices = (0, 25, 50, 75, 100)
     return PreparedSample(
         source_fps=50.0,
-        total_num_frames=3,
-        duration_s=0.06,
-        frame_indices=(0, 2),
-        parquet_timestamps=(0.0, 0.04),
-        all_parquet_timestamps=(0.0, 0.02, 0.04),
-        jpeg_frames=(b"one", b"two"),
+        total_num_frames=101,
+        duration_s=2.02,
+        frame_indices=indices,
+        parquet_timestamps=tuple(timestamps[index] for index in indices),
+        all_parquet_timestamps=timestamps,
+        jpeg_frames=tuple(_jpeg(index) for index in indices),
         decoder_name="PyAV",
         decoder_version="17.1.0",
         source_video_sha256="a" * 64,
@@ -40,13 +59,11 @@ def _sample() -> PreparedSample:
 def test_request_artifact_is_derived_canonically_and_redacts_only_base64_payload() -> None:
     sample = _sample()
     prompt = build_canonical_prompt()
-    wire_body = build_initial_request_body(model="model", prompt=prompt, sample=sample)
+    prepared = prepare_initial_request(model="model", prompt=prompt, sample=sample)
     artifact = build_request_artifact(
         attempt_id="00000000-0000-0000-0000-000000000001",
         source_episode_index=7,
-        sample=sample,
-        model="model",
-        prompt=prompt,
+        prepared_request=prepared,
     )
 
     assert artifact.keys() == {
@@ -59,20 +76,14 @@ def test_request_artifact_is_derived_canonically_and_redacts_only_base64_payload
         "sampling",
         "request_body",
     }
-    expected_request = json.loads(json.dumps(wire_body))
-    expected_request["messages"][0]["content"][0]["video_url"]["url"] = {
-        "redacted": "base64",
-        "sha256": artifact["sampled_payload_sha256"],
-        "bytes": len("b25l,dHdv"),
-    }
-    assert artifact["request_body"] == expected_request
+    assert artifact["request_body"] == prepared.redacted_body
     assert artifact["sampling"] == {
         "original_fps": 50.0,
-        "original_frame_count": 3,
-        "original_duration_s": 0.06,
+        "original_frame_count": 101,
+        "original_duration_s": 2.02,
         "target_fps": 2,
-        "selected_frame_indices": [0, 2],
-        "selected_parquet_timestamps_s": [0.0, 0.04],
+        "selected_frame_indices": [0, 25, 50, 75, 100],
+        "selected_parquet_timestamps_s": [0.0, 0.5, 1.0, 1.5, 2.0],
         "decoder": {"name": "PyAV", "version": "17.1.0"},
         "color_space": "RGB",
         "resize": {"allow_upscale": False, "max_long_edge": 640, "resampling": "LANCZOS"},
@@ -83,9 +94,7 @@ def test_request_artifact_is_derived_canonically_and_redacts_only_base64_payload
         build_request_artifact(
             attempt_id="00000000-0000-0000-0000-000000000001",
             source_episode_index=7,
-            sample=sample,
-            model="model",
-            prompt=prompt,
+            prepared_request=prepared,
             request_body={"tampered": True},
         )
 
@@ -96,20 +105,31 @@ def test_request_artifact_is_derived_canonically_and_redacts_only_base64_payload
         {"source_fps": 0.0},
         {"source_fps": float("nan")},
         {"source_fps": True},
+        {"source_fps": 50},
+        {"source_fps": np.float64(50)},
         {"total_num_frames": 0},
         {"total_num_frames": True},
-        {"duration_s": 0.061},
+        {"total_num_frames": np.int64(101)},
+        {"duration_s": 2.021},
+        {"duration_s": 2},
         {"duration_s": float("inf")},
-        {"frame_indices": [0, 2]},
+        {"duration_s": np.float64(2.02)},
+        {"frame_indices": [0, 25, 50, 75, 100]},
         {"frame_indices": (0,)},
-        {"frame_indices": (0, 0)},
-        {"frame_indices": (0, 3)},
-        {"frame_indices": (0, True)},
-        {"parquet_timestamps": (0.0, 0.02)},
-        {"parquet_timestamps": (0.0, float("nan"))},
-        {"all_parquet_timestamps": (0.0, 0.02)},
-        {"all_parquet_timestamps": (0.0, float("nan"), 0.04)},
-        {"jpeg_frames": (b"one", b"")},
+        {"frame_indices": (0, 25, 50, 75, 75)},
+        {"frame_indices": (0, 25, 50, 75, 101)},
+        {"frame_indices": (0, 25, 50, 75, True)},
+        {"frame_indices": (0, 25, 50, 75, np.int64(100))},
+        {"parquet_timestamps": (0.0, 0.5, 1.0, 1.5, 1.99)},
+        {"parquet_timestamps": (0.0, 0.5, 1.0, 1.5, float("nan"))},
+        {"parquet_timestamps": (0.0, 0.5, 1.0, 1.5, 2)},
+        {"parquet_timestamps": (0.0, 0.5, 1.0, 1.5, np.float64(2.0))},
+        {"all_parquet_timestamps": tuple(index / 50 for index in range(100))},
+        {"all_parquet_timestamps": (0.0,) * 101},
+        {"all_parquet_timestamps": (0.0, float("nan")) + tuple(index / 50 for index in range(2, 101))},
+        {"all_parquet_timestamps": (np.float64(0),) + tuple(index / 50 for index in range(1, 101))},
+        {"jpeg_frames": (_jpeg(0), _jpeg(25), _jpeg(50), _jpeg(75), b"")},
+        {"jpeg_frames": (_jpeg(0), _jpeg(25), _jpeg(50), _jpeg(75), b"not-jpeg")},
         {"decoder_name": ""},
         {"decoder_version": ""},
         {"source_video_sha256": "A" * 64},
@@ -318,21 +338,84 @@ def test_constructor_performs_locked_startup_cleanup_and_preserves_complete_evid
     directory = workspace / "artifacts/cosmos/id"
     directory.mkdir(parents=True)
     complete = directory / "response.txt"
-    temporary = directory / ".response.txt.deadbeef.tmp"
+    temporary = directory / f".curation-artifact-v1-{secrets.token_hex(16)}.tmp"
+    unrelated = directory / ".application-cache.tmp"
+    source_manifest_temporary = directory / f".source-files.sha256.{secrets.token_hex(16)}.tmp"
+    outside_artifact_tree = workspace / f".curation-artifact-v1-{secrets.token_hex(16)}.tmp"
     complete.write_bytes(b"evidence")
     temporary.write_bytes(b"partial")
+    unrelated.write_bytes(b"application-owned")
+    source_manifest_temporary.write_bytes(b"manifest-owned")
+    outside_artifact_tree.write_bytes(b"wrong-subtree")
 
     store = AtomicArtifactStore(workspace)
 
     assert store.startup_cleanup_report == [
         {
-            "relative_path": "artifacts/cosmos/id/.response.txt.deadbeef.tmp",
+            "relative_path": f"artifacts/cosmos/id/{temporary.name}",
             "byte_size": 7,
             "removed": True,
         }
     ]
     assert complete.read_bytes() == b"evidence"
     assert not temporary.exists()
+    assert unrelated.read_bytes() == b"application-owned"
+    assert source_manifest_temporary.read_bytes() == b"manifest-owned"
+    assert outside_artifact_tree.read_bytes() == b"wrong-subtree"
+
+
+def test_complete_artifact_cannot_be_named_inside_the_cleanup_namespace(tmp_path: Path) -> None:
+    store = AtomicArtifactStore(tmp_path / "workspace")
+    reserved = f"artifacts/cosmos/.curation-artifact-v1-{secrets.token_hex(16)}.tmp"
+
+    with pytest.raises(ValueError, match="reserved"):
+        store.write_bytes(reserved, b"complete", media_type="text/plain")
+
+
+def test_startup_cleanup_cannot_delete_live_source_manifest_temp_before_link(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    temporary = workspace / f".source-files.sha256.{secrets.token_hex(16)}.tmp"
+    manifest = workspace / "source-files.sha256"
+    source_fsynced = threading.Event()
+    release_source = threading.Event()
+    writer_errors: list[BaseException] = []
+
+    def write_manifest() -> None:
+        descriptor = -1
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.write(descriptor, b"complete manifest\n")
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            source_fsynced.set()
+            assert release_source.wait(timeout=5)
+            os.link(temporary, manifest)
+            directory_fd = os.open(workspace, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            temporary.unlink()
+        except BaseException as error:
+            writer_errors.append(error)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    writer = threading.Thread(target=write_manifest)
+    writer.start()
+    assert source_fsynced.wait(timeout=5)
+
+    store = AtomicArtifactStore(workspace)
+
+    assert store.startup_cleanup_report == []
+    assert temporary.read_bytes() == b"complete manifest\n"
+    release_source.set()
+    writer.join(timeout=5)
+    assert writer_errors == []
+    assert manifest.read_bytes() == b"complete manifest\n"
 
 
 def test_cleanup_lock_cannot_delete_a_live_writer_temporary_file(tmp_path: Path) -> None:
