@@ -13,6 +13,7 @@ from curation.cosmos_transport import (
     SamplingOutcome,
     build_canonical_prompt,
 )
+from curation.db import _validate_http_exchange, canonical_json
 import httpx
 import pytest
 
@@ -250,30 +251,59 @@ def test_timeout_is_manual_only_without_retry() -> None:
     assert (result.status, result.reason, calls) == ("manual_only", "timeout", 1)
 
 
+def test_hostile_transport_error_text_cannot_poison_task4_exchange_serialization() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("\ud800", request=request)
+
+    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
+
+    assert (result.status, result.reason) == ("manual_only", "timeout")
+    canonical_json(result.exchanges).encode("utf-8")
+    _validate_http_exchange(result.exchanges[0])
+
+
 @pytest.mark.parametrize(
-    ("body", "reason", "observed_content"),
-    [
-        ({"choices": []}, "missing_choice", None),
-        ({"choices": [{}]}, "missing_content", None),
-        (
-            {"choices": [{"message": {"content": "{}"}, "finish_reason": "length"}]},
-            "finish_reason",
-            "{}",
-        ),
-        (
-            {"choices": [{"message": {"content": "{}"}}]},
-            "finish_reason",
-            "{}",
-        ),
-    ],
+    ("body", "reason"),
+    [({"choices": []}, "missing_choice"), ({"choices": [{}]}, "missing_content")],
 )
 def test_invalid_success_envelope_preserves_any_exact_content_for_evidence(
-    body: dict[str, Any], reason: str, observed_content: str | None
+    body: dict[str, Any], reason: str
 ) -> None:
     result = _transport(lambda _: httpx.Response(200, json=body)).annotate(SamplingOutcome.ready(_sample()))
     assert (result.status, result.reason) == ("manual_only", reason)
-    assert result.initial_content == observed_content
+    assert result.initial_content is None
     assert result.repair_content is None
+
+
+@pytest.mark.parametrize("finish_reason", ["length", None, "content_filter"])
+def test_non_stop_initial_with_string_content_gets_exactly_one_text_only_repair(
+    finish_reason: str | None,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:
+            document = {
+                "choices": [
+                    {
+                        "message": {"content": "truncated initial"},
+                    }
+                ]
+            }
+            if finish_reason is not None:
+                document["choices"][0]["finish_reason"] = finish_reason
+            return httpx.Response(200, json=document)
+        return _response(json.dumps(_complete_response()))
+
+    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
+
+    assert result.status == "succeeded"
+    assert result.initial_content == "truncated initial"
+    assert result.repair_content == json.dumps(_complete_response())
+    assert len(requests) == 2
+    assert requests[1]["max_completion_tokens"] == 2048
+    assert "media_io_kwargs" not in requests[1]
 
 
 def test_response_body_limit_is_enforced_before_json_validation() -> None:
@@ -281,6 +311,45 @@ def test_response_body_limit_is_enforced_before_json_validation() -> None:
         SamplingOutcome.ready(_sample())
     )
     assert (result.status, result.reason) == ("manual_only", "response_too_large")
+
+
+@pytest.mark.parametrize(
+    "raw_body",
+    [
+        b'{"choices":[],"choices":[]}',
+        b'{"choices":NaN}',
+        b'{"choices":Infinity}',
+        b'{"choices":[{"message":{"content":"ok","content":"duplicate"},"finish_reason":"stop"}]}',
+        b'{"\\ud800":1,"\\ud800":2}',
+        b'{"choices":[]}' + b"\xff",
+    ],
+)
+def test_hostile_outer_json_is_bounded_manual_only_with_task4_serializable_exchange(raw_body: bytes) -> None:
+    result = _transport(lambda _: httpx.Response(200, content=raw_body)).annotate(SamplingOutcome.ready(_sample()))
+
+    assert (result.status, result.reason) == ("manual_only", "invalid_json")
+    assert result.initial_content is None
+    assert result.exchanges[0]["error"]["class"] == "CosmosEnvelopeError"
+    canonical_json(result.exchanges).encode("utf-8")
+    _validate_http_exchange(result.exchanges[0])
+
+
+def test_surrogate_message_content_is_rejected_without_uncaught_encoding_or_repair() -> None:
+    raw = b'{"choices":[{"message":{"content":"\\ud800"},"finish_reason":"stop"}]}'
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=raw)
+
+    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
+
+    assert (result.status, result.reason, calls) == ("manual_only", "invalid_utf8", 1)
+    assert result.initial_content is None
+    assert result.exchanges[0]["error"]["class"] == "CosmosEnvelopeError"
+    canonical_json(result.exchanges).encode("utf-8")
+    _validate_http_exchange(result.exchanges[0])
 
 
 def test_invalid_contract_content_gets_one_text_only_repair_without_retry() -> None:
@@ -316,6 +385,22 @@ def test_invalid_contract_content_gets_one_text_only_repair_without_retry() -> N
     assert repair_payload["invalid_response"] == "not json"
     assert isinstance(repair_payload["validation_errors"], list)
     assert result.exchanges[-1]["phase"] == "repair"
+
+
+def test_inner_json_surrogate_validation_error_is_safely_escaped_in_repair_request() -> None:
+    requests: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.content)
+        if len(requests) == 1:
+            return _response('{"\\ud800":1}')
+        return _response(json.dumps(_complete_response()))
+
+    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
+
+    assert result.status == "succeeded"
+    assert len(requests) == 2
+    requests[1].decode("utf-8")
 
 
 def test_semantically_incomplete_valid_content_is_accepted_without_repair() -> None:

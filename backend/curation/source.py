@@ -34,6 +34,32 @@ class SourceRecord:
             return None
         return open_regular_file_beneath(self.root, relative, identity)
 
+    def verify_pinned_asset(self, asset: OpenedAsset, *, sha256: str) -> bool:
+        """Revalidate a pinned descriptor, its bytes, and its registered pathname.
+
+        The descriptor check detects in-place mutation while the secure reopen
+        detects a pathname swap.  Callers must keep ``asset`` open throughout
+        their read and hash operation.
+        """
+
+        key = asset.relative_path.as_posix()
+        expected_identity = self.file_identities.get(key)
+        expected_hash = self.file_hashes.get(key)
+        if asset.closed or expected_identity is None or expected_hash != sha256:
+            return False
+        try:
+            if not expected_identity.matches(os.fstat(asset.fd)):
+                return False
+        except OSError:
+            return False
+        current = self.open_asset(key)
+        if current is None:
+            return False
+        try:
+            return expected_identity.matches(current.stat_result)
+        finally:
+            current.close()
+
     def verify_current_inventory(self) -> bool:
         """Verify every registered file still has its manifest-time identity."""
         try:
