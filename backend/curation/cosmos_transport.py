@@ -775,7 +775,11 @@ def _validated_cosmos_endpoint(base_url: Any) -> str:
         or (port is not None and not 1 <= port <= 65_535)
     ):
         raise ValueError("Cosmos base URL must be absolute and contain no credentials, query, or fragment")
-    return base_url.rstrip("/") + "/chat/completions"
+    endpoint = base_url.rstrip("/") + "/chat/completions"
+    try:
+        return str(httpx.Request("POST", endpoint).url)
+    except (httpx.InvalidURL, UnicodeError, ValueError):
+        raise ValueError("Cosmos base URL is not a valid HTTP request URL") from None
 
 
 def _validated_bearer_token(api_key: Any) -> str:
@@ -1037,6 +1041,16 @@ class CosmosTransport:
                 error_summary="Cosmos response exceeded 2 MiB",
             )
             return _CallResult(None, "response_too_large", False, exchange)
+        except httpx.InvalidURL:
+            exchange = self._exchange(
+                phase,
+                started_at,
+                request_record,
+                response=None,
+                error_class="InvalidURL",
+                error_summary="Cosmos request URL was rejected",
+            )
+            return _CallResult(None, "invalid_url", False, exchange)
         except httpx.TimeoutException as error:
             exchange = self._exchange(
                 phase,
@@ -1596,30 +1610,12 @@ class AtomicArtifactStore:
 
     def _cleanup_locked(self, root_fd: int, *, referenced: frozenset[str]) -> list[dict[str, Any]]:
         report: list[dict[str, Any]] = []
-        try:
-            artifacts_fd = os.open(
-                "artifacts",
-                os.O_RDONLY
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=root_fd,
-            )
-        except (FileNotFoundError, NotADirectoryError):
-            return report
-        except OSError as error:
-            if error.errno in {errno.ELOOP, errno.ENOENT, errno.ENOTDIR}:
-                return report
-            raise ArtifactSecurityError("artifact subtree could not be inspected") from error
-        try:
-            self._cleanup_directory_fd(
-                artifacts_fd,
-                relative_parts=("artifacts",),
-                referenced=referenced,
-                report=report,
-            )
-        finally:
-            os.close(artifacts_fd)
+        self._cleanup_directory_fd(
+            root_fd,
+            relative_parts=(),
+            referenced=referenced,
+            report=report,
+        )
         return report
 
     def _cleanup_directory_fd(

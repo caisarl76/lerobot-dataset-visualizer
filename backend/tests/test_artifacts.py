@@ -352,16 +352,21 @@ def test_constructor_performs_locked_startup_cleanup_and_preserves_complete_evid
 
     assert store.startup_cleanup_report == [
         {
+            "relative_path": outside_artifact_tree.name,
+            "byte_size": 13,
+            "removed": True,
+        },
+        {
             "relative_path": f"artifacts/cosmos/id/{temporary.name}",
             "byte_size": 7,
             "removed": True,
-        }
+        },
     ]
     assert complete.read_bytes() == b"evidence"
     assert not temporary.exists()
     assert unrelated.read_bytes() == b"application-owned"
     assert source_manifest_temporary.read_bytes() == b"manifest-owned"
-    assert outside_artifact_tree.read_bytes() == b"wrong-subtree"
+    assert not outside_artifact_tree.exists()
 
 
 def test_complete_artifact_cannot_be_named_inside_the_cleanup_namespace(tmp_path: Path) -> None:
@@ -370,6 +375,41 @@ def test_complete_artifact_cannot_be_named_inside_the_cleanup_namespace(tmp_path
 
     with pytest.raises(ValueError, match="reserved"):
         store.write_bytes(reserved, b"complete", media_type="text/plain")
+
+
+def test_startup_cleanup_finds_exact_owned_temps_across_the_workspace_tree(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    contact_sheets = workspace / "contact_sheets"
+    exports = workspace / "exports/nested"
+    contact_sheets.mkdir(parents=True)
+    exports.mkdir(parents=True)
+    contact_temp = contact_sheets / f".curation-artifact-v1-{secrets.token_hex(16)}.tmp"
+    export_temp = exports / f".curation-artifact-v1-{secrets.token_hex(16)}.tmp"
+    source_temp = exports / f".source-files.sha256.{secrets.token_hex(16)}.tmp"
+    unrelated_temp = contact_sheets / ".thumbnail-cache.tmp"
+    contact_temp.write_bytes(b"contact partial")
+    export_temp.write_bytes(b"export partial")
+    source_temp.write_bytes(b"manifest partial")
+    unrelated_temp.write_bytes(b"unrelated partial")
+
+    store = AtomicArtifactStore(workspace)
+
+    assert store.startup_cleanup_report == [
+        {
+            "relative_path": f"contact_sheets/{contact_temp.name}",
+            "byte_size": len(b"contact partial"),
+            "removed": True,
+        },
+        {
+            "relative_path": f"exports/nested/{export_temp.name}",
+            "byte_size": len(b"export partial"),
+            "removed": True,
+        },
+    ]
+    assert not contact_temp.exists()
+    assert not export_temp.exists()
+    assert source_temp.read_bytes() == b"manifest partial"
+    assert unrelated_temp.read_bytes() == b"unrelated partial"
 
 
 def test_startup_cleanup_cannot_delete_live_source_manifest_temp_before_link(tmp_path: Path) -> None:

@@ -327,6 +327,24 @@ def test_transport_rejects_noncanonical_or_credential_bearing_base_urls(base_url
 
 
 @pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://[v1.foo]/v1",
+        "http://😀.example/v1",
+        "http://cosmos.\u00a0test/v1",
+    ],
+)
+def test_transport_rejects_authorities_httpx_cannot_construct_without_echoing_them(
+    base_url: str,
+) -> None:
+    with pytest.raises(ValueError) as caught:
+        CosmosTransport(base_url=base_url, model="model", api_key="key")
+
+    assert str(caught.value) == "Cosmos base URL is not a valid HTTP request URL"
+    assert base_url not in str(caught.value)
+
+
+@pytest.mark.parametrize(
     "api_key",
     ["space key", " key", "key ", "key\r\nInjected: yes", "key\x00", "key\x1f", "key\x7f"],
 )
@@ -377,6 +395,22 @@ def test_httpx_exception_text_cannot_leak_api_key_into_persisted_exchange(
     assert "secret-key" not in serialized
     assert result.exchanges[-1]["error"]["summary"] == expected_summary
     _validate_http_exchange(result.exchanges[-1])
+
+
+def test_defensive_invalid_url_from_httpx_is_bounded_without_secret_leakage() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise httpx.InvalidURL("secret-key appeared in invalid URL details")
+
+    result = _transport(handler).annotate(SamplingOutcome.ready(_sample()))
+    serialized = canonical_json(result.exchanges)
+
+    assert (result.status, result.reason) == ("manual_only", "invalid_url")
+    assert "secret-key" not in serialized
+    assert result.exchanges[0]["error"] == {
+        "class": "InvalidURL",
+        "summary": "Cosmos request URL was rejected",
+    }
+    _validate_http_exchange(result.exchanges[0])
 
 
 def test_manual_only_sampling_outcome_never_calls_http_or_rejects() -> None:
