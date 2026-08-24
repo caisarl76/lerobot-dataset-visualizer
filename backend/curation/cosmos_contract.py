@@ -40,12 +40,15 @@ class CosmosProposal:
 def parse_cosmos_response(content: str, *, duration_s: float) -> dict[str, Any]:
     """Parse exactly one Cosmos object and enforce its static and dynamic contract."""
 
-    response = _decode_response_object(content)
-    schema_errors = sorted(_SCHEMA_VALIDATOR.iter_errors(response), key=_schema_error_key)
-    if schema_errors:
-        raise CosmosContractError(f"schema {error.json_path}: {error.message}" for error in schema_errors)
-    _validate_dynamic_contract(response, duration_s=duration_s)
-    return response
+    try:
+        response = _decode_response_object(content)
+        schema_errors = sorted(_SCHEMA_VALIDATOR.iter_errors(response), key=_schema_error_key)
+        if schema_errors:
+            raise CosmosContractError(f"schema {error.json_path}: {error.message}" for error in schema_errors)
+        _validate_dynamic_contract(response, duration_s=duration_s)
+        return response
+    except RecursionError as error:
+        raise CosmosContractError("response nesting exceeds the validation limit") from error
 
 
 def snap_transition_frames(
@@ -59,7 +62,7 @@ def snap_transition_frames(
 
     try:
         timestamps = np.asarray(list(parquet_timestamps), dtype=np.float64)
-    except (TypeError, ValueError) as error:
+    except (OverflowError, TypeError, ValueError) as error:
         raise CosmosContractError("parquet timestamps must be a one-dimensional numeric sequence") from error
     if timestamps.ndim != 1 or timestamps.size == 0:
         raise CosmosContractError("parquet timestamps must be a nonempty one-dimensional sequence")

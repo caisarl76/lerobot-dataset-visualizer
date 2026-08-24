@@ -237,6 +237,24 @@ def test_strict_parser_rejects_noncontract_envelopes(content: str) -> None:
         _contract().parse_cosmos_response(content, duration_s=41.2)
 
 
+def test_deeply_nested_json_is_reported_as_a_contract_error() -> None:
+    nested = "[" * 1_500 + "0" + "]" * 1_500
+    content = '{"extra":' + nested + "}"
+    assert len(content.encode("utf-8")) < 2 * 1024 * 1024
+    with pytest.raises(_contract().CosmosContractError):
+        _contract().parse_cosmos_response(content, duration_s=41.2)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['{"schema_version": 2, "schema_version": 2}', '{"outer": {"value": 1, "value": 2}}'],
+    ids=["root", "nested"],
+)
+def test_duplicate_json_members_are_rejected(content: str) -> None:
+    with pytest.raises(_contract().CosmosContractError):
+        _contract().parse_cosmos_response(content, duration_s=41.2)
+
+
 def test_absent_segments_are_rejected() -> None:
     response = deepcopy(COMPLETE_RESPONSE)
     response.pop("segments")
@@ -422,3 +440,8 @@ def test_snapping_rejects_nonfinite_parquet_timestamps(timestamp: float) -> None
             duration_s=41.2,
             parquet_timestamps=[0.0, timestamp, 41.2],
         )
+
+
+def test_snapping_reports_huge_parquet_timestamps_as_contract_errors() -> None:
+    with pytest.raises(_contract().CosmosContractError):
+        _contract().snap_transition_frames(INCOMPLETE_RESPONSE, [0.0, 10**1000])
