@@ -111,6 +111,52 @@ class WorkspaceSourceConflict(RuntimeError):
         super().__init__(f"registered workspace source does not match alias {alias}")
 
 
+class WorkspacePromptContractConflict(RuntimeError):
+    """A normal workspace open used a different prompt contract."""
+
+    def __init__(self, alias: str, current_dataset: dict[str, Any]) -> None:
+        self.alias = alias
+        self.current_dataset = current_dataset
+        super().__init__(f"workspace prompt contract does not match alias {alias}")
+
+
+class PromptMigrationConflict(RuntimeError):
+    """An explicit prompt migration lost its compare-and-swap."""
+
+    status_code = 409
+
+    def __init__(
+        self,
+        *,
+        expected_version: str,
+        expected_sha256: str,
+        current_version: str,
+        current_sha256: str,
+    ) -> None:
+        self.payload = {
+            "error": "prompt_migration_conflict",
+            "expected_prompt_template_version": expected_version,
+            "expected_prompt_template_sha256": expected_sha256,
+            "current_prompt_template_version": current_version,
+            "current_prompt_template_sha256": current_sha256,
+        }
+        super().__init__("prompt migration expected contract is no longer current")
+
+
+class PromptMigrationDowngrade(RuntimeError):
+    """An explicit migration attempted a non-increasing prompt version."""
+
+    status_code = 409
+
+    def __init__(self, *, current_version: str, requested_version: str) -> None:
+        self.payload = {
+            "error": "prompt_migration_downgrade",
+            "current_prompt_template_version": current_version,
+            "requested_prompt_template_version": requested_version,
+        }
+        super().__init__("prompt migration must increase the version within the same contract lineage")
+
+
 class PromptContractConflict(RuntimeError):
     """Approval raced with a dataset prompt-contract update."""
 
@@ -151,6 +197,16 @@ def _utc_now() -> str:
 
 def _enum_values(enum: type[Any]) -> str:
     return ", ".join(repr(member.value) for member in enum)
+
+
+def _prompt_contract_generation(version: str) -> tuple[str, int] | None:
+    lineage, separator, generation = version.rpartition("-v")
+    if not separator or not lineage or not generation.isdecimal() or generation.startswith("0"):
+        return None
+    number = int(generation)
+    if number < 1:
+        return None
+    return lineage, number
 
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -376,7 +432,6 @@ class CurationDatabase:
         now = _utc_now()
         with self._write() as connection:
             dataset = _row(connection.execute("SELECT * FROM datasets WHERE alias=?", (alias,)).fetchone())
-            invalidated: list[dict[str, Any]] = []
             if dataset is None:
                 cursor = connection.execute(
                     """
@@ -424,13 +479,11 @@ class CurationDatabase:
                 }
                 if persisted_lengths != normalized_lengths:
                     raise WorkspaceSourceConflict(alias)
-                invalidated = self._update_prompt_template_in_transaction(
-                    connection,
-                    dataset=dataset,
-                    prompt_template_version=prompt_template_version,
-                    prompt_template_sha256=prompt_template_sha256,
-                    actor=actor,
-                )
+                if (
+                    dataset["prompt_template_version"] != prompt_template_version
+                    or dataset["prompt_template_sha256"] != prompt_template_sha256
+                ):
+                    raise WorkspacePromptContractConflict(alias, dataset)
             dataset = _require_row(connection.execute("SELECT * FROM datasets WHERE alias=?", (alias,)).fetchone())
             episodes = [
                 dict(row)
@@ -439,7 +492,7 @@ class CurationDatabase:
                     (dataset["id"],),
                 )
             ]
-            return {"dataset": dataset, "episodes": episodes, "invalidated": invalidated}
+            return {"dataset": dataset, "episodes": episodes, "invalidated": []}
 
     def get_dataset(self, *, alias: str) -> dict[str, Any] | None:
         with self._read() as connection:
@@ -627,15 +680,17 @@ class CurationDatabase:
             )
             return updated
 
-    def update_prompt_template(
+    def migrate_prompt_template(
         self,
         *,
         dataset_id: int,
+        expected_prompt_template_version: str,
+        expected_prompt_template_sha256: str,
         prompt_template_version: str,
         prompt_template_sha256: str,
         actor: str,
     ) -> list[dict[str, Any]]:
-        """Update the template and atomically invalidate only approved keeps."""
+        """CAS a prompt upgrade and atomically invalidate only approved keeps."""
         if not actor:
             raise ValueError("actor is required")
         with self._write() as connection:
@@ -643,7 +698,34 @@ class CurationDatabase:
                 connection.execute("SELECT * FROM datasets WHERE id=?", (dataset_id,)).fetchone(),
                 "dataset not found",
             )
-            return self._update_prompt_template_in_transaction(
+            if (
+                dataset["prompt_template_version"] != expected_prompt_template_version
+                or dataset["prompt_template_sha256"] != expected_prompt_template_sha256
+            ):
+                raise PromptMigrationConflict(
+                    expected_version=expected_prompt_template_version,
+                    expected_sha256=expected_prompt_template_sha256,
+                    current_version=dataset["prompt_template_version"],
+                    current_sha256=dataset["prompt_template_sha256"],
+                )
+            if (
+                dataset["prompt_template_version"] == prompt_template_version
+                and dataset["prompt_template_sha256"] == prompt_template_sha256
+            ):
+                return []
+            current_generation = _prompt_contract_generation(dataset["prompt_template_version"])
+            requested_generation = _prompt_contract_generation(prompt_template_version)
+            if (
+                current_generation is None
+                or requested_generation is None
+                or requested_generation[0] != current_generation[0]
+                or requested_generation[1] <= current_generation[1]
+            ):
+                raise PromptMigrationDowngrade(
+                    current_version=dataset["prompt_template_version"],
+                    requested_version=prompt_template_version,
+                )
+            return self._migrate_prompt_template_in_transaction(
                 connection,
                 dataset=dataset,
                 prompt_template_version=prompt_template_version,
@@ -651,7 +733,7 @@ class CurationDatabase:
                 actor=actor,
             )
 
-    def _update_prompt_template_in_transaction(
+    def _migrate_prompt_template_in_transaction(
         self,
         connection: sqlite3.Connection,
         *,

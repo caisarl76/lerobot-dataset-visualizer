@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Any
 
 from curation.assets import LocalAssetService
@@ -350,6 +351,24 @@ def test_draft_normalizes_object_previews_prompts_and_validates_boundaries(revie
             )
 
 
+def test_whitespace_only_draft_object_is_validation_error_without_revision_change(
+    review_service: ReviewService,
+) -> None:
+    with pytest.raises(ReviewValidation, match="object_name"):
+        review_service.save_draft(
+            dataset_alias="local/pnp_trash",
+            source_episode_index=0,
+            expected_revision=0,
+            actor="curator",
+            object_name=" \t  ",
+        )
+
+    current = review_service.get_episode("local/pnp_trash", 0)
+    assert current["revision"] == 0
+    assert current["decision"]["review_state"] == "pending"
+    assert current["decision"]["object_name"] is None
+
+
 def test_pending_and_draft_allowed_edges_and_approval_invariants(review_service: ReviewService) -> None:
     draft = _complete_draft(review_service)
     approved = review_service.approve_keep(
@@ -547,7 +566,12 @@ def test_prompt_change_invalidates_only_keeps_in_one_transaction(
         prompt_template_sha256="c" * 64,
     )
 
-    changed.open_workspace("local/pnp_trash", actor="template-migrator")
+    changed.migrate_prompt_contract(
+        "local/pnp_trash",
+        expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
+        actor="template-migrator",
+    )
     invalidated = changed.get_episode("local/pnp_trash", 0)
     unchanged_reject = changed.get_episode("local/pnp_trash", 1)
 
@@ -578,8 +602,10 @@ def test_approval_wins_then_prompt_invalidation_reopens_the_keep(review_service:
     dataset = review_service.database.get_dataset(alias="local/pnp_trash")
     assert dataset is not None
 
-    invalidated = review_service.database.update_prompt_template(
+    invalidated = review_service.database.migrate_prompt_template(
         dataset_id=dataset["id"],
+        expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
         prompt_template_version="pnp-trash-prompts-v2",
         prompt_template_sha256="1" * 64,
         actor="template-migrator",
@@ -602,8 +628,10 @@ def test_prompt_invalidation_between_preflight_and_approval_blocks_stale_keep(
     original_transition = database.transition_review_episode
 
     def invalidate_then_transition(**arguments: Any) -> dict[str, Any]:
-        database.update_prompt_template(
+        database.migrate_prompt_template(
             dataset_id=dataset["id"],
+            expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+            expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
             prompt_template_version="pnp-trash-prompts-v2",
             prompt_template_sha256="2" * 64,
             actor="template-migrator",
@@ -642,7 +670,12 @@ def test_stale_service_is_blocked_after_another_service_changes_the_template(
         prompt_template_version="pnp-trash-prompts-v2",
         prompt_template_sha256="f" * 64,
     )
-    newer.open_workspace("local/pnp_trash", actor="template-migrator")
+    newer.migrate_prompt_contract(
+        "local/pnp_trash",
+        expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
+        actor="template-migrator",
+    )
 
     with pytest.raises(ReviewConflict) as raised:
         review_service.summary("local/pnp_trash")
@@ -656,6 +689,164 @@ def test_stale_service_is_blocked_after_another_service_changes_the_template(
     with pytest.raises(ReviewConflict) as reopened:
         review_service.open_workspace("local/pnp_trash", actor="old-service")
     assert reopened.value.payload["error"] == "stale_review_service"
+
+
+def test_fresh_stale_service_after_upgrade_cannot_downgrade_prompt_contract(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+) -> None:
+    newer = ReviewService(
+        database=review_service.database,
+        source_registry=review_source[0],
+        prompt_template_version="pnp-trash-prompts-v2",
+        prompt_template_sha256="a" * 64,
+    )
+    newer.migrate_prompt_contract(
+        "local/pnp_trash",
+        expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
+        actor="template-migrator",
+    )
+    fresh_stale = ReviewService(database=review_service.database, source_registry=review_source[0])
+
+    with pytest.raises(ReviewConflict) as raised:
+        fresh_stale.open_workspace("local/pnp_trash", actor="stale-process")
+
+    assert raised.value.payload["error"] == "stale_review_service"
+    persisted = review_service.database.get_dataset(alias="local/pnp_trash")
+    assert persisted is not None
+    assert persisted["prompt_template_version"] == "pnp-trash-prompts-v2"
+    assert persisted["prompt_template_sha256"] == "a" * 64
+
+
+def test_normal_open_never_implicitly_upgrades_prompt_contract(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+) -> None:
+    newer = ReviewService(
+        database=review_service.database,
+        source_registry=review_source[0],
+        prompt_template_version="pnp-trash-prompts-v2",
+        prompt_template_sha256="9" * 64,
+    )
+
+    with pytest.raises(ReviewConflict) as raised:
+        newer.open_workspace("local/pnp_trash", actor="normal-open")
+
+    assert raised.value.payload["error"] == "stale_review_service"
+    persisted = review_service.database.get_dataset(alias="local/pnp_trash")
+    assert persisted is not None
+    assert persisted["prompt_template_version"] == PROMPT_TEMPLATE_VERSION
+    assert persisted["prompt_template_sha256"] == PROMPT_TEMPLATE_SHA256
+
+
+def test_cached_old_and_new_concurrent_opens_cannot_revert_upgraded_prompt_contract(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+) -> None:
+    newer = ReviewService(
+        database=review_service.database,
+        source_registry=review_source[0],
+        prompt_template_version="pnp-trash-prompts-v2",
+        prompt_template_sha256="b" * 64,
+    )
+    newer.migrate_prompt_contract(
+        "local/pnp_trash",
+        expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
+        actor="template-migrator",
+    )
+    old_process = review_service
+    new_process = ReviewService(
+        database=review_service.database,
+        source_registry=review_source[0],
+        prompt_template_version="pnp-trash-prompts-v2",
+        prompt_template_sha256="b" * 64,
+    )
+    barrier = threading.Barrier(2)
+
+    def open_after_barrier(service: ReviewService, actor: str) -> str:
+        barrier.wait()
+        try:
+            service.open_workspace("local/pnp_trash", actor=actor)
+        except ReviewConflict as error:
+            return error.payload["error"]
+        return "opened"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(open_after_barrier, old_process, "old-process"),
+            executor.submit(open_after_barrier, new_process, "new-process"),
+        ]
+        results = {future.result() for future in futures}
+
+    assert results == {"stale_review_service", "opened"}
+    persisted = review_service.database.get_dataset(alias="local/pnp_trash")
+    assert persisted is not None
+    assert persisted["prompt_template_version"] == "pnp-trash-prompts-v2"
+    assert persisted["prompt_template_sha256"] == "b" * 64
+
+
+def test_prompt_migration_compare_and_swap_conflict_and_downgrade_rejection(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+) -> None:
+    version_two = ReviewService(
+        database=review_service.database,
+        source_registry=review_source[0],
+        prompt_template_version="pnp-trash-prompts-v2",
+        prompt_template_sha256="c" * 64,
+    )
+    version_three = ReviewService(
+        database=review_service.database,
+        source_registry=review_source[0],
+        prompt_template_version="pnp-trash-prompts-v3",
+        prompt_template_sha256="d" * 64,
+    )
+    version_two.migrate_prompt_contract(
+        "local/pnp_trash",
+        expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
+        actor="v2-migrator",
+    )
+
+    with pytest.raises(ReviewConflict) as cas_conflict:
+        version_three.migrate_prompt_contract(
+            "local/pnp_trash",
+            expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+            expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
+            actor="v3-migrator",
+        )
+    assert cas_conflict.value.payload["error"] == "prompt_migration_conflict"
+    assert cas_conflict.value.payload["current_prompt_template_version"] == "pnp-trash-prompts-v2"
+
+    with pytest.raises(ReviewConflict) as downgrade:
+        review_service.migrate_prompt_contract(
+            "local/pnp_trash",
+            expected_prompt_template_version="pnp-trash-prompts-v2",
+            expected_prompt_template_sha256="c" * 64,
+            actor="old-migrator",
+        )
+    assert downgrade.value.payload["error"] == "prompt_migration_downgrade"
+    persisted = review_service.database.get_dataset(alias="local/pnp_trash")
+    assert persisted is not None
+    assert persisted["prompt_template_version"] == "pnp-trash-prompts-v2"
+    assert persisted["prompt_template_sha256"] == "c" * 64
+
+
+def test_new_service_reconstructs_persisted_workspace_without_process_cache(
+    review_service: ReviewService,
+    review_source: tuple[SourceRegistry, Path],
+) -> None:
+    draft = _complete_draft(review_service)
+    restarted = ReviewService(database=review_service.database, source_registry=review_source[0])
+
+    summary = restarted.summary("local/pnp_trash")
+    current = restarted.get_episode("local/pnp_trash", 0)
+
+    assert summary["counts"]["draft"] == 1
+    assert current["revision"] == draft["revision"]
+    assert current["decision"] == draft["decision"]
 
 
 def test_response_warnings_report_draft_and_corrupt_approval_invariants(
@@ -724,8 +915,10 @@ def test_prompt_invalidation_rolls_back_dataset_rows_and_audits_together(
 
     monkeypatch.setattr(database, "_append_audit_event", fail_second_audit)
     with pytest.raises(RuntimeError, match="injected"):
-        database.update_prompt_template(
+        database.migrate_prompt_template(
             dataset_id=dataset_before["id"],
+            expected_prompt_template_version=PROMPT_TEMPLATE_VERSION,
+            expected_prompt_template_sha256=PROMPT_TEMPLATE_SHA256,
             prompt_template_version="pnp-trash-prompts-v2",
             prompt_template_sha256="e" * 64,
             actor="template-migrator",
@@ -887,7 +1080,7 @@ def test_unknown_or_changed_source_never_reuses_registered_decisions(
         changed_service.open_workspace("local/pnp_trash", actor="curator")
 
 
-def test_workspace_open_requires_an_actor_for_possible_invalidation(review_service: ReviewService) -> None:
+def test_workspace_open_requires_an_actor(review_service: ReviewService) -> None:
     with pytest.raises(ReviewValidation, match="actor"):
         review_service.open_workspace("local/pnp_trash", actor="   ")
 
@@ -997,6 +1190,30 @@ def test_review_api_shapes_mutations_and_conflicts(review_client: TestClient) ->
     )
     assert approval.status_code == 200
     assert approval.json()["approval_revision"] == approval.json()["revision"]
+
+
+def test_review_api_rejects_whitespace_object_without_mutation(review_client: TestClient) -> None:
+    headers = {"Authorization": "Bearer secret-token"}
+    response = review_client.patch(
+        "/api/curation/episodes/0/draft",
+        headers=headers,
+        json={
+            "dataset_alias": "local/pnp_trash",
+            "expected_revision": 0,
+            "actor": "curator",
+            "object_name": "   ",
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["error"] == "invalid_review"
+    current = review_client.get(
+        "/api/curation/episodes/0",
+        params={"dataset_alias": "local/pnp_trash"},
+        headers=headers,
+    )
+    assert current.status_code == 200
+    assert current.json()["revision"] == 0
+    assert current.json()["decision"]["review_state"] == "pending"
 
 
 @pytest.mark.parametrize(

@@ -15,6 +15,9 @@ from .db import (
     IllegalStateTransition,
     OptimisticConflict,
     PromptContractConflict,
+    PromptMigrationConflict,
+    PromptMigrationDowngrade,
+    WorkspacePromptContractConflict,
     WorkspaceSourceConflict,
 )
 from .models import ReviewState
@@ -165,6 +168,17 @@ def _source_identity_conflict(record: SourceRecord) -> ReviewConflict:
     )
 
 
+def _persisted_lengths_match(
+    database: CurationDatabase,
+    dataset_id: int,
+    source_lengths: dict[int, int],
+) -> bool:
+    persisted = {
+        row["source_episode_index"]: row["source_length"] for row in database.list_episodes(dataset_id=dataset_id)
+    }
+    return persisted == source_lengths
+
+
 def _read_registered_bytes(record: SourceRecord, relative_path: str) -> bytes:
     asset = record.open_asset(relative_path)
     if asset is None:
@@ -240,10 +254,7 @@ class ReviewService:
                 or current_dataset["prompt_template_sha256"] != self.prompt_template_sha256
             ):
                 raise _stale_service_conflict(dataset_alias, current_dataset)
-        source = self._sources.get(dataset_alias)
-        if source is None:
-            source = _SourceDataset.load(record)
-            self._sources[dataset_alias] = source
+        source = self._sources.get(dataset_alias) or _SourceDataset.load(record)
         try:
             self.database.open_review_workspace(
                 alias=dataset_alias,
@@ -259,12 +270,63 @@ class ReviewService:
                 "registered source fingerprint does not match current source",
                 {"error": "source_fingerprint_mismatch", "dataset_alias": dataset_alias},
             ) from error
+        except WorkspacePromptContractConflict as error:
+            raise _stale_service_conflict(dataset_alias, error.current_dataset) from error
+        self._sources[dataset_alias] = source
         return {
             "dataset_alias": dataset_alias,
             "source_fingerprint": record.fingerprint,
             "prompt_template_version": self.prompt_template_version,
             "prompt_template_sha256": self.prompt_template_sha256,
             "episode_count": len(source.lengths),
+        }
+
+    def migrate_prompt_contract(
+        self,
+        dataset_alias: str,
+        *,
+        expected_prompt_template_version: str,
+        expected_prompt_template_sha256: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Explicitly CAS the configured prompt contract into one workspace."""
+        actor = _identity(actor, "actor")
+        record = self.source_registry.records.get(dataset_alias)
+        if record is None:
+            raise ReviewNotFound(
+                "dataset alias is not registered",
+                {"error": "dataset_alias_not_found", "dataset_alias": dataset_alias},
+            )
+        if not record.verify_current_inventory():
+            raise _source_identity_conflict(record)
+        dataset = self.database.get_dataset(alias=dataset_alias)
+        if dataset is None:
+            raise ReviewConflict(
+                "workspace has not been initialized",
+                {"error": "workspace_not_open", "dataset_alias": dataset_alias},
+            )
+        if dataset["source_path"] != str(record.root) or dataset["source_manifest_sha256"] != record.fingerprint:
+            raise _source_identity_conflict(record)
+        source = self._sources.get(dataset_alias) or _SourceDataset.load(record)
+        if not _persisted_lengths_match(self.database, dataset["id"], source.lengths):
+            raise _source_identity_conflict(record)
+        try:
+            invalidated = self.database.migrate_prompt_template(
+                dataset_id=dataset["id"],
+                expected_prompt_template_version=expected_prompt_template_version,
+                expected_prompt_template_sha256=expected_prompt_template_sha256,
+                prompt_template_version=self.prompt_template_version,
+                prompt_template_sha256=self.prompt_template_sha256,
+                actor=actor,
+            )
+        except (PromptMigrationConflict, PromptMigrationDowngrade) as error:
+            raise ReviewConflict(str(error), error.payload) from error
+        self._sources[dataset_alias] = source
+        return {
+            "dataset_alias": dataset_alias,
+            "prompt_template_version": self.prompt_template_version,
+            "prompt_template_sha256": self.prompt_template_sha256,
+            "invalidated_episode_indices": [row["source_episode_index"] for row in invalidated],
         }
 
     def summary(self, dataset_alias: str) -> dict[str, Any]:
@@ -321,7 +383,13 @@ class ReviewService:
             "prompt_template_sha256": self.prompt_template_sha256,
         }
         if object_name is not _UNSET:
-            changes["object_name"] = None if object_name is None else normalize_object_name(object_name)
+            if object_name is None:
+                changes["object_name"] = None
+            else:
+                try:
+                    changes["object_name"] = normalize_object_name(object_name)
+                except (TypeError, ValueError) as error:
+                    raise ReviewValidation(str(error)) from error
         if pickup_hand is not _UNSET:
             changes["pickup_hand"] = _optional_enum(pickup_hand, "pickup_hand")
         if turn_direction is not _UNSET:
@@ -564,7 +632,6 @@ class ReviewService:
     def _workspace(self, dataset_alias: str) -> tuple[dict[str, Any], _SourceDataset]:
         record = self.source_registry.records.get(dataset_alias)
         dataset = self.database.get_dataset(alias=dataset_alias)
-        source = self._sources.get(dataset_alias)
         if record is None:
             raise ReviewNotFound(
                 "dataset alias is not registered",
@@ -572,7 +639,7 @@ class ReviewService:
             )
         if not record.verify_current_inventory():
             raise _source_identity_conflict(record)
-        if dataset is None or source is None:
+        if dataset is None:
             raise ReviewConflict(
                 "workspace has not been opened",
                 {"error": "workspace_not_open", "dataset_alias": dataset_alias},
@@ -587,6 +654,12 @@ class ReviewService:
             or dataset["prompt_template_sha256"] != self.prompt_template_sha256
         ):
             raise _stale_service_conflict(dataset_alias, dataset)
+        source = self._sources.get(dataset_alias)
+        if source is None:
+            source = _SourceDataset.load(record)
+            if not _persisted_lengths_match(self.database, dataset["id"], source.lengths):
+                raise _source_identity_conflict(record)
+            self._sources[dataset_alias] = source
         return dataset, source
 
     def _episode_row(self, dataset_id: int, source_episode_index: int) -> dict[str, Any]:
