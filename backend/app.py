@@ -51,12 +51,16 @@ from pydantic import BaseModel
 try:  # Supports both ``import backend.app`` and the legacy ``import app`` entrypoint.
     from .curation.assets import LocalAssetService
     from .curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
+    from .curation.db import CurationDatabase
+    from .curation.review import ReviewService
     from .curation.router import build_curation_router
     from .curation.security import CurationLoopbackGuard
     from .curation.source import SourceRegistry
 except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from curation.assets import LocalAssetService
     from curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
+    from curation.db import CurationDatabase
+    from curation.review import ReviewService
     from curation.router import build_curation_router
     from curation.security import CurationLoopbackGuard
     from curation.source import SourceRegistry
@@ -727,13 +731,16 @@ def _do_export(state: DatasetState, output_dir: str | None, copy_videos: bool) -
 # deliberately all-or-nothing and source registration happens before serving.
 _curation_settings: CurationSettings | None = None
 _local_asset_service: LocalAssetService | None = None
+_review_service: ReviewService | None = None
 if curation_is_configured():
     _curation_settings = CurationSettings.from_env()
-    _local_asset_service = LocalAssetService(
-        SourceRegistry.from_paths(
-            _curation_settings.dataset_aliases, workspace=_curation_settings.workspace
-        )
+    _source_registry = SourceRegistry.from_paths(
+        _curation_settings.dataset_aliases, workspace=_curation_settings.workspace
     )
+    _local_asset_service = LocalAssetService(_source_registry)
+    _curation_database = CurationDatabase(_curation_settings.workspace / "curation.sqlite3")
+    _curation_database.initialize()
+    _review_service = ReviewService(database=_curation_database, source_registry=_source_registry)
 
 app = FastAPI(title="LeRobot dataset visualizer — annotation backend")
 app.add_middleware(
@@ -747,7 +754,13 @@ app.add_middleware(
 )
 if _curation_settings:
     app.add_middleware(CurationLoopbackGuard)
-app.include_router(build_curation_router(_local_asset_service))
+app.include_router(
+    build_curation_router(
+        _local_asset_service,
+        review_service=_review_service,
+        bearer_token=_curation_settings.bearer_token if _curation_settings else None,
+    )
+)
 
 
 @app.get("/api/health")

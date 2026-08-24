@@ -103,6 +103,14 @@ class IllegalStateTransition(RuntimeError):
         super().__init__(f"{entity} {identifier} cannot transition from {current_state} to {target_state}")
 
 
+class WorkspaceSourceConflict(RuntimeError):
+    """A registered alias no longer describes the exact same immutable source."""
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        super().__init__(f"registered workspace source does not match alias {alias}")
+
+
 def canonical_json(value: Any) -> str:
     """Return the one JSON representation used by every hash-bearing record."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -315,6 +323,99 @@ class CurationDatabase:
                 connection.execute("SELECT * FROM datasets WHERE id=?", (cursor.lastrowid,)).fetchone()
             )
 
+    def open_review_workspace(
+        self,
+        *,
+        alias: str,
+        source_path: str,
+        source_manifest_sha256: str,
+        episode_lengths: Mapping[int, int],
+        prompt_template_version: str,
+        prompt_template_sha256: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Atomically register or validate one exact source and its prompt contract."""
+        if not actor:
+            raise ValueError("actor is required")
+        normalized_lengths = dict(episode_lengths)
+        if not normalized_lengths or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or isinstance(length, bool)
+            or not isinstance(length, int)
+            or length < 0
+            for index, length in normalized_lengths.items()
+        ):
+            raise ValueError("episode_lengths must be a nonempty mapping of nonnegative integers")
+        now = _utc_now()
+        with self._write() as connection:
+            dataset = _row(connection.execute("SELECT * FROM datasets WHERE alias=?", (alias,)).fetchone())
+            invalidated: list[dict[str, Any]] = []
+            if dataset is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO datasets(
+                        alias, source_path, source_manifest_sha256, prompt_template_version,
+                        prompt_template_sha256, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        alias,
+                        source_path,
+                        source_manifest_sha256,
+                        prompt_template_version,
+                        prompt_template_sha256,
+                        now,
+                        now,
+                    ),
+                )
+                dataset = _require_row(
+                    connection.execute("SELECT * FROM datasets WHERE id=?", (cursor.lastrowid,)).fetchone()
+                )
+                for source_episode_index, source_length in sorted(normalized_lengths.items()):
+                    _insert_workspace_episode(
+                        connection,
+                        dataset_id=dataset["id"],
+                        source_episode_index=source_episode_index,
+                        source_length=source_length,
+                        now=now,
+                    )
+            else:
+                if (
+                    dataset["source_path"] != source_path
+                    or dataset["source_manifest_sha256"] != source_manifest_sha256
+                ):
+                    raise WorkspaceSourceConflict(alias)
+                persisted_lengths = {
+                    row["source_episode_index"]: row["source_length"]
+                    for row in connection.execute(
+                        """
+                        SELECT source_episode_index, source_length
+                        FROM episodes WHERE dataset_id=? ORDER BY source_episode_index
+                        """,
+                        (dataset["id"],),
+                    )
+                }
+                if persisted_lengths != normalized_lengths:
+                    raise WorkspaceSourceConflict(alias)
+                invalidated = self._update_prompt_template_in_transaction(
+                    connection,
+                    dataset=dataset,
+                    prompt_template_version=prompt_template_version,
+                    prompt_template_sha256=prompt_template_sha256,
+                    actor=actor,
+                )
+            dataset = _require_row(connection.execute("SELECT * FROM datasets WHERE alias=?", (alias,)).fetchone())
+            episodes = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM episodes WHERE dataset_id=? ORDER BY source_episode_index",
+                    (dataset["id"],),
+                )
+            ]
+            return {"dataset": dataset, "episodes": episodes, "invalidated": invalidated}
+
     def get_dataset(self, *, alias: str) -> dict[str, Any] | None:
         with self._read() as connection:
             return _row(connection.execute("SELECT * FROM datasets WHERE alias=?", (alias,)).fetchone())
@@ -342,6 +443,33 @@ class CurationDatabase:
                 connection.execute(
                     "SELECT * FROM episodes WHERE dataset_id=? AND source_episode_index=?",
                     (dataset_id, source_episode_index),
+                ).fetchone()
+            )
+
+    def list_episodes(self, *, dataset_id: int) -> list[dict[str, Any]]:
+        with self._read() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM episodes WHERE dataset_id=? ORDER BY source_episode_index",
+                    (dataset_id,),
+                )
+            ]
+
+    def get_active_proposal(self, *, dataset_id: int, source_episode_index: int) -> dict[str, Any] | None:
+        """Return the one active model proposal for an exact dataset episode."""
+        with self._read() as connection:
+            return _row(
+                connection.execute(
+                    """
+                    SELECT proposal.*
+                    FROM cosmos_proposals AS proposal
+                    JOIN cosmos_attempts AS attempt ON attempt.id=proposal.attempt_id
+                    JOIN cosmos_jobs AS job ON job.id=attempt.job_id
+                    WHERE job.dataset_id=? AND attempt.source_episode_index=?
+                        AND proposal.state=?
+                    """,
+                    (dataset_id, source_episode_index, ProposalState.ACTIVE.value),
                 ).fetchone()
             )
 
@@ -390,6 +518,158 @@ class CurationDatabase:
                 new_revision=updated["revision"],
             )
             return updated
+
+    def transition_review_episode(
+        self,
+        *,
+        dataset_id: int,
+        source_episode_index: int,
+        expected_revision: int,
+        allowed_states: frozenset[ReviewState],
+        changes: Mapping[str, Any],
+        actor: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        """Apply one revisioned human-review edge in the same write lock."""
+        unknown = set(changes).difference(_EPISODE_CHANGE_COLUMNS)
+        if unknown:
+            raise ValueError(f"unsupported episode fields: {', '.join(sorted(unknown))}")
+        if not actor:
+            raise ValueError("actor is required")
+        if not operation:
+            raise ValueError("operation is required")
+        with self._write() as connection:
+            current = _require_row(
+                connection.execute(
+                    "SELECT * FROM episodes WHERE dataset_id=? AND source_episode_index=?",
+                    (dataset_id, source_episode_index),
+                ).fetchone(),
+                "episode not found",
+            )
+            if current["revision"] != expected_revision:
+                raise OptimisticConflict(current)
+            current_state = ReviewState(current["review_state"])
+            if current_state not in allowed_states:
+                target = changes.get("review_state", current_state)
+                if hasattr(target, "value"):
+                    target = target.value
+                raise IllegalStateTransition(
+                    entity="episode",
+                    identifier=str(source_episode_index),
+                    current_state=current_state.value,
+                    target_state=str(target),
+                )
+            fields = {key: (value.value if hasattr(value, "value") else value) for key, value in changes.items()}
+            fields["revision"] = expected_revision + 1
+            fields["updated_at"] = _utc_now()
+            assignments = ", ".join(f"{name}=?" for name in fields)
+            connection.execute(
+                f"UPDATE episodes SET {assignments} WHERE id=?",
+                (*fields.values(), current["id"]),
+            )
+            updated = _require_row(
+                connection.execute("SELECT * FROM episodes WHERE id=?", (current["id"],)).fetchone()
+            )
+            self._append_audit_event(
+                connection,
+                dataset_id=dataset_id,
+                actor=actor,
+                operation=operation,
+                episode_id=current["id"],
+                previous_revision=expected_revision,
+                new_revision=updated["revision"],
+            )
+            return updated
+
+    def update_prompt_template(
+        self,
+        *,
+        dataset_id: int,
+        prompt_template_version: str,
+        prompt_template_sha256: str,
+        actor: str,
+    ) -> list[dict[str, Any]]:
+        """Update the template and atomically invalidate only approved keeps."""
+        if not actor:
+            raise ValueError("actor is required")
+        with self._write() as connection:
+            dataset = _require_row(
+                connection.execute("SELECT * FROM datasets WHERE id=?", (dataset_id,)).fetchone(),
+                "dataset not found",
+            )
+            return self._update_prompt_template_in_transaction(
+                connection,
+                dataset=dataset,
+                prompt_template_version=prompt_template_version,
+                prompt_template_sha256=prompt_template_sha256,
+                actor=actor,
+            )
+
+    def _update_prompt_template_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        dataset: Mapping[str, Any],
+        prompt_template_version: str,
+        prompt_template_sha256: str,
+        actor: str,
+    ) -> list[dict[str, Any]]:
+        now = _utc_now()
+        hash_changed = dataset["prompt_template_sha256"] != prompt_template_sha256
+        if not hash_changed and dataset["prompt_template_version"] == prompt_template_version:
+            return []
+        connection.execute(
+            """
+            UPDATE datasets
+            SET prompt_template_version=?, prompt_template_sha256=?, updated_at=?
+            WHERE id=?
+            """,
+            (prompt_template_version, prompt_template_sha256, now, dataset["id"]),
+        )
+        if not hash_changed:
+            return []
+        approved_keeps = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM episodes WHERE dataset_id=? AND review_state=? ORDER BY source_episode_index",
+                (dataset["id"], ReviewState.APPROVED_KEEP.value),
+            )
+        ]
+        invalidated: list[dict[str, Any]] = []
+        for episode in approved_keeps:
+            new_revision = episode["revision"] + 1
+            connection.execute(
+                """
+                UPDATE episodes
+                SET review_state=?, revision=?, approval_revision=NULL, reviewer=NULL,
+                    approved_at=NULL, prompt_template_sha256=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    ReviewState.DRAFT.value,
+                    new_revision,
+                    prompt_template_sha256,
+                    now,
+                    episode["id"],
+                ),
+            )
+            self._append_audit_event(
+                connection,
+                dataset_id=dataset["id"],
+                actor=actor,
+                operation="prompt_template_invalidated",
+                episode_id=episode["id"],
+                previous_revision=episode["revision"],
+                new_revision=new_revision,
+                details={
+                    "previous_prompt_template_sha256": dataset["prompt_template_sha256"],
+                    "prompt_template_sha256": prompt_template_sha256,
+                },
+            )
+            invalidated.append(
+                _require_row(connection.execute("SELECT * FROM episodes WHERE id=?", (episode["id"],)).fetchone())
+            )
+        return invalidated
 
     def create_cosmos_job(
         self, *, dataset_id: int, configuration: Mapping[str, Any], parent_job_id: str | None = None
@@ -656,6 +936,33 @@ def _require_row(row: sqlite3.Row | None, message: str = "row not found") -> dic
     if value is None:
         raise LookupError(message)
     return value
+
+
+def _insert_workspace_episode(
+    connection: sqlite3.Connection,
+    *,
+    dataset_id: int,
+    source_episode_index: int,
+    source_length: int,
+    now: str,
+) -> dict[str, Any]:
+    cursor = connection.execute(
+        """
+        INSERT INTO episodes(
+            dataset_id, source_episode_index, source_length, review_state,
+            revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 0, ?, ?)
+        """,
+        (
+            dataset_id,
+            source_episode_index,
+            source_length,
+            ReviewState.PENDING.value,
+            now,
+            now,
+        ),
+    )
+    return _require_row(connection.execute("SELECT * FROM episodes WHERE id=?", (cursor.lastrowid,)).fetchone())
 
 
 def _approval_snapshot_document(
