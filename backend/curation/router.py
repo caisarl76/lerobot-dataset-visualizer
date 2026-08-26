@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from .assets import LocalAssetService
 from .db import RetryableDatabaseError
 from .review import ReviewError, ReviewService
+from .worker import BatchError, BatchService
 
 
 class _StrictBody(BaseModel):
@@ -42,6 +43,16 @@ class RejectBody(ApprovalBody):
     reason: str | None = None
 
 
+class StartBatchBody(_StrictBody):
+    dataset_alias: str
+    episode_indices: list[int] | None = None
+
+
+class RetryBatchBody(_StrictBody):
+    episode_indices: list[int] | None = None
+    failure_states: list[Literal["manual_only", "retryable", "cancelled"]] | None = None
+
+
 def _review_response(operation: Any) -> JSONResponse:
     try:
         return JSONResponse(operation())
@@ -52,6 +63,7 @@ def _review_response(operation: Any) -> JSONResponse:
 def build_curation_router(
     asset_service: LocalAssetService | None = None,
     review_service: ReviewService | None = None,
+    batch_service: BatchService | None = None,
     bearer_token: str | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -74,7 +86,7 @@ def build_curation_router(
             headers=request.headers,
         )
 
-    if review_service is None:
+    if review_service is None and batch_service is None:
         return router
     if not bearer_token:
         raise ValueError("bearer_token is required when review_service is configured")
@@ -92,6 +104,47 @@ def build_curation_router(
             )
 
     curation = APIRouter(dependencies=[Depends(require_curation_bearer)])
+
+    if batch_service is not None:
+
+        def batch_response(operation: Any, *, success_status: int = 200) -> JSONResponse:
+            try:
+                return JSONResponse(operation(), status_code=success_status)
+            except (BatchError, RetryableDatabaseError) as error:
+                return JSONResponse(error.payload, status_code=error.status_code)
+
+        @curation.post("/api/curation/batches")
+        def start_batch(body: StartBatchBody) -> JSONResponse:
+            return batch_response(
+                lambda: batch_service.start(body.dataset_alias, body.episode_indices), success_status=201
+            )
+
+        @curation.get("/api/curation/batches/{job_id}")
+        def batch_status(job_id: str) -> JSONResponse:
+            return batch_response(lambda: batch_service.status(job_id))
+
+        @curation.post("/api/curation/batches/{job_id}/retry")
+        def retry_batch(job_id: str, body: RetryBatchBody) -> JSONResponse:
+            return batch_response(
+                lambda: batch_service.retry(
+                    job_id,
+                    episode_indices=body.episode_indices,
+                    failure_states=body.failure_states,
+                ),
+                success_status=201,
+            )
+
+        @curation.post("/api/curation/batches/{job_id}/cancel")
+        def cancel_batch(job_id: str) -> JSONResponse:
+            try:
+                status_code, payload = batch_service.cancel(job_id)
+                return JSONResponse(payload, status_code=status_code)
+            except RetryableDatabaseError as error:
+                return JSONResponse(error.payload, status_code=error.status_code)
+
+    if review_service is None:
+        router.include_router(curation)
+        return router
 
     @curation.post("/api/curation/workspaces/open")
     def open_workspace(body: OpenWorkspaceBody) -> JSONResponse:

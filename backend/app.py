@@ -56,6 +56,7 @@ try:  # Supports both ``import backend.app`` and the legacy ``import app`` entry
     from .curation.router import build_curation_router
     from .curation.security import CurationLoopbackGuard
     from .curation.source import SourceRegistry
+    from .curation.worker import BatchService
 except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from curation.assets import LocalAssetService
     from curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
@@ -64,6 +65,7 @@ except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from curation.router import build_curation_router
     from curation.security import CurationLoopbackGuard
     from curation.source import SourceRegistry
+    from curation.worker import BatchService
 
 logger = logging.getLogger("lerobot-annotate")
 logging.basicConfig(level=logging.INFO)
@@ -732,6 +734,7 @@ def _do_export(state: DatasetState, output_dir: str | None, copy_videos: bool) -
 _curation_settings: CurationSettings | None = None
 _local_asset_service: LocalAssetService | None = None
 _review_service: ReviewService | None = None
+_batch_service: BatchService | None = None
 if curation_is_configured():
     _curation_settings = CurationSettings.from_env()
     _source_registry = SourceRegistry.from_paths(
@@ -741,6 +744,15 @@ if curation_is_configured():
     _curation_database = CurationDatabase(_curation_settings.workspace / "curation.sqlite3")
     _curation_database.initialize()
     _review_service = ReviewService(database=_curation_database, source_registry=_source_registry)
+    _batch_service = BatchService(
+        database=_curation_database,
+        source_registry=_source_registry,
+        workspace=_curation_settings.workspace,
+        cosmos_base_url=_curation_settings.cosmos_base_url,
+        cosmos_model=_curation_settings.cosmos_model,
+        cosmos_api_key_env=_curation_settings.cosmos_api_key_env,
+        cosmos_endpoint_identity=_curation_settings.cosmos_endpoint_identity,
+    )
 
 app = FastAPI(title="LeRobot dataset visualizer — annotation backend")
 app.add_middleware(
@@ -758,6 +770,7 @@ app.include_router(
     build_curation_router(
         _local_asset_service,
         review_service=_review_service,
+        batch_service=_batch_service,
         bearer_token=_curation_settings.bearer_token if _curation_settings else None,
     )
 )

@@ -9,8 +9,9 @@ PRAGMAs therefore cannot be treated as one-time process setup.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -60,6 +61,10 @@ class RetryableDatabaseError(RuntimeError):
 
     status_code = 503
     payload = {"error": "database_busy", "retryable": True}
+
+
+class IncompatibleCurationDatabase(RuntimeError):
+    """The worker was pointed at a database other than the exact current schema."""
 
 
 class OptimisticConflict(RuntimeError):
@@ -312,6 +317,36 @@ class CurationDatabase:
             connection.close()
             raise
         return connection
+
+    def validate_worker_compatibility(self) -> None:
+        """Read-only gate for the exact schema the standalone worker may mutate."""
+
+        if not self.path.is_file():
+            raise IncompatibleCurationDatabase("curation database is not a regular file")
+        connection: sqlite3.Connection | None = None
+        try:
+            uri = self.path.resolve().as_uri() + "?mode=ro"
+            connection = sqlite3.connect(uri, uri=True, isolation_level=None)
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            version_row = connection.execute("PRAGMA user_version").fetchone()
+            if version_row is None or type(version_row[0]) is not int or version_row[0] != SCHEMA_VERSION:
+                raise IncompatibleCurationDatabase("curation database schema version is incompatible")
+            observed = _schema_signature(connection)
+            if observed != _expected_v1_schema_signature():
+                raise IncompatibleCurationDatabase("curation database schema manifest is incompatible")
+            check_row = connection.execute("PRAGMA quick_check(1)").fetchone()
+            if check_row is None or tuple(check_row) != ("ok",):
+                raise IncompatibleCurationDatabase("curation database integrity check failed")
+        except IncompatibleCurationDatabase:
+            raise
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError):
+            raise IncompatibleCurationDatabase("curation database could not be validated") from None
+        finally:
+            if connection is not None:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                connection.close()
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
@@ -964,10 +999,18 @@ class CurationDatabase:
                 connection.execute("SELECT * FROM exports WHERE id=?", (current["id"],)).fetchone()
             )
 
-    def append_http_exchange_history(self, *, attempt_id: str, exchange: Mapping[str, Any]) -> dict[str, Any]:
+    def append_http_exchange_history(
+        self,
+        *,
+        attempt_id: str,
+        exchange: Mapping[str, Any],
+        _connection: sqlite3.Connection | None = None,
+        _deduplicate_exact_replay: bool = False,
+    ) -> dict[str, Any]:
         """Append one canonical HTTP envelope without rewriting prior exchange evidence."""
         normalized_exchange = _validate_http_exchange(exchange)
-        with self._write() as connection:
+        transaction = self._write() if _connection is None else nullcontext(_connection)
+        with transaction as connection:
             current = _require_row(
                 connection.execute("SELECT * FROM cosmos_attempts WHERE id=?", (attempt_id,)).fetchone(),
                 "Cosmos attempt not found",
@@ -975,11 +1018,12 @@ class CurationDatabase:
             history = json.loads(current["http_exchange_history_json"])
             if not isinstance(history, list):  # Defensive: the v1 CHECK normally makes this unreachable.
                 raise RuntimeError("attempt HTTP exchange history is not an array")
-            history.append(normalized_exchange)
-            connection.execute(
-                "UPDATE cosmos_attempts SET http_exchange_history_json=?, updated_at=? WHERE id=?",
-                (canonical_json(history), _utc_now(), attempt_id),
-            )
+            if not (_deduplicate_exact_replay and normalized_exchange in history):
+                history.append(normalized_exchange)
+                connection.execute(
+                    "UPDATE cosmos_attempts SET http_exchange_history_json=?, updated_at=? WHERE id=?",
+                    (canonical_json(history), _utc_now(), attempt_id),
+                )
             return _require_row(
                 connection.execute("SELECT * FROM cosmos_attempts WHERE id=?", (attempt_id,)).fetchone()
             )
@@ -1075,6 +1119,7 @@ class CurationDatabase:
         byte_size: int,
         sha256: str,
         update_attempt_pointer: bool = False,
+        _connection: sqlite3.Connection | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Atomically create-or-return one exact attempt artifact and optional pointer."""
 
@@ -1129,7 +1174,8 @@ class CurationDatabase:
         def matches(artifact: Mapping[str, Any]) -> bool:
             return all(artifact.get(key) == value for key, value in expected.items())
 
-        with self._write() as connection:
+        transaction = self._write() if _connection is None else nullcontext(_connection)
+        with transaction as connection:
             attempt_owner = _row(
                 connection.execute(
                     """
@@ -1285,6 +1331,35 @@ def _approval_snapshot_document(
         },
         episodes,
     )
+
+
+_SCHEMA_SIGNATURE_QUERY = """
+    SELECT type, name, tbl_name, sql
+    FROM sqlite_schema
+    WHERE name NOT LIKE 'sqlite_%'
+    ORDER BY type, name
+"""
+
+
+def _schema_signature(connection: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
+    rows = connection.execute(_SCHEMA_SIGNATURE_QUERY).fetchall()
+    signature: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        if len(row) != 4 or any(not isinstance(value, str) or not value for value in row):
+            raise IncompatibleCurationDatabase("curation database schema manifest is malformed")
+        signature.append(tuple(row))
+    return tuple(signature)
+
+
+@lru_cache(maxsize=1)
+def _expected_v1_schema_signature() -> tuple[tuple[str, str, str, str], ...]:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        for statement in _migration_v1_statements():
+            connection.execute(statement)
+        return _schema_signature(connection)
+    finally:
+        connection.close()
 
 
 def _migration_v1_statements() -> tuple[str, ...]:

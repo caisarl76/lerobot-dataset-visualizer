@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1528,6 +1528,7 @@ class AtomicArtifactStore:
         *,
         media_type: str,
         register: Callable[[ArtifactRecord], ReferenceT] | None = None,
+        authorization_guard: Callable[[], Any] | None = None,
     ) -> ArtifactWriteResult[ReferenceT]:
         if not isinstance(contents, bytes):
             raise TypeError("artifact contents must be bytes")
@@ -1535,25 +1536,28 @@ class AtomicArtifactStore:
         parts = PurePosixPath(normalized).parts
         if self._TEMP_PATTERN.fullmatch(parts[-1]) is not None:
             raise ValueError("artifact destination uses the reserved temporary-file namespace")
+        if authorization_guard is not None and not callable(authorization_guard):
+            raise TypeError("artifact authorization guard must be callable")
         with self._locked() as root_fd:
-            parent_fd, parent_relative = self._open_or_create_directories(root_fd, parts[:-1])
-            try:
-                installed = self._install_no_clobber(
-                    parent_fd,
-                    parent_relative=parent_relative,
-                    destination_name=parts[-1],
-                    destination_relative=normalized,
-                    contents=contents,
-                    media_type=media_type,
-                )
-            finally:
-                os.close(parent_fd)
-            named = self._snapshot_from_root(root_fd, normalized, media_type=media_type, fsync_parent=True)
-            self._require_same_snapshot(installed, named)
-            configured = self._revalidate_configured_snapshot(named, media_type=media_type)
-            record = configured.record
-            database_reference = None if register is None else register(record)
-            return ArtifactWriteResult(record=record, database_reference=database_reference)
+            with nullcontext() if authorization_guard is None else authorization_guard():
+                parent_fd, parent_relative = self._open_or_create_directories(root_fd, parts[:-1])
+                try:
+                    installed = self._install_no_clobber(
+                        parent_fd,
+                        parent_relative=parent_relative,
+                        destination_name=parts[-1],
+                        destination_relative=normalized,
+                        contents=contents,
+                        media_type=media_type,
+                    )
+                finally:
+                    os.close(parent_fd)
+                named = self._snapshot_from_root(root_fd, normalized, media_type=media_type, fsync_parent=True)
+                self._require_same_snapshot(installed, named)
+                configured = self._revalidate_configured_snapshot(named, media_type=media_type)
+                record = configured.record
+                database_reference = None if register is None else register(record)
+                return ArtifactWriteResult(record=record, database_reference=database_reference)
 
     def inspect_existing(
         self,
@@ -1599,6 +1603,7 @@ class AtomicArtifactStore:
         register: Callable[[ArtifactRecord], ReferenceT],
         expected_sha256: str | None = None,
         expected_byte_size: int | None = None,
+        authorization_guard: Callable[[], Any] | None = None,
     ) -> ArtifactWriteResult[ReferenceT]:
         """Durably reconcile complete evidence, then idempotently register it."""
 
@@ -1606,12 +1611,15 @@ class AtomicArtifactStore:
             raise TypeError("artifact adoption requires a database register callback")
         normalized = self._validated_existing_target(relative_path)
         self._validate_expected_artifact(expected_sha256, expected_byte_size)
+        if authorization_guard is not None and not callable(authorization_guard):
+            raise TypeError("artifact authorization guard must be callable")
         with self._locked() as root_fd:
-            snapshot = self._stable_existing_snapshot(root_fd, normalized, media_type=media_type)
-            self._require_expected_artifact(snapshot.record, expected_sha256, expected_byte_size)
-            configured = self._revalidate_configured_snapshot(snapshot, media_type=media_type)
-            reference = register(configured.record)
-            return ArtifactWriteResult(record=configured.record, database_reference=reference)
+            with nullcontext() if authorization_guard is None else authorization_guard():
+                snapshot = self._stable_existing_snapshot(root_fd, normalized, media_type=media_type)
+                self._require_expected_artifact(snapshot.record, expected_sha256, expected_byte_size)
+                configured = self._revalidate_configured_snapshot(snapshot, media_type=media_type)
+                reference = register(configured.record)
+                return ArtifactWriteResult(record=configured.record, database_reference=reference)
 
     def _validated_existing_target(self, relative_path: str) -> str:
         normalized = _safe_artifact_relative_path(relative_path)
@@ -1946,12 +1954,14 @@ class AtomicArtifactStore:
         document: Mapping[str, Any],
         *,
         register: Callable[[ArtifactRecord], ReferenceT] | None = None,
+        authorization_guard: Callable[[], Any] | None = None,
     ) -> ArtifactWriteResult[ReferenceT]:
         return self.write_bytes(
             relative_path,
             _canonical_json(dict(document)).encode("utf-8"),
             media_type="application/json",
             register=register,
+            authorization_guard=authorization_guard,
         )
 
     def write_text(
@@ -1960,12 +1970,14 @@ class AtomicArtifactStore:
         content: str,
         *,
         register: Callable[[ArtifactRecord], ReferenceT] | None = None,
+        authorization_guard: Callable[[], Any] | None = None,
     ) -> ArtifactWriteResult[ReferenceT]:
         return self.write_bytes(
             relative_path,
             content.encode("utf-8"),
             media_type="text/plain; charset=utf-8",
             register=register,
+            authorization_guard=authorization_guard,
         )
 
     def cleanup_temporary_files(self, *, referenced_relative_paths: Iterable[str] = ()) -> list[dict[str, Any]]:
