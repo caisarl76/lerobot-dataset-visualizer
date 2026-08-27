@@ -45,6 +45,97 @@ const TERMINAL_BATCH_STATES = new Set<BatchStatus["state"]>([
   "failed",
 ]);
 
+const OBJECT_SUGGESTIONS_KEY = "lerobot-curation:pnp-trash:object-suggestions";
+const MAX_OBJECT_SUGGESTIONS = 25;
+
+export interface CurationReviewIntent {
+  choice: "keep" | "reject";
+  rejectionReason: string;
+}
+
+export interface CurationReviewIntentEntry extends CurationReviewIntent {
+  dirty: boolean;
+  authoritativeLocked: boolean;
+}
+
+function normalizedObjectSuggestions(values: readonly string[]): string[] {
+  const unique: string[] = [];
+  for (const value of values) {
+    const normalized = value.trim();
+    if (!normalized) continue;
+    const previous = unique.indexOf(normalized);
+    if (previous >= 0) unique.splice(previous, 1);
+    unique.push(normalized);
+  }
+  return unique.slice(-MAX_OBJECT_SUGGESTIONS);
+}
+
+function storedObjectSuggestions(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const value: unknown = JSON.parse(
+      window.localStorage.getItem(OBJECT_SUGGESTIONS_KEY) ?? "[]",
+    );
+    return Array.isArray(value)
+      ? normalizedObjectSuggestions(
+          value.filter((item): item is string => typeof item === "string"),
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function reviewIntentEntryFromEpisode(
+  episode: EpisodeCuration | null,
+): CurationReviewIntentEntry {
+  return {
+    choice:
+      episode?.decision.reviewState === "approved_reject" ? "reject" : "keep",
+    rejectionReason: episode?.decision.rejectionReason ?? "",
+    dirty: false,
+    authoritativeLocked: episode?.approvalLocked ?? false,
+  };
+}
+
+function reconcileReviewIntent(
+  current: CurationReviewIntentEntry | undefined,
+  episode: EpisodeCuration,
+  forceServer = false,
+): CurationReviewIntentEntry {
+  const lockedAuthorityChanged =
+    current !== undefined &&
+    current.authoritativeLocked !== episode.approvalLocked;
+  if (
+    forceServer ||
+    current === undefined ||
+    !current.dirty ||
+    episode.approvalLocked ||
+    lockedAuthorityChanged
+  ) {
+    return reviewIntentEntryFromEpisode(episode);
+  }
+  return { ...current, authoritativeLocked: episode.approvalLocked };
+}
+
+function publicReviewIntent(
+  current: CurationReviewIntentEntry | undefined,
+  episode: EpisodeCuration | null,
+): CurationReviewIntent {
+  const value = current ?? reviewIntentEntryFromEpisode(episode);
+  return { choice: value.choice, rejectionReason: value.rejectionReason };
+}
+
+function withServerObjectSuggestion(
+  suggestions: readonly string[],
+  episode: EpisodeCuration,
+): string[] {
+  const objectName = episode.decision.objectName;
+  return objectName === null || objectName.trim().length === 0
+    ? [...suggestions]
+    : normalizedObjectSuggestions([...suggestions, objectName]);
+}
+
 export interface CurationState {
   workspaceGeneration: number;
   workspaceDatasetAlias: string;
@@ -65,6 +156,8 @@ export interface CurationState {
   batchOperationPending: boolean;
   batchPollGeneration: number;
   auditOperationToken: number;
+  reviewIntents: Record<number, CurationReviewIntentEntry>;
+  savedObjectSuggestions: string[];
 }
 
 type WorkspaceIdentity = { workspaceGeneration: number };
@@ -96,6 +189,11 @@ type CurationAction =
   | ({ type: "conflict"; current: EpisodeCuration } & EpisodeIdentity)
   | ({ type: "episode_error"; message: string } & EpisodeIdentity)
   | ({ type: "edit_draft"; patch: EpisodeDraftPatch } & EpisodeIdentity)
+  | ({
+      type: "edit_review_intent";
+      sourceEpisodeIndex: number;
+      patch: Partial<CurationReviewIntent>;
+    } & WorkspaceIdentity)
   | ({ type: "summary_loaded"; summary: WorkspaceSummary } & WorkspaceIdentity)
   | ({ type: "warning"; message: string } & WorkspaceIdentity)
   | ({ type: "audit_started"; token: number } & WorkspaceIdentity)
@@ -185,6 +283,8 @@ export function curationReducer(
         batchOperationPending: false,
         batchPollGeneration: action.pollGeneration,
         auditOperationToken: action.auditToken,
+        reviewIntents: {},
+        savedObjectSuggestions: state.savedObjectSuggestions,
       };
     case "workspace_ready":
       if (!matchesWorkspace(state, action)) return state;
@@ -227,6 +327,17 @@ export function curationReducer(
         loading: false,
         saving: false,
         error: null,
+        reviewIntents: {
+          ...state.reviewIntents,
+          [action.sourceEpisodeIndex]: reconcileReviewIntent(
+            state.reviewIntents[action.sourceEpisodeIndex],
+            action.episode,
+          ),
+        },
+        savedObjectSuggestions: withServerObjectSuggestion(
+          state.savedObjectSuggestions,
+          action.episode,
+        ),
       };
     case "episode_saving":
       if (
@@ -251,6 +362,17 @@ export function curationReducer(
         saving: false,
         error: null,
         conflict: null,
+        reviewIntents: {
+          ...state.reviewIntents,
+          [action.sourceEpisodeIndex]: reconcileReviewIntent(
+            state.reviewIntents[action.sourceEpisodeIndex],
+            action.episode,
+          ),
+        },
+        savedObjectSuggestions: withServerObjectSuggestion(
+          state.savedObjectSuggestions,
+          action.episode,
+        ),
       };
     case "grip_loading":
       if (
@@ -282,6 +404,18 @@ export function curationReducer(
             "This episode changed elsewhere. Reloaded the current revision; reconcile before saving.",
           current: action.current,
         },
+        reviewIntents: {
+          ...state.reviewIntents,
+          [action.sourceEpisodeIndex]: reconcileReviewIntent(
+            state.reviewIntents[action.sourceEpisodeIndex],
+            action.current,
+            true,
+          ),
+        },
+        savedObjectSuggestions: withServerObjectSuggestion(
+          state.savedObjectSuggestions,
+          action.current,
+        ),
       };
     case "episode_error":
       if (!matchesEpisode(state, action)) return state;
@@ -311,6 +445,27 @@ export function curationReducer(
         },
         error: null,
         conflict: null,
+      };
+    case "edit_review_intent":
+      if (
+        !matchesWorkspace(state, action) ||
+        state.selectedEpisodeIndex !== action.sourceEpisodeIndex ||
+        state.episode === null ||
+        state.episode.approvalLocked ||
+        state.conflict !== null
+      )
+        return state;
+      return {
+        ...state,
+        reviewIntents: {
+          ...state.reviewIntents,
+          [action.sourceEpisodeIndex]: {
+            ...(state.reviewIntents[action.sourceEpisodeIndex] ??
+              reviewIntentEntryFromEpisode(state.episode)),
+            ...action.patch,
+            dirty: true,
+          },
+        },
       };
     case "summary_loaded":
       if (!matchesWorkspace(state, action)) return state;
@@ -389,8 +544,10 @@ export function curationReducer(
 }
 
 interface CurationContextValue extends CurationState {
+  reviewIntent: CurationReviewIntent;
   selectEpisode: (sourceEpisodeIndex: number) => void;
   updateDraft: (patch: EpisodeDraftPatch) => void;
+  updateReviewIntent: (patch: Partial<CurationReviewIntent>) => void;
   saveDraft: () => Promise<void>;
   applyProposal: () => Promise<void>;
   reopen: () => Promise<void>;
@@ -490,6 +647,8 @@ export function CurationProvider({
     batchOperationPending: false,
     batchPollGeneration: 0,
     auditOperationToken: 0,
+    reviewIntents: {},
+    savedObjectSuggestions: storedObjectSuggestions(),
   });
 
   const actorRef = useRef(actor);
@@ -666,7 +825,11 @@ export function CurationProvider({
       while (!controller.signal.aborted) {
         try {
           await waitForPoll(pollIntervalMs, controller.signal);
-          const next = await fetchCurationBatch(jobId, controller.signal);
+          const next = await fetchCurationBatch(
+            jobId,
+            controller.signal,
+            datasetAlias,
+          );
           dispatch({
             type: "batch_polled",
             workspaceGeneration,
@@ -693,6 +856,7 @@ export function CurationProvider({
         pollControllerRef.current = null;
     };
   }, [
+    datasetAlias,
     pollIntervalMs,
     polledBatchState,
     polledJobId,
@@ -735,6 +899,18 @@ export function CurationProvider({
       patch,
     });
   }, []);
+
+  const updateReviewIntent = useCallback(
+    (patch: Partial<CurationReviewIntent>) => {
+      dispatch({
+        type: "edit_review_intent",
+        workspaceGeneration: workspaceGenerationRef.current,
+        sourceEpisodeIndex: selectedEpisodeRef.current,
+        patch,
+      });
+    },
+    [],
+  );
 
   const runMutation = useCallback(
     async (
@@ -956,13 +1132,41 @@ export function CurationProvider({
           batch,
         });
       } catch (error) {
-        if (!isAbort(error))
+        if (isAbort(error)) return;
+        const activeJobId =
+          error instanceof CurationClientError && error.status === 409
+            ? error.activeBatchJobId
+            : null;
+        if (activeJobId === null) {
           dispatch({
             type: "batch_error",
             workspaceGeneration: operation.workspaceGeneration,
             token: operation.token,
             message: errorMessage(error),
           });
+          return;
+        }
+        try {
+          const batch = await fetchCurationBatch(
+            activeJobId,
+            operation.controller.signal,
+            datasetAlias,
+          );
+          dispatch({
+            type: "batch_loaded",
+            workspaceGeneration: operation.workspaceGeneration,
+            token: operation.token,
+            batch,
+          });
+        } catch (recoveryError) {
+          if (!isAbort(recoveryError))
+            dispatch({
+              type: "batch_error",
+              workspaceGeneration: operation.workspaceGeneration,
+              token: operation.token,
+              message: errorMessage(recoveryError),
+            });
+        }
       }
     },
     [beginBatchOperation, datasetAlias],
@@ -981,6 +1185,7 @@ export function CurationProvider({
       const current = await fetchCurationBatch(
         jobId,
         operation.controller.signal,
+        datasetAlias,
       );
       dispatch({
         type: "batch_loaded",
@@ -997,7 +1202,7 @@ export function CurationProvider({
           message: errorMessage(error),
         });
     }
-  }, [beginBatchOperation, state.batch]);
+  }, [beginBatchOperation, datasetAlias, state.batch]);
 
   const retryBatch = useCallback(
     async (selection: {
@@ -1016,6 +1221,7 @@ export function CurationProvider({
         const child = await retryCurationBatch(
           jobId,
           selection,
+          datasetAlias,
           operation.controller.signal,
         );
         dispatch({
@@ -1034,7 +1240,7 @@ export function CurationProvider({
           });
       }
     },
-    [beginBatchOperation, state.batch],
+    [beginBatchOperation, datasetAlias, state.batch],
   );
 
   const refreshGrip = useCallback(async () => {
@@ -1098,6 +1304,17 @@ export function CurationProvider({
     [],
   );
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        OBJECT_SUGGESTIONS_KEY,
+        JSON.stringify(state.savedObjectSuggestions),
+      );
+    } catch {
+      // Suggestion history is optional; review state remains provider-owned.
+    }
+  }, [state.savedObjectSuggestions]);
+
   const clearConflict = useCallback(
     () => dispatch({ type: "clear_conflict" }),
     [],
@@ -1106,8 +1323,13 @@ export function CurationProvider({
   const value = useMemo<CurationContextValue>(
     () => ({
       ...state,
+      reviewIntent: publicReviewIntent(
+        state.reviewIntents[state.selectedEpisodeIndex],
+        state.episode,
+      ),
       selectEpisode,
       updateDraft,
+      updateReviewIntent,
       saveDraft,
       applyProposal,
       reopen,
@@ -1135,6 +1357,7 @@ export function CurationProvider({
       startBatch,
       state,
       updateDraft,
+      updateReviewIntent,
     ],
   );
 
@@ -1150,4 +1373,46 @@ export function useCuration(): CurationContextValue {
   if (context === null)
     throw new Error("useCuration must be used within CurationProvider");
   return context;
+}
+
+export interface CurationRouteSyncProps {
+  currentRouteEpisode: number;
+  onEpisodeNavigate: (sourceEpisodeIndex: number) => void;
+}
+
+export function CurationRouteSync({
+  currentRouteEpisode,
+  onEpisodeNavigate,
+}: CurationRouteSyncProps) {
+  const curation = useCuration();
+  const previousSelectionRef = useRef(curation.selectedEpisodeIndex);
+  const previousRouteRef = useRef(currentRouteEpisode);
+  const previousWorkspaceGenerationRef = useRef(curation.workspaceGeneration);
+
+  useEffect(() => {
+    const workspaceChanged =
+      previousWorkspaceGenerationRef.current !== curation.workspaceGeneration;
+    const selectedEpisodeChanged =
+      previousSelectionRef.current !== curation.selectedEpisodeIndex;
+    const routeEpisodeUnchanged =
+      previousRouteRef.current === currentRouteEpisode;
+    previousWorkspaceGenerationRef.current = curation.workspaceGeneration;
+    previousSelectionRef.current = curation.selectedEpisodeIndex;
+    previousRouteRef.current = currentRouteEpisode;
+    if (
+      workspaceChanged ||
+      curation.selectedEpisodeIndex === currentRouteEpisode ||
+      !selectedEpisodeChanged ||
+      !routeEpisodeUnchanged
+    )
+      return;
+    onEpisodeNavigate(curation.selectedEpisodeIndex);
+  }, [
+    currentRouteEpisode,
+    curation.selectedEpisodeIndex,
+    curation.workspaceGeneration,
+    onEpisodeNavigate,
+  ]);
+
+  return null;
 }

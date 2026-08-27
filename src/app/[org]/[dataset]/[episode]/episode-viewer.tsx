@@ -1,6 +1,13 @@
 "use client";
 
-import { useState, useEffect, useRef, lazy, Suspense } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  lazy,
+  Suspense,
+} from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { postParentMessageWithParams } from "@/utils/postParentMessage";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
@@ -11,8 +18,16 @@ import {
   AnnotationsProvider,
   useAnnotations,
 } from "@/context/annotations-context";
+import {
+  CurationProvider,
+  CurationRouteSync,
+} from "@/context/curation-context";
 import { AnnotationsPanel } from "@/components/annotations-panel";
 import { AnnotationsTimeline } from "@/components/annotations-timeline";
+import {
+  isTaskIndexCurationDataset,
+  TaskIndexCurationWorkspace,
+} from "@/components/task-index-curation-workspace";
 import Sidebar from "@/components/side-nav";
 import StatsPanel from "@/components/stats-panel";
 import OverviewPanel from "@/components/overview-panel";
@@ -150,7 +165,19 @@ export default function EpisodeViewer({
 }) {
   const [data, setData] = useState<EpisodeData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [curationEligibility, setCurationEligibility] = useState<{
+    routeDatasetKey: string;
+    episodeIndices: number[];
+  } | null>(null);
   const requestIdRef = useRef(0);
+  const routeDatasetKey = `${org}/${dataset}`;
+  const router = useRouter();
+  const navigateToCurationEpisode = useCallback(
+    (sourceEpisodeIndex: number) => {
+      router.push(`./episode_${sourceEpisodeIndex}`);
+    },
+    [router],
+  );
 
   useEffect(() => {
     if (Number.isNaN(episodeId)) {
@@ -169,7 +196,17 @@ export default function EpisodeViewer({
           setData(null);
           return;
         }
-        setData(loaded ?? null);
+        const nextData = loaded ?? null;
+        setData(nextData);
+        setCurationEligibility(
+          nextData &&
+            isTaskIndexCurationDataset(
+              nextData.datasetInfo.repoId,
+              nextData.datasetInfo.codebase_version,
+            )
+            ? { routeDatasetKey, episodeIndices: nextData.episodes }
+            : null,
+        );
       })
       .catch((err) => {
         if (requestIdRef.current !== requestId) return;
@@ -177,8 +214,49 @@ export default function EpisodeViewer({
         setError(message || "Unknown error");
         setData(null);
       });
-  }, [org, dataset, episodeId]);
+  }, [org, dataset, episodeId, routeDatasetKey]);
 
+  const content = (
+    <EpisodeViewerLoadBoundary
+      data={data}
+      error={error}
+      org={org}
+      dataset={dataset}
+    />
+  );
+
+  if (curationEligibility?.routeDatasetKey === routeDatasetKey) {
+    return (
+      <CurationProvider
+        datasetAlias="local/pnp_trash"
+        actor="visualizer-curator"
+        reviewer="visualizer-curator"
+        episodeIndices={curationEligibility.episodeIndices}
+        initialEpisodeIndex={episodeId}
+      >
+        <CurationRouteSync
+          currentRouteEpisode={episodeId}
+          onEpisodeNavigate={navigateToCurationEpisode}
+        />
+        {content}
+      </CurationProvider>
+    );
+  }
+
+  return content;
+}
+
+function EpisodeViewerLoadBoundary({
+  data,
+  error,
+  org,
+  dataset,
+}: {
+  data: EpisodeData | null;
+  error: string | null;
+  org: string;
+  dataset: string;
+}) {
   if (error) {
     return (
       <div className="flex h-screen items-center justify-center bg-[var(--bg)] text-red-300">
@@ -257,7 +335,14 @@ function EpisodeViewerInner({
 
   const router = useRouter();
   const searchParams = useSearchParams();
-
+  const taskIndexDataset = isTaskIndexCurationDataset(
+    datasetInfo.repoId,
+    datasetInfo.codebase_version,
+  );
+  const [annotationMode, setAnnotationMode] = useState<"atoms" | "task_index">(
+    taskIndexDataset ? "task_index" : "atoms",
+  );
+  const activeAnnotationMode = taskIndexDataset ? annotationMode : "atoms";
   // Tab state & lazy stats — read sessionStorage in the initializer so the
   // correct tab renders on the very first frame (no post-mount flash).
   // Safe because EpisodeViewerInner only mounts client-side (behind a loading gate).
@@ -749,26 +834,67 @@ function EpisodeViewerInner({
                   onVideosReady={() => setVideosReady(true)}
                 />
               )}
-              <div className="grounding-intro">
-                <span className="section-kicker">Grounded VQA</span>
-                <ul>
-                  <li>
-                    Draw directly on the active video to create visual
-                    questions. Drag for a bounding box, click for a point. The
-                    camera is detected from the video you draw on.
-                  </li>
-                  <li>
-                    Drag on any video to add a bbox question. Click any video to
-                    add a keypoint question. Confirm the popup with <kbd>↵</kbd>
-                    , or cancel with <kbd>Esc</kbd>.
-                  </li>
-                </ul>
-              </div>
-              <PlaybackBar />
-              <AnnotationsTimeline duration={data.duration} />
-              <AnnotationsPanel
-                cameraKeys={videosInfo.map((v) => v.filename)}
-              />
+              {taskIndexDataset && (
+                <div
+                  className="flex w-fit rounded border border-slate-700 bg-slate-950/60 p-1"
+                  role="group"
+                  aria-label="Annotation mode"
+                >
+                  <button
+                    type="button"
+                    aria-pressed={activeAnnotationMode === "task_index"}
+                    className={`rounded px-3 py-1.5 text-xs ${
+                      activeAnnotationMode === "task_index"
+                        ? "bg-cyan-950 text-cyan-200"
+                        : "text-slate-400"
+                    }`}
+                    onClick={() => setAnnotationMode("task_index")}
+                  >
+                    task_index
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={activeAnnotationMode === "atoms"}
+                    className={`rounded px-3 py-1.5 text-xs ${
+                      activeAnnotationMode === "atoms"
+                        ? "bg-cyan-950 text-cyan-200"
+                        : "text-slate-400"
+                    }`}
+                    onClick={() => setAnnotationMode("atoms")}
+                  >
+                    v3.1 atoms
+                  </button>
+                </div>
+              )}
+              {activeAnnotationMode === "task_index" ? (
+                <>
+                  <PlaybackBar />
+                  <TaskIndexCurationWorkspace currentRouteEpisode={episodeId} />
+                </>
+              ) : (
+                <>
+                  <div className="grounding-intro">
+                    <span className="section-kicker">Grounded VQA</span>
+                    <ul>
+                      <li>
+                        Draw directly on the active video to create visual
+                        questions. Drag for a bounding box, click for a point.
+                        The camera is detected from the video you draw on.
+                      </li>
+                      <li>
+                        Drag on any video to add a bbox question. Click any
+                        video to add a keypoint question. Confirm the popup with{" "}
+                        <kbd>↵</kbd>, or cancel with <kbd>Esc</kbd>.
+                      </li>
+                    </ul>
+                  </div>
+                  <PlaybackBar />
+                  <AnnotationsTimeline duration={data.duration} />
+                  <AnnotationsPanel
+                    cameraKeys={videosInfo.map((v) => v.filename)}
+                  />
+                </>
+              )}
             </div>
           )}
 

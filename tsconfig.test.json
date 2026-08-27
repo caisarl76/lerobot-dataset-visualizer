@@ -8,6 +8,8 @@
   },
   "files": [
     "src/app/api/curation/[...path]/__tests__/route.test.ts",
+    "src/components/__tests__/task-index-curation-timeline.test.tsx",
+    "src/components/__tests__/task-index-curation-workspace.test.tsx",
     "src/context/__tests__/curation-context.test.tsx",
     "src/utils/__tests__/curationClient.test.ts",
     "src/utils/__tests__/curationTimeline.test.ts"

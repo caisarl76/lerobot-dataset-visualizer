@@ -526,6 +526,10 @@ describe("CurationProvider", () => {
       expect(observed.current?.episode?.sourceEpisodeIndex).toBe(0),
     );
     act(() => {
+      observed.current?.updateReviewIntent({
+        choice: "reject",
+        rejectionReason: "must not cross datasets",
+      });
       void observed.current?.refreshAudit();
       void observed.current?.startBatch();
       observed.current?.selectEpisode(1);
@@ -542,6 +546,7 @@ describe("CurationProvider", () => {
     expect(observed.current?.episode).toBeNull();
     expect(observed.current?.audit).toBeNull();
     expect(observed.current?.batch).toBeNull();
+    expect(observed.current?.reviewIntents).toEqual({});
     await waitFor(() =>
       expect(observed.current?.episode?.datasetAlias).toBe(nextAlias),
     );
@@ -633,6 +638,12 @@ describe("CurationProvider", () => {
     await waitFor(() =>
       expect(observed.current?.episode?.sourceEpisodeIndex).toBe(0),
     );
+    act(() =>
+      observed.current?.updateReviewIntent({
+        choice: "reject",
+        rejectionReason: "local episode zero reason",
+      }),
+    );
     await act(async () => {
       await Promise.all([
         observed.current?.refreshAudit(),
@@ -654,6 +665,10 @@ describe("CurationProvider", () => {
     expect(observed.current?.summary).toBe(preservedSummary);
     expect(observed.current?.audit).toBe(preservedAudit);
     expect(observed.current?.batch?.jobId).toBe("job-route");
+    expect(observed.current?.reviewIntent).toEqual({
+      choice: "keep",
+      rejectionReason: "",
+    });
     const pollsAfterRouteChange = pollCount;
     await waitFor(() =>
       expect(pollCount).toBeGreaterThan(pollsAfterRouteChange),
@@ -710,6 +725,10 @@ describe("CurationProvider", () => {
     );
 
     act(() => {
+      view.result.current.updateReviewIntent({
+        choice: "reject",
+        rejectionReason: "object missed bin",
+      });
       view.result.current.updateDraft({
         objectName: "crumpled can",
         pickupHand: "left",
@@ -732,6 +751,17 @@ describe("CurationProvider", () => {
     expect(view.result.current.episode?.revision).toBe(1);
     expect(view.result.current.episode?.promptPreview).toEqual(
       saved.prompt_preview,
+    );
+    expect(view.result.current.reviewIntent).toEqual({
+      choice: "reject",
+      rejectionReason: "object missed bin",
+    });
+    expect(view.result.current.reviewIntents[0]).toMatchObject({
+      dirty: true,
+      authoritativeLocked: false,
+    });
+    expect(view.result.current.savedObjectSuggestions).toContain(
+      "crumpled can",
     );
   });
 
@@ -781,13 +811,28 @@ describe("CurationProvider", () => {
 
     const view = renderHook(() => useCuration(), { wrapper: wrapper() });
     await waitFor(() => expect(view.result.current.episode?.revision).toBe(1));
-    act(() => view.result.current.updateDraft({ objectName: "box" }));
+    act(() => {
+      view.result.current.updateReviewIntent({
+        choice: "reject",
+        rejectionReason: "local conflict reason",
+      });
+      view.result.current.updateDraft({ objectName: "box" });
+    });
     await act(async () => view.result.current.saveDraft());
 
     await waitFor(() => expect(view.result.current.episode?.revision).toBe(2));
     expect(episodeGets).toBe(2);
     expect(view.result.current.conflict?.kind).toBe("revision_conflict");
     expect(view.result.current.conflict?.message).toContain("reconcile");
+    expect(view.result.current.reviewIntent).toEqual({
+      choice: "keep",
+      rejectionReason: "",
+    });
+    expect(view.result.current.reviewIntents[0]).toMatchObject({
+      dirty: false,
+      authoritativeLocked: false,
+    });
+    expect(view.result.current.savedObjectSuggestions).toContain("bottle");
   });
 
   test("does not mislabel non-revision 409 responses as optimistic conflicts", async () => {
@@ -853,6 +898,12 @@ describe("CurationProvider", () => {
         "proposal-1",
       ),
     );
+    act(() =>
+      view.result.current.updateReviewIntent({
+        choice: "reject",
+        rejectionReason: "proposal remains rejectable",
+      }),
+    );
     await act(async () => view.result.current.applyProposal());
 
     expect(view.result.current.error).toBeNull();
@@ -866,6 +917,14 @@ describe("CurationProvider", () => {
       6,
     ]);
     expect(view.result.current.episode?.approvalLocked).toBe(false);
+    expect(view.result.current.reviewIntent).toEqual({
+      choice: "reject",
+      rejectionReason: "proposal remains rejectable",
+    });
+    expect(view.result.current.reviewIntents[0]).toMatchObject({
+      dirty: true,
+      authoritativeLocked: false,
+    });
   });
 
   test("loads an incomplete proposal with zero and duplicate snapped transitions", async () => {
@@ -899,10 +958,11 @@ describe("CurationProvider", () => {
 
   test("locks approved records until reopen succeeds", async () => {
     const approved = wireEpisode(0, {
-      state: "approved_keep",
+      state: "approved_reject",
       revision: 2,
       objectName: "can",
       transitions: [1, 2, 3, 4, 5, 6],
+      rejectionReason: "server rejection",
     });
     const reopened = wireEpisode(0, {
       state: "draft",
@@ -928,6 +988,10 @@ describe("CurationProvider", () => {
     await waitFor(() =>
       expect(view.result.current.episode?.approvalLocked).toBe(true),
     );
+    expect(view.result.current.reviewIntent).toEqual({
+      choice: "reject",
+      rejectionReason: "server rejection",
+    });
     act(() =>
       view.result.current.updateDraft({ objectName: "silently ignored" }),
     );
@@ -940,6 +1004,70 @@ describe("CurationProvider", () => {
     expect(view.result.current.episode?.approvalLocked).toBe(false);
     expect(view.result.current.episode?.revision).toBe(3);
     expect(mutationCount).toBe(1);
+    expect(view.result.current.reviewIntent).toEqual({
+      choice: "keep",
+      rejectionReason: "",
+    });
+    expect(view.result.current.reviewIntents[0]).toMatchObject({
+      dirty: false,
+      authoritativeLocked: false,
+    });
+  });
+
+  test("refreshes grip on an approved record without reopening or invalidating it", async () => {
+    const approved = wireEpisode(0, {
+      state: "approved_keep",
+      revision: 2,
+      objectName: "can",
+      transitions: [1, 2, 3, 4, 5, 6],
+    });
+    let gripGets = 0;
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const request = new Request(input, init);
+        const path = new URL(request.url).pathname;
+        const bootstrap = bootstrapResponse(request);
+        if (bootstrap) return bootstrap;
+        if (request.method === "GET" && path.endsWith("/episodes/0/grip")) {
+          gripGets += 1;
+          return json({
+            dataset_alias: DATASET_ALIAS,
+            source_episode_index: 0,
+            status: "available",
+            side: "left",
+            reason: null,
+            usable_joint_indices: [0, 1, 2],
+            grasp: { frame: 2, timestamp_s: 0.2, derivative: -0.4 },
+            release: { frame: 5, timestamp_s: 0.5, derivative: 0.5 },
+            advisories: [],
+            grasp_delta_s: 0,
+            release_delta_s: 0.1,
+          });
+        }
+        if (request.method === "GET" && path.endsWith("/episodes/0"))
+          return json(approved);
+        throw new Error(`unexpected request ${request.method} ${request.url}`);
+      },
+    ) as typeof fetch;
+
+    const view = renderHook(() => useCuration(), { wrapper: wrapper() });
+    await waitFor(() =>
+      expect(view.result.current.episode?.approvalLocked).toBe(true),
+    );
+    const approvalRevision = view.result.current.episode?.approvalRevision;
+
+    await act(async () => view.result.current.refreshGrip());
+
+    expect(gripGets).toBe(1);
+    expect(view.result.current.grip?.status).toBe("available");
+    expect(view.result.current.episode?.decision.reviewState).toBe(
+      "approved_keep",
+    );
+    expect(view.result.current.episode?.approvalLocked).toBe(true);
+    expect(view.result.current.episode?.approvalRevision).toBe(
+      approvalRevision,
+    );
+    expect(view.result.current.episode?.revision).toBe(2);
   });
 
   test("polls an active batch and stops once it reaches a terminal state", async () => {
@@ -991,6 +1119,136 @@ describe("CurationProvider", () => {
 
     expect(terminalPollCount).toBe(2);
     expect(pollCount).toBe(terminalPollCount);
+  });
+
+  test("recovers a persisted active batch from start conflict and resumes polling", async () => {
+    let statusGets = 0;
+    let starts = 0;
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const request = new Request(input, init);
+        const path = new URL(request.url).pathname;
+        const bootstrap = bootstrapResponse(request);
+        if (bootstrap) return bootstrap;
+        if (request.method === "GET" && path.endsWith("/episodes/0"))
+          return json(wireEpisode(0));
+        if (request.method === "POST" && path.endsWith("/batches")) {
+          starts += 1;
+          return json(
+            { error: "active_batch_exists", job_id: "job-existing" },
+            409,
+          );
+        }
+        if (
+          request.method === "GET" &&
+          path.endsWith("/batches/job-existing")
+        ) {
+          statusGets += 1;
+          return json(
+            wireBatch(
+              "job-existing",
+              statusGets === 1 ? "running" : "completed",
+            ),
+          );
+        }
+        throw new Error(`unexpected request ${request.method} ${request.url}`);
+      },
+    ) as typeof fetch;
+
+    const view = renderHook(() => useCuration(), {
+      wrapper: wrapper({ pollIntervalMs: 5 }),
+    });
+    await waitFor(() => expect(view.result.current.episode).not.toBeNull());
+
+    await act(async () => view.result.current.startBatch());
+    await waitFor(() =>
+      expect(view.result.current.batch?.state).toBe("completed"),
+    );
+
+    expect(starts).toBe(1);
+    expect(statusGets).toBe(2);
+    expect(view.result.current.batch?.jobId).toBe("job-existing");
+    expect(view.result.current.error).toBeNull();
+  });
+
+  test("rejects active-batch recovery when status belongs to another dataset", async () => {
+    let statusGets = 0;
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const request = new Request(input, init);
+        const path = new URL(request.url).pathname;
+        const bootstrap = bootstrapResponse(request);
+        if (bootstrap) return bootstrap;
+        if (request.method === "GET" && path.endsWith("/episodes/0"))
+          return json(wireEpisode(0));
+        if (request.method === "POST" && path.endsWith("/batches"))
+          return json(
+            { error: "active_batch_exists", job_id: "job-other" },
+            409,
+          );
+        if (request.method === "GET" && path.endsWith("/batches/job-other")) {
+          statusGets += 1;
+          return json({
+            ...wireBatch("job-other", "running"),
+            configuration: {
+              ...batchConfiguration(),
+              dataset_alias: "local/other",
+            },
+          });
+        }
+        throw new Error(`unexpected request ${request.method} ${request.url}`);
+      },
+    ) as typeof fetch;
+
+    const view = renderHook(() => useCuration(), { wrapper: wrapper() });
+    await waitFor(() => expect(view.result.current.episode).not.toBeNull());
+
+    await act(async () => view.result.current.startBatch());
+
+    expect(statusGets).toBe(1);
+    expect(view.result.current.batch).toBeNull();
+    expect(view.result.current.error).toBe(
+      "Curation service returned an invalid response",
+    );
+  });
+
+  test("keeps the parent batch when a retry response crosses dataset identity", async () => {
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const request = new Request(input, init);
+        const path = new URL(request.url).pathname;
+        const bootstrap = bootstrapResponse(request);
+        if (bootstrap) return bootstrap;
+        if (request.method === "GET" && path.endsWith("/episodes/0"))
+          return json(wireEpisode(0));
+        if (request.method === "POST" && path.endsWith("/batches"))
+          return json(wireBatch("job-parent", "cancelled"), 201);
+        if (request.method === "POST" && path.endsWith("/retry")) {
+          return json({
+            ...wireBatch("job-child", "queued", "job-parent"),
+            configuration: {
+              ...batchConfiguration("job-parent"),
+              dataset_alias: "local/other",
+            },
+          });
+        }
+        throw new Error(`unexpected request ${request.method} ${request.url}`);
+      },
+    ) as typeof fetch;
+
+    const view = renderHook(() => useCuration(), { wrapper: wrapper() });
+    await waitFor(() => expect(view.result.current.episode).not.toBeNull());
+    await act(async () => view.result.current.startBatch());
+    expect(view.result.current.batch?.jobId).toBe("job-parent");
+
+    await act(async () =>
+      view.result.current.retryBatch({ failureStates: ["cancelled"] }),
+    );
+
+    expect(view.result.current.batch?.jobId).toBe("job-parent");
+    expect(view.result.current.error).toBe(
+      "Curation service returned an invalid response",
+    );
   });
 
   test("loads typed grip/audit state and supports batch cancel and retry controls", async () => {
@@ -1213,12 +1471,23 @@ describe("CurationProvider", () => {
     await waitFor(() =>
       expect(view.result.current.episode?.decision.reviewState).toBe("draft"),
     );
+    act(() =>
+      view.result.current.updateReviewIntent({
+        rejectionReason: "must reset after approval",
+      }),
+    );
     await act(async () => view.result.current.approveKeepAndNext());
     await waitFor(() =>
       expect(view.result.current.episode?.sourceEpisodeIndex).toBe(1),
     );
 
     expect(view.result.current.selectedEpisodeIndex).toBe(1);
+    expect(view.result.current.reviewIntents[0]).toMatchObject({
+      choice: "keep",
+      rejectionReason: "",
+      dirty: false,
+      authoritativeLocked: true,
+    });
   });
 
   test("accepts an empty backend-valid rejection reason and advances", async () => {

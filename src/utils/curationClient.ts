@@ -23,8 +23,11 @@ import type {
 
 export type CurationClientErrorCode = "http_error" | "invalid_response";
 export type CurationErrorPayload = Record<string, unknown>;
+const SAFE_JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 export class CurationClientError extends Error {
+  readonly activeBatchJobId: string | null;
+
   constructor(
     readonly code: CurationClientErrorCode,
     readonly status: number,
@@ -36,6 +39,13 @@ export class CurationClientError extends Error {
         : `curation request failed with status ${status}`,
     );
     this.name = "CurationClientError";
+    const recoveryJobId = errorPayload?.job_id;
+    this.activeBatchJobId =
+      errorPayload?.error === "active_batch_exists" &&
+      typeof recoveryJobId === "string" &&
+      SAFE_JOB_ID.test(recoveryJobId)
+        ? recoveryJobId
+        : null;
   }
 }
 
@@ -82,6 +92,20 @@ function nullableString(value: unknown): string | null {
 
 function nullableStringAllowEmpty(value: unknown): string | null {
   return value === null ? null : string(value, true);
+}
+
+function safeJobId(value: unknown): string {
+  const result = string(value);
+  if (!SAFE_JOB_ID.test(result)) return invalid();
+  return result;
+}
+
+function requestJobId(value: string): string {
+  try {
+    return safeJobId(value);
+  } catch {
+    throw new CurationClientError("invalid_response", 400);
+  }
 }
 
 function boolean(value: unknown): boolean {
@@ -413,7 +437,7 @@ function episode(value: unknown): EpisodeCuration {
     locked !== approved ||
     (approved &&
       (reviewer === null ||
-        approvalRevision !== revision ||
+        approvalRevision === null ||
         approvedAt === null)) ||
     (!approved &&
       (reviewer !== null || approvalRevision !== null || approvedAt !== null))
@@ -597,7 +621,7 @@ function configuration(value: unknown): BatchConfiguration {
   )
     return invalid();
   const parent = hasOwn(record, "parent_job_id")
-    ? string(record.parent_job_id)
+    ? safeJobId(record.parent_job_id)
     : undefined;
   return {
     schema_version: 1,
@@ -650,15 +674,25 @@ function batch(value: unknown): BatchStatus {
     "active_proposal_coverage",
   ]);
   const counts = exactCountRecord(record.counts, ATTEMPT_STATES, false);
+  const jobId = safeJobId(record.job_id);
+  const parentJobId =
+    record.parent_job_id === null ? null : safeJobId(record.parent_job_id);
+  const decodedConfiguration = configuration(record.configuration);
+  if (
+    (parentJobId === null) !==
+      (decodedConfiguration.parent_job_id === undefined) ||
+    (parentJobId !== null && decodedConfiguration.parent_job_id !== parentJobId)
+  )
+    return invalid();
   const leaseRecord =
     record.lease === null
       ? null
       : object(record.lease, ["owner", "expires_at"]);
   return {
-    jobId: string(record.job_id),
-    parentJobId: nullableString(record.parent_job_id),
+    jobId,
+    parentJobId,
     state: batchState(record.state),
-    configuration: configuration(record.configuration),
+    configuration: decodedConfiguration,
     counts,
     episodes: array(record.episodes, (item) => {
       const attempt = object(item, [
@@ -994,11 +1028,19 @@ function sanitizedJson(value: unknown, depth = 0): unknown {
 
 function errorPayload(value: unknown): CurationErrorPayload {
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    const errorEntry = Object.entries(value).find(([key]) => key === "error");
+    const entries = Object.entries(value);
+    const errorEntry = entries.find(([key]) => key === "error");
     if (errorEntry?.[1] === "revision_conflict") {
       // The current episode can be large. It is reloaded independently below
       // the context layer, so retain only this bounded discriminator.
       return { error: "revision_conflict" };
+    }
+    if (errorEntry?.[1] === "active_batch_exists") {
+      const jobId = entries.find(([key]) => key === "job_id")?.[1];
+      return {
+        error: "active_batch_exists",
+        job_id: safeJobId(jobId),
+      };
     }
   }
   const sanitized = sanitizedJson(value);
@@ -1325,18 +1367,26 @@ export function startCurationBatch(
   );
 }
 
-export function fetchCurationBatch(
+export async function fetchCurationBatch(
   jobId: string,
   signal?: AbortSignal,
+  expectedDatasetAlias?: string,
 ): Promise<BatchStatus> {
+  const checkedJobId = requestJobId(jobId);
   return requestJson(
-    `/api/curation/batches/${jobId}`,
-    matching(batch, (decoded) => decoded.jobId === jobId),
+    `/api/curation/batches/${checkedJobId}`,
+    matching(
+      batch,
+      (decoded) =>
+        decoded.jobId === checkedJobId &&
+        (expectedDatasetAlias === undefined ||
+          decoded.configuration.dataset_alias === expectedDatasetAlias),
+    ),
     { signal },
   );
 }
 
-export function retryCurationBatch(
+export async function retryCurationBatch(
   jobId: string,
   selection: {
     episodeIndices?: number[];
@@ -1344,15 +1394,18 @@ export function retryCurationBatch(
       Extract<AttemptState, "manual_only" | "retryable" | "cancelled">
     >;
   },
+  expectedDatasetAlias: string,
   signal?: AbortSignal,
 ): Promise<BatchStatus> {
+  const checkedJobId = requestJobId(jobId);
   return requestJson(
-    `/api/curation/batches/${jobId}/retry`,
+    `/api/curation/batches/${checkedJobId}/retry`,
     matching(
       batch,
       (decoded) =>
-        decoded.parentJobId === jobId &&
-        decoded.configuration.parent_job_id === jobId,
+        decoded.parentJobId === checkedJobId &&
+        decoded.configuration.parent_job_id === checkedJobId &&
+        decoded.configuration.dataset_alias === expectedDatasetAlias,
     ),
     {
       method: "POST",
@@ -1369,7 +1422,7 @@ export function retryCurationBatch(
   );
 }
 
-export function cancelCurationBatch(
+export async function cancelCurationBatch(
   jobId: string,
   signal?: AbortSignal,
 ): Promise<{
@@ -1377,20 +1430,21 @@ export function cancelCurationBatch(
   state: "cancel_requested" | "cancelled";
   changed: boolean;
 }> {
+  const checkedJobId = requestJobId(jobId);
   return requestJson(
-    `/api/curation/batches/${jobId}/cancel`,
+    `/api/curation/batches/${checkedJobId}/cancel`,
     matching(
       (value) => {
         const record = object(value, ["job_id", "state", "changed"]);
         if (record.state !== "cancel_requested" && record.state !== "cancelled")
           return invalid();
         return {
-          job_id: string(record.job_id),
+          job_id: safeJobId(record.job_id),
           state: record.state,
           changed: boolean(record.changed),
         };
       },
-      (decoded) => decoded.job_id === jobId,
+      (decoded) => decoded.job_id === checkedJobId,
     ),
     { method: "POST", signal },
   );

@@ -109,6 +109,31 @@ function pendingEpisode(datasetAlias: string, sourceEpisodeIndex: number) {
   };
 }
 
+function staleApprovedEpisode(
+  datasetAlias: string,
+  sourceEpisodeIndex: number,
+) {
+  return {
+    ...pendingEpisode(datasetAlias, sourceEpisodeIndex),
+    decision: {
+      review_state: "approved_keep",
+      object_name: "can",
+      pickup_hand: "left",
+      turn_direction: "right",
+      transition_frames: [1, 2, 3, 4, 5, 6],
+      rejection_reason: null,
+      prompt_template_sha256: SHA,
+    },
+    prompt_preview: ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+    warnings: ["approval_revision_mismatch"],
+    revision: 3,
+    approval_locked: true,
+    reviewer: "reviewer",
+    approval_revision: 2,
+    approved_at: "2026-08-27T00:00:00Z",
+  };
+}
+
 function emptyAudit(datasetAlias: string) {
   return {
     dataset_alias: datasetAlias,
@@ -163,7 +188,12 @@ describe("curation client runtime contracts", () => {
       ["batch status", () => fetchCurationBatch("job-1")],
       [
         "batch retry",
-        () => retryCurationBatch("job-1", { failureStates: ["manual_only"] }),
+        () =>
+          retryCurationBatch(
+            "job-1",
+            { failureStates: ["manual_only"] },
+            "local/pnp_trash",
+          ),
       ],
       ["batch cancel", () => cancelCurationBatch("job-1")],
       ["grip", () => fetchGripDiagnostic("local/pnp_trash", 0)],
@@ -231,6 +261,120 @@ describe("curation client runtime contracts", () => {
       code: "invalid_response",
       status: 422,
     });
+  });
+
+  test("retains only a safe active-batch recovery id from a 409", async () => {
+    globalThis.fetch = mock(async () =>
+      Response.json(
+        {
+          error: "active_batch_exists",
+          job_id: "job-existing",
+          secret: "must-not-be-retained",
+        },
+        { status: 409 },
+      ),
+    ) as typeof fetch;
+
+    let caught: unknown;
+    try {
+      await startCurationBatch("local/pnp_trash");
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(CurationClientError);
+    expect(caught).toMatchObject({
+      code: "http_error",
+      status: 409,
+      activeBatchJobId: "job-existing",
+      errorPayload: {
+        error: "active_batch_exists",
+        job_id: "job-existing",
+      },
+    });
+    expect(JSON.stringify(caught)).not.toContain("must-not-be-retained");
+
+    globalThis.fetch = mock(async () =>
+      Response.json(
+        { error: "active_batch_exists", job_id: "../escape" },
+        { status: 409 },
+      ),
+    ) as typeof fetch;
+    await expect(startCurationBatch("local/pnp_trash")).rejects.toMatchObject({
+      code: "invalid_response",
+      status: 409,
+      activeBatchJobId: null,
+    });
+  });
+
+  test("accepts a locked approval whose approval revision is stale", async () => {
+    globalThis.fetch = mock(async () =>
+      Response.json(staleApprovedEpisode("local/pnp_trash", 0)),
+    ) as typeof fetch;
+
+    const decoded = await fetchEpisodeCuration("local/pnp_trash", 0);
+
+    expect(decoded.approvalLocked).toBe(true);
+    expect(decoded.revision).toBe(3);
+    expect(decoded.approvalRevision).toBe(2);
+    expect(decoded.warnings).toContain("approval_revision_mismatch");
+  });
+
+  test("rejects unsafe job identifiers across batch and cancellation contracts", async () => {
+    globalThis.fetch = mock(async () =>
+      Response.json({ ...realBatchWithAttemptZero(), job_id: "../job" }),
+    ) as typeof fetch;
+    await expect(startCurationBatch("local/pnp_trash")).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        ...realBatchWithAttemptZero(),
+        job_id: "job-child",
+        parent_job_id: "../parent",
+        configuration: {
+          ...realBatchWithAttemptZero().configuration,
+          parent_job_id: "../parent",
+        },
+      }),
+    ) as typeof fetch;
+    await expect(fetchCurationBatch("job-child")).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+
+    globalThis.fetch = mock(async () =>
+      Response.json({
+        ...realBatchWithAttemptZero(),
+        job_id: "../child",
+        parent_job_id: "job-parent",
+        configuration: {
+          ...realBatchWithAttemptZero().configuration,
+          parent_job_id: "job-parent",
+        },
+      }),
+    ) as typeof fetch;
+    await expect(
+      retryCurationBatch(
+        "job-parent",
+        { episodeIndices: [0] },
+        "local/pnp_trash",
+      ),
+    ).rejects.toMatchObject({ code: "invalid_response" });
+
+    let cancellationFetches = 0;
+    globalThis.fetch = mock(async () => {
+      cancellationFetches += 1;
+      return Response.json({
+        job_id: "../escape",
+        state: "cancelled",
+        changed: true,
+      });
+    }) as typeof fetch;
+    await expect(cancelCurationBatch("../escape")).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+    expect(cancellationFetches).toBe(0);
   });
 
   test("decodes a real nonempty batch whose first attempt number is zero", async () => {
@@ -352,7 +496,12 @@ describe("curation client runtime contracts", () => {
       job_id: "job-other",
     });
     await expectInvalid(
-      () => retryCurationBatch("job-parent", { episodeIndices: [0] }),
+      () =>
+        retryCurationBatch(
+          "job-parent",
+          { episodeIndices: [0] },
+          "local/pnp_trash",
+        ),
       {
         ...batch,
         job_id: "job-child",

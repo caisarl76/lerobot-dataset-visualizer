@@ -135,6 +135,41 @@ describe("getDatasetVersionAndInfo", () => {
     }
   });
 
+  test("uses the public browser dataset URL for local assets", async () => {
+    const requests: string[] = [];
+    const info = {
+      codebase_version: "v2.1",
+      features: { action: { dtype: "float32", shape: [1], names: null } },
+    };
+    globalThis.fetch = ((url: string) => {
+      requests.push(url);
+      return Promise.resolve(
+        new Response(JSON.stringify(info), { status: 200 }),
+      );
+    }) as typeof fetch;
+
+    const originalPublicDatasetUrl = process.env.NEXT_PUBLIC_DATASET_URL;
+    const originalDatasetUrl = process.env.DATASET_URL;
+    try {
+      process.env.NEXT_PUBLIC_DATASET_URL =
+        "http://127.0.0.1:8001/api/local-datasets";
+      process.env.DATASET_URL = "https://example.invalid/datasets";
+      const localVersionUtils = await import("../versionUtils?public-local");
+      await localVersionUtils.getDatasetInfo("local/pnp_trash");
+
+      expect(requests).toEqual([
+        "http://127.0.0.1:8001/api/local-datasets/local/pnp_trash/resolve/main/meta/info.json",
+      ]);
+    } finally {
+      if (originalPublicDatasetUrl === undefined) {
+        delete process.env.NEXT_PUBLIC_DATASET_URL;
+      } else {
+        process.env.NEXT_PUBLIC_DATASET_URL = originalPublicDatasetUrl;
+      }
+      restoreDatasetUrl(originalDatasetUrl);
+    }
+  });
+
   test("keeps a video URL built from a local dataset base out of the Hugging Face proxy", async () => {
     installSentinelToken();
     const originalDatasetUrl = process.env.DATASET_URL;

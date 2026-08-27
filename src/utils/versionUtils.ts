@@ -5,7 +5,9 @@
 import { authHeaders } from "./auth";
 
 const DATASET_URL =
-  process.env.DATASET_URL || "https://huggingface.co/datasets";
+  process.env.NEXT_PUBLIC_DATASET_URL ||
+  process.env.DATASET_URL ||
+  "https://huggingface.co/datasets";
 
 /**
  * Dataset information structure from info.json
