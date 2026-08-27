@@ -1435,18 +1435,40 @@ class AtomicArtifactStore:
     _TEMP_PREFIX = ".curation-artifact-v1-"
     _TEMP_PATTERN = re.compile(r"\.curation-artifact-v1-[0-9a-f]{32}\.tmp\Z")
 
-    def __init__(self, workspace: Path, *, event_hook: EventHook | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        event_hook: EventHook | None = None,
+        cleanup_on_start: bool = True,
+    ) -> None:
         self.workspace = Path(workspace)
         self._event_hook = event_hook
-        self._ensure_workspace()
+        if type(cleanup_on_start) is not bool:
+            raise TypeError("cleanup_on_start must be a boolean")
+        self._read_only = not cleanup_on_start
+        if cleanup_on_start:
+            self._ensure_workspace()
+        else:
+            self._require_existing_workspace()
         root_fd = self._open_workspace_path()
         try:
             root_stat = os.fstat(root_fd)
             self._workspace_identity = (root_stat.st_dev, root_stat.st_ino)
         finally:
             os.close(root_fd)
-        with self._locked() as root_fd:
-            self.startup_cleanup_report = self._cleanup_locked(root_fd, referenced=frozenset())
+        self.startup_cleanup_report: list[dict[str, Any]] = []
+        if cleanup_on_start:
+            with self._locked() as root_fd:
+                self.startup_cleanup_report = self._cleanup_locked(root_fd, referenced=frozenset())
+
+    def _require_existing_workspace(self) -> None:
+        try:
+            workspace_stat = os.lstat(self.workspace)
+        except OSError as error:
+            raise ArtifactSecurityError("artifact workspace is unavailable") from error
+        if not stat.S_ISDIR(workspace_stat.st_mode) or stat.S_ISLNK(workspace_stat.st_mode):
+            raise ArtifactSecurityError("artifact workspace must be a real directory")
 
     def _emit(self, event: str, relative_path: str) -> None:
         if self._event_hook is not None:
@@ -1510,6 +1532,12 @@ class AtomicArtifactStore:
     @contextmanager
     def _locked(self):
         root_fd = self._open_root()
+        if self._read_only:
+            try:
+                yield root_fd
+            finally:
+                os.close(root_fd)
+            return
         lock_fd = -1
         try:
             lock_fd = self._open_lock(root_fd)
@@ -1530,6 +1558,8 @@ class AtomicArtifactStore:
         register: Callable[[ArtifactRecord], ReferenceT] | None = None,
         authorization_guard: Callable[[], Any] | None = None,
     ) -> ArtifactWriteResult[ReferenceT]:
+        if self._read_only:
+            raise ArtifactSecurityError("read-only artifact inspector cannot write")
         if not isinstance(contents, bytes):
             raise TypeError("artifact contents must be bytes")
         normalized = _safe_artifact_relative_path(relative_path)
@@ -1607,6 +1637,8 @@ class AtomicArtifactStore:
     ) -> ArtifactWriteResult[ReferenceT]:
         """Durably reconcile complete evidence, then idempotently register it."""
 
+        if self._read_only:
+            raise ArtifactSecurityError("read-only artifact inspector cannot adopt")
         if not callable(register):
             raise TypeError("artifact adoption requires a database register callback")
         normalized = self._validated_existing_target(relative_path)
@@ -1983,6 +2015,8 @@ class AtomicArtifactStore:
     def cleanup_temporary_files(self, *, referenced_relative_paths: Iterable[str] = ()) -> list[dict[str, Any]]:
         """Remove/report interrupted temporary writes, preserving complete evidence."""
 
+        if self._read_only:
+            raise ArtifactSecurityError("read-only artifact inspector cannot clean")
         referenced = {_safe_artifact_relative_path(relative_path) for relative_path in referenced_relative_paths}
         with self._locked() as root_fd:
             return self._cleanup_locked(root_fd, referenced=frozenset(referenced))

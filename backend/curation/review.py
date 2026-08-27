@@ -10,6 +10,9 @@ from typing import Any, Callable
 
 import pyarrow.parquet as pq
 
+from .audit import AuditNotFound, AuditWorkspaceUnavailable, build_audit_report
+from .contact_sheets import ContactSheetCoordinator, ContactSheetUnavailable
+from .cosmos_transport import ArtifactConflict, ArtifactSecurityError
 from .db import (
     CurationDatabase,
     IllegalStateTransition,
@@ -20,6 +23,7 @@ from .db import (
     WorkspacePromptContractConflict,
     WorkspaceSourceConflict,
 )
+from .grip import approved_boundary_deltas, grip_advisories, read_grip_diagnostic
 from .models import ReviewState
 from .prompts import (
     PROMPT_TEMPLATE_SHA256,
@@ -229,6 +233,7 @@ class ReviewService:
         prompt_template_version: str = PROMPT_TEMPLATE_VERSION,
         prompt_template_sha256: str = PROMPT_TEMPLATE_SHA256,
         prompt_expander: Callable[..., list[str]] = expand_prompts,
+        contact_sheet_coordinator_factory: Callable[..., Any] = ContactSheetCoordinator,
     ) -> None:
         self.database = database
         self.source_registry = source_registry
@@ -236,6 +241,8 @@ class ReviewService:
         self.prompt_template_sha256 = prompt_template_sha256
         self._prompt_expander = prompt_expander
         self._sources: dict[str, _SourceDataset] = {}
+        self._contact_sheet_coordinator_factory = contact_sheet_coordinator_factory
+        self._contact_sheet_coordinators: dict[str, Any] = {}
 
     def open_workspace(self, dataset_alias: str, *, actor: str) -> dict[str, Any]:
         actor = _identity(actor, "actor")
@@ -256,7 +263,7 @@ class ReviewService:
                 raise _stale_service_conflict(dataset_alias, current_dataset)
         source = self._sources.get(dataset_alias) or _SourceDataset.load(record)
         try:
-            self.database.open_review_workspace(
+            opened = self.database.open_review_workspace(
                 alias=dataset_alias,
                 source_path=str(record.root),
                 source_manifest_sha256=record.fingerprint,
@@ -273,6 +280,7 @@ class ReviewService:
         except WorkspacePromptContractConflict as error:
             raise _stale_service_conflict(dataset_alias, error.current_dataset) from error
         self._sources[dataset_alias] = source
+        self._reconcile_contact_sheets(dataset_alias, dataset_id=opened["dataset"]["id"])
         return {
             "dataset_alias": dataset_alias,
             "source_fingerprint": record.fingerprint,
@@ -350,7 +358,68 @@ class ReviewService:
                 "episode not found",
                 {"error": "episode_not_found", "source_episode_index": source_episode_index},
             )
-        return self._episode_response(dataset_alias, dataset, source, row)
+        contact_warning = self._reconcile_episode_contact_sheets(
+            dataset_alias,
+            dataset_id=dataset["id"],
+            source_episode_index=source_episode_index,
+        )
+        return self._episode_response(
+            dataset_alias,
+            dataset,
+            source,
+            row,
+            additional_warnings=(() if contact_warning is None else (contact_warning,)),
+        )
+
+    def grip_diagnostic(self, dataset_alias: str, source_episode_index: int) -> dict[str, Any]:
+        dataset, source = self._workspace(dataset_alias)
+        row = self._episode_row(dataset["id"], source_episode_index)
+        hand = row["pickup_hand"]
+        if hand not in {"left", "right"}:
+            from .grip import GripDiagnostic
+
+            diagnostic = GripDiagnostic.unavailable(side=None, reason="pickup_hand_unselected")
+        else:
+            diagnostic = read_grip_diagnostic(
+                source.record,
+                source_episode_index=source_episode_index,
+                side=hand,
+            )
+        decision = {
+            "review_state": row["review_state"],
+            "transition_frames": [row[column] for column in _STEP_COLUMNS],
+        }
+        if diagnostic.status != "available":
+            response = diagnostic.as_response(advisories=())
+            response.update({"grasp_delta_s": None, "release_delta_s": None})
+            response["dataset_alias"] = dataset_alias
+            response["source_episode_index"] = source_episode_index
+            return response
+        timestamps = source.timestamps(source_episode_index)
+        advisories = grip_advisories(diagnostic, decision=decision, timestamps=timestamps)
+        response = diagnostic.as_response(advisories=advisories)
+        response.update(approved_boundary_deltas(diagnostic, decision=decision, timestamps=timestamps))
+        response["dataset_alias"] = dataset_alias
+        response["source_episode_index"] = source_episode_index
+        return response
+
+    def audit(self, dataset_alias: str) -> dict[str, Any]:
+        try:
+            return build_audit_report(
+                database=self.database,
+                source_registry=self.source_registry,
+                dataset_alias=dataset_alias,
+            )
+        except AuditNotFound as error:
+            raise ReviewNotFound(
+                str(error),
+                {"error": "dataset_alias_not_found", "dataset_alias": dataset_alias},
+            ) from error
+        except AuditWorkspaceUnavailable as error:
+            raise ReviewConflict(
+                str(error),
+                {"error": "workspace_not_open", "dataset_alias": dataset_alias},
+            ) from error
 
     def save_draft(
         self,
@@ -448,7 +517,7 @@ class ReviewService:
                 "prompt_template_sha256": self.prompt_template_sha256,
             }
         )
-        return self._transition(
+        response = self._transition(
             dataset_alias,
             dataset,
             source,
@@ -459,6 +528,7 @@ class ReviewService:
             changes,
             "proposal_applied",
         )
+        return response
 
     def approve_keep(
         self,
@@ -533,7 +603,7 @@ class ReviewService:
         if issues:
             raise ReviewValidation(*issues)
         new_revision = expected_revision + 1
-        return self._transition(
+        response = self._transition(
             dataset_alias,
             dataset,
             source,
@@ -551,7 +621,17 @@ class ReviewService:
             "keep_approved",
             required_prompt_template_version=self.prompt_template_version,
             required_prompt_template_sha256=self.prompt_template_sha256,
+            snapshot_active_proposal_for_contact_sheet=True,
         )
+        contact_warning = self._ensure_final_contact_sheet(
+            dataset_alias,
+            dataset_id=dataset["id"],
+            source_episode_index=source_episode_index,
+            approval_revision=new_revision,
+        )
+        if contact_warning is not None:
+            response["warnings"] = sorted(set([*response["warnings"], contact_warning]))
+        return response
 
     def approve_reject(
         self,
@@ -721,6 +801,7 @@ class ReviewService:
         *,
         required_prompt_template_version: str | None = None,
         required_prompt_template_sha256: str | None = None,
+        snapshot_active_proposal_for_contact_sheet: bool = False,
     ) -> dict[str, Any]:
         if source_episode_index not in source.lengths:
             raise ReviewNotFound(
@@ -738,6 +819,7 @@ class ReviewService:
                 operation=operation,
                 required_prompt_template_version=required_prompt_template_version,
                 required_prompt_template_sha256=required_prompt_template_sha256,
+                snapshot_active_proposal_for_contact_sheet=snapshot_active_proposal_for_contact_sheet,
             )
         except PromptContractConflict as error:
             raise ReviewConflict(str(error), error.payload) from error
@@ -770,6 +852,7 @@ class ReviewService:
         dataset: dict[str, Any],
         source: _SourceDataset,
         row: dict[str, Any],
+        additional_warnings: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         source_episode_index = row["source_episode_index"]
         proposal_row = self.database.get_active_proposal(
@@ -791,7 +874,9 @@ class ReviewService:
             except Exception:
                 prompts = None
         proposal_warnings = [] if proposal is None else proposal["warnings"]
-        warnings = sorted(set([*proposal_warnings, *_decision_warnings(row, dataset, source)]))
+        warnings = sorted(
+            set([*proposal_warnings, *_decision_warnings(row, dataset, source), *additional_warnings])
+        )
         return {
             "dataset_alias": dataset_alias,
             "source_episode_index": source_episode_index,
@@ -817,6 +902,68 @@ class ReviewService:
             "approved_at": row["approved_at"],
         }
 
+    def _contact_sheet_coordinator(self, dataset_alias: str, *, dataset_id: int) -> Any:
+        coordinator = self._contact_sheet_coordinators.get(dataset_alias)
+        if coordinator is not None:
+            return coordinator
+        record = self.source_registry.records[dataset_alias]
+        coordinator = self._contact_sheet_coordinator_factory(
+            database=self.database,
+            dataset_id=dataset_id,
+            source_record=record,
+            workspace=self.database.path.parent,
+        )
+        self._contact_sheet_coordinators[dataset_alias] = coordinator
+        return coordinator
+
+    def _reconcile_contact_sheets(self, dataset_alias: str, *, dataset_id: int) -> str | None:
+        try:
+            statuses = self._contact_sheet_coordinator(dataset_alias, dataset_id=dataset_id).reconcile_all()
+        except (ArtifactConflict, ArtifactSecurityError):
+            return "contact_sheet_conflict"
+        except (ContactSheetUnavailable, OSError, TypeError, ValueError):
+            return "contact_sheet_pending"
+        return _contact_sheet_status_warning(statuses)
+
+    def _reconcile_episode_contact_sheets(
+        self,
+        dataset_alias: str,
+        *,
+        dataset_id: int,
+        source_episode_index: int,
+    ) -> str | None:
+        try:
+            coordinator = self._contact_sheet_coordinator(dataset_alias, dataset_id=dataset_id)
+            if hasattr(coordinator, "reconcile_episode"):
+                statuses = coordinator.reconcile_episode(source_episode_index)
+            else:
+                coordinator.ensure_episode(source_episode_index)
+                statuses = []
+        except (ArtifactConflict, ArtifactSecurityError):
+            return "contact_sheet_conflict"
+        except (ContactSheetUnavailable, OSError, TypeError, ValueError):
+            return "contact_sheet_pending"
+        return _contact_sheet_status_warning(statuses)
+
+    def _ensure_final_contact_sheet(
+        self,
+        dataset_alias: str,
+        *,
+        dataset_id: int,
+        source_episode_index: int,
+        approval_revision: int,
+    ) -> str | None:
+        try:
+            self._contact_sheet_coordinator(dataset_alias, dataset_id=dataset_id).ensure_final(
+                source_episode_index,
+                approval_revision,
+            )
+        except (ArtifactConflict, ArtifactSecurityError):
+            return "contact_sheet_conflict"
+        except (ContactSheetUnavailable, OSError, TypeError, ValueError):
+            return "contact_sheet_pending"
+        return None
+
 
 def _proposal_response(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
@@ -829,6 +976,15 @@ def _proposal_response(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "warnings": json.loads(row["validation_warnings_json"]),
         "created_at": row["created_at"],
     }
+
+
+def _contact_sheet_status_warning(statuses: list[Any]) -> str | None:
+    values = {getattr(status, "status", None) for status in statuses}
+    if "conflict" in values:
+        return "contact_sheet_conflict"
+    if "pending" in values:
+        return "contact_sheet_pending"
+    return None
 
 
 def _stale_service_conflict(dataset_alias: str, dataset: dict[str, Any]) -> ReviewConflict:

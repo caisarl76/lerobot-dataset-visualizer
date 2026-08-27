@@ -723,6 +723,52 @@ def test_constructor_performs_locked_startup_cleanup_and_preserves_complete_evid
     assert not outside_artifact_tree.exists()
 
 
+def test_read_only_artifact_inspector_performs_zero_filesystem_mutations(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    writer = AtomicArtifactStore(workspace)
+    written = writer.write_bytes("evidence/sheet.png", b"immutable", media_type="image/png")
+    stale = workspace / "evidence" / ".curation-artifact-v1-0123456789abcdef0123456789abcdef.tmp"
+    stale.write_bytes(b"preserve in read-only mode")
+
+    def snapshot() -> dict[str, bytes | None]:
+        return {
+            path.relative_to(workspace).as_posix(): (path.read_bytes() if path.is_file() else None)
+            for path in sorted(workspace.rglob("*"))
+        }
+
+    before = snapshot()
+    inspector = AtomicArtifactStore(workspace, cleanup_on_start=False)
+    observed = inspector.read_existing(
+        "evidence/sheet.png",
+        media_type="image/png",
+        expected_sha256=written.record.sha256,
+        expected_byte_size=written.record.byte_size,
+    )
+
+    assert observed.contents == b"immutable"
+    assert inspector.startup_cleanup_report == []
+    assert snapshot() == before
+    with pytest.raises(ArtifactSecurityError, match="read-only"):
+        inspector.write_bytes("evidence/new.png", b"forbidden", media_type="image/png")
+    with pytest.raises(ArtifactSecurityError, match="read-only"):
+        inspector.cleanup_temporary_files()
+    assert snapshot() == before
+
+
+def test_artifact_store_cleanup_mode_requires_exact_boolean_without_creating_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "must-not-exist"
+
+    with pytest.raises(TypeError, match="boolean"):
+        AtomicArtifactStore(workspace, cleanup_on_start=1)  # type: ignore[arg-type]
+
+    assert not workspace.exists()
+    with pytest.raises(ArtifactSecurityError, match="unavailable"):
+        AtomicArtifactStore(workspace, cleanup_on_start=False)
+    assert not workspace.exists()
+
+
 def test_complete_artifact_cannot_be_named_inside_the_cleanup_namespace(tmp_path: Path) -> None:
     store = AtomicArtifactStore(tmp_path / "workspace")
     reserved = f"artifacts/cosmos/.curation-artifact-v1-{secrets.token_hex(16)}.tmp"

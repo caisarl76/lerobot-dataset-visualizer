@@ -158,6 +158,14 @@ def build_curation_router(
     def get_review_episode(source_episode_index: int, dataset_alias: str) -> JSONResponse:
         return _review_response(lambda: review_service.get_episode(dataset_alias, source_episode_index))
 
+    @curation.get("/api/curation/episodes/{source_episode_index}/grip")
+    def get_grip_diagnostic(source_episode_index: int, dataset_alias: str) -> JSONResponse:
+        return _review_response(lambda: review_service.grip_diagnostic(dataset_alias, source_episode_index))
+
+    @curation.get("/api/curation/audit")
+    def get_curation_audit(dataset_alias: str) -> JSONResponse:
+        return _review_response(lambda: review_service.audit(dataset_alias))
+
     @curation.patch("/api/curation/episodes/{source_episode_index}/draft")
     def save_review_draft(source_episode_index: int, body: DraftBody) -> JSONResponse:
         optional: dict[str, Any] = {}

@@ -29,6 +29,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from .config import CurationConfigurationError, CurationSettings
+from .contact_sheets import ContactSheetCoordinator, ContactSheetUnavailable
 from .cosmos_contract import CosmosContractError, CosmosProposal, build_cosmos_proposal
 from .cosmos_transport import (
     MAX_DURATION_SECONDS,
@@ -116,6 +117,15 @@ class WorkerStateError(RuntimeError):
 
 class InvalidPersistedConfiguration(WorkerStateError):
     """Persisted job configuration or attempt history is not trustworthy JSON."""
+
+
+class ContactSheetReconciliationConflict(RuntimeError):
+    """Immutable contact-sheet evidence conflicts with its lifecycle snapshot."""
+
+
+def _raise_for_contact_sheet_conflicts(statuses: Sequence[Any]) -> None:
+    if any(getattr(status, "status", None) == "conflict" for status in statuses):
+        raise ContactSheetReconciliationConflict
 
 
 @dataclass(frozen=True)
@@ -1483,6 +1493,80 @@ class BatchRepository:
             )
             return self._status_in_transaction(connection, job_id)
 
+    def resolve_contact_sheet_conflict(self, job_id: str, *, owner: str) -> dict[str, Any]:
+        """Atomically give an already-requested cancellation precedence over failure."""
+
+        with self.database._write() as connection:
+            now_dt = self._now()
+            now = _timestamp(now_dt)
+            job = connection.execute("SELECT * FROM cosmos_jobs WHERE id=?", (job_id,)).fetchone()
+            if job is None or job["owner"] != owner or not _lease_is_live(job["lease_expires_at"], now_dt):
+                raise LiveLeaseConflict("cannot resolve a contact-sheet conflict without its live lease")
+            if job["state"] == JobState.CANCEL_REQUESTED.value or bool(job["cancel_requested"]):
+                connection.execute(
+                    """
+                    UPDATE cosmos_attempts SET state='cancelled', lease_owner=NULL,
+                        lease_expires_at=NULL, updated_at=?
+                    WHERE job_id=? AND state IN ('queued', 'retryable', 'leased', 'requesting')
+                    """,
+                    (now, job_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE cosmos_jobs SET state='cancelled', owner=NULL, lease_expires_at=NULL,
+                        cancel_requested=1, updated_at=? WHERE id=?
+                    """,
+                    (now, job_id),
+                )
+                self.database._append_audit_event(
+                    connection,
+                    dataset_id=job["dataset_id"],
+                    actor=owner,
+                    operation="batch_cancelled",
+                    job_id=job_id,
+                    details={"reason": "contact_sheet_conflict_after_cancel_requested"},
+                )
+                return self._status_in_transaction(connection, job_id)
+            if job["state"] != JobState.RUNNING.value:
+                raise LiveLeaseConflict("contact-sheet conflict job is no longer running")
+            active_attempts = connection.execute(
+                """
+                SELECT * FROM cosmos_attempts
+                WHERE job_id=? AND state IN ('leased', 'requesting')
+                """,
+                (job_id,),
+            ).fetchall()
+            if any(
+                attempt["lease_owner"] != owner or not _lease_is_live(attempt["lease_expires_at"], now_dt)
+                for attempt in active_attempts
+            ):
+                raise LiveLeaseConflict("cannot fail a job with an unowned or expired attempt lease")
+            summary = "ContactSheetReconciliationConflict"
+            connection.execute(
+                """
+                UPDATE cosmos_attempts SET state='retryable', lease_owner=NULL,
+                    lease_expires_at=NULL, error_class='WorkerFailure', error_summary=?, updated_at=?
+                WHERE job_id=? AND state IN ('queued', 'leased', 'requesting')
+                """,
+                (summary, now, job_id),
+            )
+            connection.execute(
+                """
+                UPDATE cosmos_jobs SET state='failed', owner=NULL, lease_expires_at=NULL,
+                    updated_at=? WHERE id=?
+                """,
+                (now, job_id),
+            )
+            self.database._append_audit_event(
+                connection,
+                dataset_id=job["dataset_id"],
+                actor=owner,
+                operation="batch_failed",
+                job_id=job_id,
+                details={"summary": summary},
+            )
+            return self._status_in_transaction(connection, job_id)
+
     def finalize_if_done(self, job_id: str, *, owner: str) -> dict[str, Any] | None:
         with self.database._write() as connection:
             now_dt = self._now()
@@ -1720,6 +1804,7 @@ class CosmosAttemptProcessor:
         sleep: Callable[[float], None] = time.sleep,
         event_hook: Callable[[str, str], None] | None = None,
         stop_requested: threading.Event | None = None,
+        contact_sheet_coordinator: Any | None = None,
     ) -> None:
         self.repository = repository
         self.source_record = source_record
@@ -1736,6 +1821,17 @@ class CosmosAttemptProcessor:
         self.sleep = sleep
         self.event_hook = event_hook or (lambda event, attempt_id: None)
         self.stop_requested = stop_requested or threading.Event()
+        if contact_sheet_coordinator is None:
+            contact_dataset = repository.database.get_dataset(alias=source_record.alias)
+            if contact_dataset is None:
+                raise WorkerStateError("contact-sheet dataset authority is unavailable")
+            contact_sheet_coordinator = ContactSheetCoordinator(
+                database=repository.database,
+                dataset_id=contact_dataset["id"],
+                source_record=source_record,
+                workspace=self.workspace,
+            )
+        self.contact_sheet_coordinator = contact_sheet_coordinator
 
     def __call__(self, attempt: dict[str, Any], owner: str) -> None:
         attempt_id = attempt["id"]
@@ -1744,6 +1840,13 @@ class CosmosAttemptProcessor:
         if current is None:
             raise WorkerStateError("attempt not found")
         if current["state"] == AttemptState.SUCCEEDED.value:
+            try:
+                statuses = self.contact_sheet_coordinator.reconcile_all()
+                _raise_for_contact_sheet_conflicts(statuses)
+            except ContactSheetUnavailable:
+                pass
+            except (ArtifactConflict, ArtifactSecurityError) as error:
+                raise ContactSheetReconciliationConflict from error
             return
         if self.stop_requested.is_set():
             return
@@ -1929,6 +2032,12 @@ class CosmosAttemptProcessor:
         committed = self.repository.complete_proposal(attempt_id, owner=owner, proposal=proposal)
         if committed is not None:
             self.event_hook("proposal_commit", attempt_id)
+            try:
+                self.contact_sheet_coordinator.ensure_proposal(committed["id"])
+            except ContactSheetUnavailable:
+                self.event_hook("proposal_contact_sheet_pending", attempt_id)
+            except (ArtifactConflict, ArtifactSecurityError) as error:
+                raise ContactSheetReconciliationConflict from error
 
     def _write_request(self, attempt_id: str, dataset_id: int, document: Mapping[str, Any], *, owner: str) -> None:
         relative = f"artifacts/cosmos/{attempt_id}/request.json"
@@ -2469,6 +2578,35 @@ def _print_status(document: Mapping[str, Any]) -> None:
     print(canonical_json(dict(document)), flush=True)
 
 
+def _fail_job_for_contact_sheet_conflict(
+    repository: BatchRepository,
+    *,
+    job_id: str,
+    owner: str,
+    stop_requested: threading.Event | WorkerStopState,
+) -> int:
+    try:
+        final = repository.resolve_contact_sheet_conflict(job_id, owner=owner)
+    except LiveLeaseConflict:
+        _request_worker_stop(stop_requested, "lease_lost")
+        _print_status({"error": "worker_lease_lost", "job_id": job_id})
+        return 3
+    except RetryableDatabaseError:
+        _print_status({"error": "database_busy", "job_id": job_id, "retryable": True})
+        return 2
+    if final["state"] == JobState.CANCELLED.value:
+        _print_status({"event": "worker_terminal", "job_id": job_id, "state": final["state"]})
+        return 0
+    _print_status(
+        {
+            "error": "contact_sheet_conflict",
+            "job_id": job_id,
+            "state": final["state"],
+        }
+    )
+    return 1
+
+
 def build_attempt_processor(
     *,
     repository: BatchRepository,
@@ -2492,7 +2630,7 @@ def build_attempt_processor(
         raise WorkerStateError("configured Cosmos API key environment variable is unavailable")
     artifact_store = AtomicArtifactStore(workspace)
     artifact_store.cleanup_temporary_files(referenced_relative_paths=repository.list_artifact_paths())
-    return CosmosAttemptProcessor(
+    processor = CosmosAttemptProcessor(
         repository=repository,
         source_record=record,
         workspace=binding.workspace,
@@ -2503,6 +2641,14 @@ def build_attempt_processor(
         artifact_store=artifact_store,
         stop_requested=stop_requested,
     )
+    try:
+        statuses = processor.contact_sheet_coordinator.reconcile_all()
+        _raise_for_contact_sheet_conflicts(statuses)
+    except ContactSheetUnavailable:
+        pass
+    except (ArtifactConflict, ArtifactSecurityError) as error:
+        raise ContactSheetReconciliationConflict from error
+    return processor
 
 
 def cli_main(argv: Sequence[str] | None = None) -> int:
@@ -2595,6 +2741,14 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                     workspace=args.workspace,
                     stop_requested=stop_requested,
                 )
+            except ContactSheetReconciliationConflict:
+                heartbeat_controller.stop()
+                return _fail_job_for_contact_sheet_conflict(
+                    repository,
+                    job_id=args.job_id,
+                    owner=owner,
+                    stop_requested=stop_requested,
+                )
             except RetryableDatabaseError:
                 heartbeat_controller.stop()
                 try:
@@ -2622,6 +2776,13 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
             )
         try:
             final = worker.execute(args.command, args.job_id, acquired_status=acquired)
+        except ContactSheetReconciliationConflict:
+            return _fail_job_for_contact_sheet_conflict(
+                repository,
+                job_id=args.job_id,
+                owner=owner,
+                stop_requested=stop_requested,
+            )
         except LiveLeaseConflict:
             stop_requested.request("lease_lost")
             _print_status({"error": "worker_lease_lost", "job_id": args.job_id})

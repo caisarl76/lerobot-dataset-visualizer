@@ -656,6 +656,8 @@ class CurationDatabase:
         operation: str,
         required_prompt_template_version: str | None = None,
         required_prompt_template_sha256: str | None = None,
+        audit_details: Mapping[str, Any] | None = None,
+        snapshot_active_proposal_for_contact_sheet: bool = False,
     ) -> dict[str, Any]:
         """Apply one revisioned human-review edge in the same write lock."""
         unknown = set(changes).difference(_EPISODE_CHANGE_COLUMNS)
@@ -667,6 +669,8 @@ class CurationDatabase:
             raise ValueError("operation is required")
         if (required_prompt_template_version is None) != (required_prompt_template_sha256 is None):
             raise ValueError("required prompt template version and SHA256 must be provided together")
+        if snapshot_active_proposal_for_contact_sheet and operation != "keep_approved":
+            raise ValueError("only keep_approved may snapshot a contact-sheet proposal")
         with self._write() as connection:
             current = _require_row(
                 connection.execute(
@@ -705,6 +709,61 @@ class CurationDatabase:
                         dataset_sha256=dataset["prompt_template_sha256"],
                         episode_sha256=current["prompt_template_sha256"],
                     )
+            details = dict(audit_details or {})
+            if snapshot_active_proposal_for_contact_sheet:
+                dataset_identity = _require_row(
+                    connection.execute(
+                        "SELECT id, alias, source_manifest_sha256 FROM datasets WHERE id=?",
+                        (dataset_id,),
+                    ).fetchone(),
+                    "dataset not found",
+                )
+                proposal = connection.execute(
+                    """
+                    SELECT proposal.id,
+                        proposal.step_2_start_frame, proposal.step_3_start_frame,
+                        proposal.step_4_start_frame, proposal.step_5_start_frame,
+                        proposal.step_6_start_frame, proposal.step_7_start_frame
+                    FROM cosmos_proposals AS proposal
+                    JOIN cosmos_attempts AS attempt ON attempt.id=proposal.attempt_id
+                    JOIN cosmos_jobs AS job ON job.id=attempt.job_id
+                    WHERE job.dataset_id=? AND attempt.source_episode_index=?
+                        AND proposal.state='active'
+                    """,
+                    (dataset_id, source_episode_index),
+                ).fetchall()
+                if len(proposal) > 1:
+                    raise RuntimeError("multiple active proposals violate the contact-sheet snapshot contract")
+                proposal_row = None if not proposal else proposal[0]
+                proposal_id = None if proposal_row is None else proposal_row["id"]
+                approval_revision = changes.get("approval_revision")
+                final_frames = [
+                    changes.get(f"step_{step}_start_frame", current[f"step_{step}_start_frame"])
+                    for step in range(2, 8)
+                ]
+                proposal_frames = (
+                    [None] * 6
+                    if proposal_row is None
+                    else [proposal_row[f"step_{step}_start_frame"] for step in range(2, 8)]
+                )
+                if (
+                    type(approval_revision) is not int
+                    or approval_revision < 1
+                    or any(type(frame) is not int for frame in final_frames)
+                ):
+                    raise ValueError("keep approval contact-sheet evidence is incomplete")
+                details["contact_sheet_proposal_id"] = proposal_id
+                details["contact_sheet_evidence"] = {
+                    "schema_version": 1,
+                    "dataset_id": dataset_identity["id"],
+                    "dataset_alias": dataset_identity["alias"],
+                    "source_manifest_sha256": dataset_identity["source_manifest_sha256"],
+                    "source_episode_index": source_episode_index,
+                    "approval_revision": approval_revision,
+                    "final_transition_frames": final_frames,
+                    "proposal_id": proposal_id,
+                    "proposal_transition_frames": proposal_frames,
+                }
             fields = {key: (value.value if hasattr(value, "value") else value) for key, value in changes.items()}
             fields["revision"] = expected_revision + 1
             fields["updated_at"] = _utc_now()
@@ -724,6 +783,7 @@ class CurationDatabase:
                 episode_id=current["id"],
                 previous_revision=expected_revision,
                 new_revision=updated["revision"],
+                details=details,
             )
             return updated
 

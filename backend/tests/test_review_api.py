@@ -8,6 +8,8 @@ import threading
 from typing import Any
 
 from curation.assets import LocalAssetService
+from curation.contact_sheets import ContactSheetUnavailable
+from curation.cosmos_transport import ArtifactConflict
 import curation.db as db_module
 from curation.db import CurationDatabase
 from curation.prompts import PROMPT_TEMPLATE_SHA256, PROMPT_TEMPLATE_VERSION
@@ -849,6 +851,73 @@ def test_new_service_reconstructs_persisted_workspace_without_process_cache(
     assert current["decision"] == draft["decision"]
 
 
+@pytest.mark.parametrize(
+    ("failure", "warning"),
+    [
+        (ContactSheetUnavailable("injected decode failure"), "contact_sheet_pending"),
+        (ArtifactConflict("injected immutable evidence conflict"), "contact_sheet_conflict"),
+    ],
+)
+def test_final_sheet_postcommit_failure_keeps_approval_and_access_retries(
+    tmp_path: Path,
+    review_source: tuple[SourceRegistry, Path],
+    failure: Exception,
+    warning: str,
+) -> None:
+    database = CurationDatabase(tmp_path / "sheet-retry" / "curation.sqlite3")
+    database.initialize()
+
+    class RetryCoordinator:
+        fail = True
+        final_calls = 0
+        reconcile_calls = 0
+
+        def reconcile_all(self) -> list[object]:
+            self.reconcile_calls += 1
+            return []
+
+        def ensure_episode(self, source_episode_index: int) -> list[object]:
+            if self.fail:
+                raise failure
+            self.final_calls += 1
+            return []
+
+        def ensure_final(self, source_episode_index: int, approval_revision: int) -> object:
+            self.final_calls += 1
+            if self.fail:
+                raise failure
+            return object()
+
+    coordinator = RetryCoordinator()
+    service = ReviewService(
+        database=database,
+        source_registry=review_source[0],
+        contact_sheet_coordinator_factory=lambda **kwargs: coordinator,
+    )
+    service.open_workspace("local/pnp_trash", actor="curator")
+    draft = _complete_draft(service)
+
+    approved = service.approve_keep(
+        dataset_alias="local/pnp_trash",
+        source_episode_index=0,
+        expected_revision=draft["revision"],
+        actor="curator",
+        reviewer="reviewer",
+    )
+
+    assert approved["decision"]["review_state"] == "approved_keep"
+    assert warning in approved["warnings"]
+    assert coordinator.final_calls == 1
+    persisted = database.get_dataset(alias="local/pnp_trash")
+    assert persisted is not None
+    persisted_episode = database.get_episode(dataset_id=persisted["id"], source_episode_index=0)
+    assert persisted_episode["review_state"] == "approved_keep"
+
+    coordinator.fail = False
+    service.get_episode("local/pnp_trash", 0)
+    assert coordinator.final_calls == 2
+
+
 def test_response_warnings_report_draft_and_corrupt_approval_invariants(
     review_service: ReviewService,
 ) -> None:
@@ -867,13 +936,14 @@ def test_response_warnings_report_draft_and_corrupt_approval_invariants(
     ]
 
     complete = _complete_draft(review_service, 1)
-    review_service.approve_keep(
+    approved = review_service.approve_keep(
         dataset_alias="local/pnp_trash",
         source_episode_index=1,
         expected_revision=complete["revision"],
         actor="curator",
         reviewer="reviewer",
     )
+    assert approved["warnings"] == ["contact_sheet_pending"]
     dataset = review_service.database.get_dataset(alias="local/pnp_trash")
     assert dataset is not None
     episode = review_service.database.get_episode(dataset_id=dataset["id"], source_episode_index=1)
@@ -884,7 +954,11 @@ def test_response_warnings_report_draft_and_corrupt_approval_invariants(
             (episode["id"],),
         )
     corrupt = review_service.get_episode("local/pnp_trash", 1)
-    assert corrupt["warnings"] == ["approval_reviewer_missing", "approval_revision_mismatch"]
+    assert corrupt["warnings"] == [
+        "approval_reviewer_missing",
+        "approval_revision_mismatch",
+        "contact_sheet_pending",
+    ]
 
 
 def test_prompt_invalidation_rolls_back_dataset_rows_and_audits_together(

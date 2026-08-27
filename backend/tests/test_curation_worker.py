@@ -19,6 +19,11 @@ import time
 from uuid import uuid4
 
 import av
+from curation.contact_sheets import (
+    ContactSheetDatasetIdentity,
+    proposal_contact_sheet_path,
+    receipt_path,
+)
 from curation.cosmos_transport import (
     ArtifactRecord,
     ArtifactSecurityError,
@@ -721,6 +726,269 @@ def test_cli_expected_processor_preflight_failures_are_json_exit_two(
     line = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert line["error"] == expected_error
     assert "secret filesystem detail" not in json.dumps(line)
+
+
+def test_cli_contact_sheet_reconciliation_conflict_fails_job_and_clears_all_leases(
+    lifecycle: tuple[CurationDatabase, BatchRepository, MutableClock, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database, repository, _clock, job_id = lifecycle
+
+    def fail_reconciliation(**kwargs: object) -> object:
+        raise worker_module.ContactSheetReconciliationConflict
+
+    monkeypatch.setattr(worker_module, "build_attempt_processor", fail_reconciliation)
+
+    exit_code = cli_main(["--workspace", str(database.path.parent), "run", "--job-id", job_id])
+
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {
+        "error": "contact_sheet_conflict",
+        "job_id": job_id,
+        "state": "failed",
+    }
+    status = repository.status(job_id)
+    assert status["state"] == "failed"
+    with database.open_connection() as connection:
+        job = connection.execute(
+            "SELECT owner, lease_expires_at FROM cosmos_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        attempts = connection.execute(
+            "SELECT lease_owner, lease_expires_at FROM cosmos_attempts WHERE job_id=?", (job_id,)
+        ).fetchall()
+    assert job["owner"] is None
+    assert job["lease_expires_at"] is None
+    assert all(row["lease_owner"] is None and row["lease_expires_at"] is None for row in attempts)
+
+
+@pytest.mark.parametrize("failure_point", ["startup", "runtime"])
+def test_cli_contact_sheet_conflict_honors_cancel_that_commits_before_resolver_lock(
+    lifecycle: tuple[CurationDatabase, BatchRepository, MutableClock, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure_point: str,
+) -> None:
+    database, repository, _clock, job_id = lifecycle
+
+    def cancel_then_conflict() -> None:
+        status_code, payload = repository.cancel(job_id)
+        assert (status_code, payload["state"]) == (202, "cancel_requested")
+        raise worker_module.ContactSheetReconciliationConflict
+
+    if failure_point == "startup":
+
+        def build_failure(**kwargs: object) -> object:
+            cancel_then_conflict()
+
+        monkeypatch.setattr(worker_module, "build_attempt_processor", build_failure)
+    else:
+
+        def runtime_failure(attempt: object, owner: str) -> None:
+            cancel_then_conflict()
+
+        monkeypatch.setattr(
+            worker_module,
+            "build_attempt_processor",
+            lambda **kwargs: runtime_failure,
+        )
+
+    exit_code = cli_main(["--workspace", str(database.path.parent), "run", "--job-id", job_id])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {
+        "event": "worker_terminal",
+        "job_id": job_id,
+        "state": "cancelled",
+    }
+    persisted = repository.status(job_id)
+    assert persisted["state"] == "cancelled"
+    assert persisted["counts"] == {"cancelled": 3}
+    with database.open_connection() as connection:
+        operations = [
+            row["operation"]
+            for row in connection.execute(
+                "SELECT operation FROM audit_events WHERE job_id=? ORDER BY id", (job_id,)
+            )
+        ]
+    assert operations.count("batch_cancel_requested") == 1
+    assert operations.count("batch_cancelled") == 1
+    assert "batch_failed" not in operations
+
+
+@pytest.mark.parametrize("failure_point", ["startup", "runtime"])
+@pytest.mark.parametrize(
+    ("failure", "expected_exit", "expected_status"),
+    [
+        (
+            LiveLeaseConflict("stale owner detail"),
+            3,
+            {"error": "worker_lease_lost"},
+        ),
+        (
+            worker_module.RetryableDatabaseError("database path and secret detail"),
+            2,
+            {"error": "database_busy", "retryable": True},
+        ),
+    ],
+)
+def test_cli_contact_sheet_conflict_fail_job_preserves_exact_task8_error_mapping(
+    lifecycle: tuple[CurationDatabase, BatchRepository, MutableClock, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure_point: str,
+    failure: BaseException,
+    expected_exit: int,
+    expected_status: dict[str, object],
+) -> None:
+    database, repository, _clock, job_id = lifecycle
+
+    if failure_point == "startup":
+
+        def build_failure(**kwargs: object) -> object:
+            raise worker_module.ContactSheetReconciliationConflict
+
+        monkeypatch.setattr(worker_module, "build_attempt_processor", build_failure)
+    else:
+
+        def runtime_failure(attempt: object, owner: str) -> None:
+            raise worker_module.ContactSheetReconciliationConflict
+
+        monkeypatch.setattr(
+            worker_module,
+            "build_attempt_processor",
+            lambda **kwargs: runtime_failure,
+        )
+
+    def resolve_contact_sheet_conflict(self: BatchRepository, job_id: str, *, owner: str) -> object:
+        raise failure
+
+    monkeypatch.setattr(BatchRepository, "resolve_contact_sheet_conflict", resolve_contact_sheet_conflict)
+
+    exit_code = cli_main(["--workspace", str(database.path.parent), "run", "--job-id", job_id])
+
+    assert exit_code == expected_exit
+    line = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert line == {**expected_status, "job_id": job_id}
+    persisted = repository.status(job_id)
+    assert persisted["state"] == "running"
+    with database.open_connection() as connection:
+        job = connection.execute(
+            "SELECT state, owner, lease_expires_at FROM cosmos_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        attempts = connection.execute(
+            "SELECT state, lease_owner, lease_expires_at FROM cosmos_attempts WHERE job_id=?",
+            (job_id,),
+        ).fetchall()
+        failed_events = connection.execute(
+            "SELECT count(*) FROM audit_events WHERE job_id=? AND operation='batch_failed'",
+            (job_id,),
+        ).fetchone()[0]
+    assert job["state"] == "running"
+    assert job["owner"] is not None
+    assert job["lease_expires_at"] is not None
+    expected_attempt_states = (
+        ["queued", "queued", "queued"] if failure_point == "startup" else ["requesting", "queued", "queued"]
+    )
+    assert [row["state"] for row in attempts] == expected_attempt_states
+    if failure_point == "startup":
+        assert all(row["lease_owner"] is None for row in attempts)
+        assert all(row["lease_expires_at"] is None for row in attempts)
+    else:
+        assert attempts[0]["lease_owner"] is not None
+        assert attempts[0]["lease_expires_at"] is not None
+        assert all(row["lease_owner"] is None for row in attempts[1:])
+        assert all(row["lease_expires_at"] is None for row in attempts[1:])
+    assert failed_events == 0
+
+
+@pytest.mark.parametrize("failure_point", ["startup", "runtime"])
+@pytest.mark.parametrize(
+    ("failure_name", "expected_exit", "expected_status"),
+    [
+        ("LiveLeaseConflict", 3, {"error": "worker_lease_lost"}),
+        ("RetryableDatabaseError", 2, {"error": "database_busy", "retryable": True}),
+    ],
+)
+def test_subprocess_contact_sheet_conflict_fail_job_preserves_exact_task8_error_mapping(
+    lifecycle: tuple[CurationDatabase, BatchRepository, MutableClock, str],
+    failure_point: str,
+    failure_name: str,
+    expected_exit: int,
+    expected_status: dict[str, object],
+) -> None:
+    database, _repository, _clock, job_id = lifecycle
+    repository_root = Path(__file__).parents[2]
+    python = repository_root / "backend" / ".venv" / "bin" / "python"
+    if failure_point == "startup":
+        processor_patch = (
+            "def build_attempt_processor(**kwargs):\n    raise worker.ContactSheetReconciliationConflict\n"
+        )
+    else:
+        processor_patch = (
+            "def processor(attempt, owner):\n"
+            "    raise worker.ContactSheetReconciliationConflict\n"
+            "def build_attempt_processor(**kwargs):\n"
+            "    return processor\n"
+        )
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(repository_root / 'backend')!r})\n"
+        "import curation.worker as worker\n"
+        f"{processor_patch}"
+        "worker.build_attempt_processor = build_attempt_processor\n"
+        "def resolve_contact_sheet_conflict(self, job_id, *, owner):\n"
+        f"    raise worker.{failure_name}('sensitive child-process detail')\n"
+        "worker.BatchRepository.resolve_contact_sheet_conflict = resolve_contact_sheet_conflict\n"
+        "raise SystemExit(worker.cli_main([\n"
+        f"    '--workspace', {str(database.path.parent)!r},\n"
+        f"    'run', '--job-id', {job_id!r},\n"
+        "]))\n"
+    )
+
+    process = subprocess.run(
+        [str(python), "-c", script],
+        cwd=repository_root,
+        env=dict(os.environ),
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert process.returncode == expected_exit
+    assert process.stderr == ""
+    assert _status_lines(process)[-1] == {**expected_status, "job_id": job_id}
+    assert "sensitive child-process detail" not in process.stdout
+    with database.open_connection() as connection:
+        job = connection.execute(
+            "SELECT state, owner, lease_expires_at FROM cosmos_jobs WHERE id=?", (job_id,)
+        ).fetchone()
+        attempts = connection.execute(
+            "SELECT state, lease_owner, lease_expires_at FROM cosmos_attempts WHERE job_id=? "
+            "ORDER BY source_episode_index",
+            (job_id,),
+        ).fetchall()
+        failed_events = connection.execute(
+            "SELECT count(*) FROM audit_events WHERE job_id=? AND operation='batch_failed'",
+            (job_id,),
+        ).fetchone()[0]
+    assert job["state"] == "running"
+    assert job["owner"] is not None
+    assert job["lease_expires_at"] is not None
+    expected_states = (
+        ["queued", "queued", "queued"] if failure_point == "startup" else ["requesting", "queued", "queued"]
+    )
+    assert [attempt["state"] for attempt in attempts] == expected_states
+    if failure_point == "startup":
+        assert all(attempt["lease_owner"] is None for attempt in attempts)
+        assert all(attempt["lease_expires_at"] is None for attempt in attempts)
+    else:
+        assert attempts[0]["lease_owner"] is not None
+        assert attempts[0]["lease_expires_at"] is not None
+        assert all(attempt["lease_owner"] is None for attempt in attempts[1:])
+        assert all(attempt["lease_expires_at"] is None for attempt in attempts[1:])
+    assert failed_events == 0
 
 
 def test_cli_retryable_acquisition_failure_is_json_exit_two(
@@ -1698,6 +1966,20 @@ def test_crash_after_proposal_commit_is_exactly_once_and_never_reprocesses(
             crashed = True
             raise RuntimeError("injected crash")
 
+    class RecordingCoordinator:
+        reconcile_calls = 0
+        proposal_ids: list[str] = []
+
+        def reconcile_all(self) -> list[object]:
+            self.reconcile_calls += 1
+            return []
+
+        def ensure_proposal(self, proposal_id: str) -> object:
+            self.proposal_ids.append(proposal_id)
+            return object()
+
+    coordinator = RecordingCoordinator()
+
     processor = CosmosAttemptProcessor(
         repository=repository,
         source_record=registry.records["local/pnp_trash"],
@@ -1709,18 +1991,58 @@ def test_crash_after_proposal_commit_is_exactly_once_and_never_reprocesses(
         sampler=lambda **kwargs: SamplingOutcome.ready(_prepared_sample()),
         transport_factory=lambda: transport,
         event_hook=event,
+        contact_sheet_coordinator=coordinator,
         sleep=lambda seconds: None,
     )
     with pytest.raises(RuntimeError, match="injected crash"):
         processor(attempt, owner)
     processor(attempt, owner)
     assert transport.initial_calls == 1
+    assert coordinator.reconcile_calls == 1
+    assert coordinator.proposal_ids == []
     with database.open_connection() as connection:
         assert connection.execute("SELECT count(*) FROM cosmos_proposals").fetchone()[0] == 1
         assert (
             connection.execute("SELECT state FROM cosmos_attempts WHERE id=?", (attempt["id"],)).fetchone()[0]
             == "succeeded"
         )
+
+
+def test_successful_proposal_activation_produces_its_contact_sheet(
+    processor_case: tuple[CurationDatabase, BatchRepository, dict[str, object], str, SourceRegistry],
+) -> None:
+    database, repository, attempt, owner, registry = processor_case
+
+    class RecordingCoordinator:
+        proposal_ids: list[str] = []
+
+        def reconcile_all(self) -> list[object]:
+            raise AssertionError("new proposal must be produced directly")
+
+        def ensure_proposal(self, proposal_id: str) -> object:
+            self.proposal_ids.append(proposal_id)
+            return object()
+
+    coordinator = RecordingCoordinator()
+    processor = CosmosAttemptProcessor(
+        repository=repository,
+        source_record=registry.records["local/pnp_trash"],
+        workspace=database.path.parent,
+        source_fps=10,
+        base_url="http://cosmos/v1",
+        model="cosmos3-nano",
+        api_key="test-key",
+        sampler=lambda **kwargs: SamplingOutcome.ready(_prepared_sample()),
+        transport_factory=FakeTransport,
+        contact_sheet_coordinator=coordinator,
+        sleep=lambda seconds: None,
+    )
+
+    processor(attempt, owner)
+
+    with database.open_connection() as connection:
+        proposal_id = connection.execute("SELECT id FROM cosmos_proposals").fetchone()["id"]
+    assert coordinator.proposal_ids == [proposal_id]
 
 
 def test_cancel_after_parsed_artifact_never_activates_or_supersedes_a_proposal(
@@ -2912,6 +3234,58 @@ def test_exact_authority_tamper_never_sends_sentinel_authorization_to_redirect_h
     finally:
         redirector.close()
         redirect_target.close()
+
+
+def test_exact_entrypoint_contact_sheet_conflict_is_json_exit_one_and_clears_leases(
+    entrypoint_case: _EntrypointCase,
+) -> None:
+    case = entrypoint_case
+    completed_job = _start_via_api(case)
+    completed = _run_entrypoint(case, "run", str(completed_job["job_id"]))
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    dataset = case.database.get_dataset(alias="local/pnp_trash")
+    assert dataset is not None
+    identity = ContactSheetDatasetIdentity(
+        dataset_id=dataset["id"],
+        dataset_alias=dataset["alias"],
+        source_manifest_sha256=dataset["source_manifest_sha256"],
+    )
+    with case.database.open_connection() as connection:
+        proposal_id = connection.execute(
+            "SELECT id FROM cosmos_proposals ORDER BY created_at, id LIMIT 1"
+        ).fetchone()["id"]
+    sheet_path = proposal_contact_sheet_path(identity, proposal_id)
+    receipt = case.workspace / receipt_path(sheet_path)
+    replacement = receipt.with_name("replacement.json")
+    replacement.write_text("{}", encoding="utf-8")
+    os.replace(replacement, receipt)
+
+    retry = case.client.post(
+        f"/api/curation/batches/{completed_job['job_id']}/retry",
+        headers={"Authorization": "Bearer token"},
+        json={"episode_indices": [0]},
+    ).json()
+    failed = _run_entrypoint(case, "run", str(retry["job_id"]))
+
+    assert failed.returncode == 1
+    assert failed.stderr == ""
+    assert _status_lines(failed)[-1] == {
+        "error": "contact_sheet_conflict",
+        "job_id": retry["job_id"],
+        "state": "failed",
+    }
+    assert case.server.post_count == 1
+    with case.database.open_connection() as connection:
+        job = connection.execute(
+            "SELECT state, owner, lease_expires_at FROM cosmos_jobs WHERE id=?",
+            (retry["job_id"],),
+        ).fetchone()
+        attempts = connection.execute(
+            "SELECT lease_owner, lease_expires_at FROM cosmos_attempts WHERE job_id=?",
+            (retry["job_id"],),
+        ).fetchall()
+    assert dict(job) == {"state": "failed", "owner": None, "lease_expires_at": None}
+    assert all(row["lease_owner"] is None and row["lease_expires_at"] is None for row in attempts)
 
 
 def test_exact_entrypoint_run_retry_and_all_nonsignal_exit_codes(entrypoint_case: _EntrypointCase) -> None:
