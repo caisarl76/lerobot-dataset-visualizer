@@ -6,5 +6,12 @@
     "types": ["bun-types"],
     "incremental": false
   },
-  "include": ["**/__tests__/**/*.ts", "src/**/*.ts"]
+  "files": [
+    "src/app/api/curation/[...path]/__tests__/route.test.ts",
+    "src/context/__tests__/curation-context.test.tsx",
+    "src/utils/__tests__/curationClient.test.ts",
+    "src/utils/__tests__/curationTimeline.test.ts"
+  ],
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "src/**/__tests__/**"]
 }
