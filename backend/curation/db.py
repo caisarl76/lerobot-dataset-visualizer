@@ -15,6 +15,7 @@ from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 import sqlite3
 from typing import Any
 from uuid import uuid4
@@ -197,6 +198,14 @@ class PromptContractConflict(RuntimeError):
             "episode_prompt_template_sha256": episode_sha256,
         }
         super().__init__("prompt contract changed before approval could be committed")
+
+
+class ExportSnapshotValidationError(RuntimeError):
+    """A transactional export preflight rejected the current review snapshot."""
+
+    def __init__(self, error: str, **details: Any) -> None:
+        self.payload = {"error": error, **details}
+        super().__init__(error)
 
 
 def canonical_json(value: Any) -> str:
@@ -965,65 +974,182 @@ class CurationDatabase:
                 connection.execute("SELECT * FROM cosmos_jobs WHERE id=?", (current["id"],)).fetchone()
             )
 
-    def create_export_snapshot(self, *, dataset_id: int, staging_path: str, final_path: str) -> dict[str, Any]:
+    def create_export_snapshot(
+        self,
+        *,
+        dataset_id: int,
+        staging_path: str,
+        final_path: str,
+        export_id: str | None = None,
+    ) -> dict[str, Any]:
         """Freeze approved rows and their hash before any exporter work begins."""
-        identifier = str(uuid4())
+        identifier = str(uuid4()) if export_id is None else export_id
         now = _utc_now()
         with self._write() as connection:
             document, rows = _approval_snapshot_document(connection, dataset_id)
-            snapshot_sha256 = canonical_json_sha256(document)
-            connection.execute(
-                """
-                INSERT INTO exports(
-                    id, dataset_id, state, approval_snapshot_sha256, staging_path,
-                    final_path, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    identifier,
-                    dataset_id,
-                    ExportState.QUEUED.value,
-                    snapshot_sha256,
-                    staging_path,
-                    final_path,
-                    now,
-                    now,
-                ),
+            _insert_export_snapshot(
+                connection,
+                identifier=identifier,
+                dataset_id=dataset_id,
+                staging_path=staging_path,
+                final_path=final_path,
+                document=document,
+                rows=rows,
+                now=now,
             )
-            for row in rows:
+            return _require_row(connection.execute("SELECT * FROM exports WHERE id=?", (identifier,)).fetchone())
+
+    def create_validated_export_snapshot(
+        self,
+        *,
+        dataset_id: int,
+        staging_path: str,
+        final_path: str,
+        export_id: str,
+        expected_source_manifest_sha256: str,
+        expected_prompt_template_sha256: str,
+        expected_episode_count: int,
+    ) -> dict[str, Any]:
+        """Validate and freeze one complete approval snapshot under one write lock."""
+        now = _utc_now()
+        with self._write() as connection:
+            dataset = _require_row(
+                connection.execute("SELECT * FROM datasets WHERE id=?", (dataset_id,)).fetchone()
+            )
+            if dataset["source_manifest_sha256"] != expected_source_manifest_sha256:
+                raise ExportSnapshotValidationError("source_fingerprint_mismatch")
+            if dataset["prompt_template_sha256"] != expected_prompt_template_sha256:
+                raise ExportSnapshotValidationError("export_prompt_contract_mismatch")
+            active = connection.execute(
+                """
+                SELECT id FROM exports
+                WHERE dataset_id=? AND state IN (
+                    'queued', 'building', 'core_structural_validated', 'gr00t_stats_validated',
+                    'gr00t_loader_validated', 'provenance_written', 'final_consistency_validated', 'publishing'
+                )
+                """,
+                (dataset_id,),
+            ).fetchone()
+            if active is not None:
+                raise ExportSnapshotValidationError("export_active")
+            all_rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM episodes WHERE dataset_id=? ORDER BY source_episode_index",
+                    (dataset_id,),
+                )
+            ]
+            if len(all_rows) != expected_episode_count:
+                raise ExportSnapshotValidationError("source_fingerprint_mismatch")
+            unapproved = [
+                row["source_episode_index"]
+                for row in all_rows
+                if row["review_state"] not in {ReviewState.APPROVED_KEEP.value, ReviewState.APPROVED_REJECT.value}
+            ]
+            if unapproved:
+                raise ExportSnapshotValidationError(
+                    "export_reviews_incomplete", unapproved_episode_indices=unapproved
+                )
+            if not any(row["review_state"] == ReviewState.APPROVED_KEEP.value for row in all_rows):
+                raise ExportSnapshotValidationError("export_zero_kept_episodes")
+            invalid = [
+                row["source_episode_index"]
+                for row in all_rows
+                if not _valid_export_approval(row, prompt_template_sha256=expected_prompt_template_sha256)
+            ]
+            if invalid:
+                raise ExportSnapshotValidationError("export_invalid_approval", source_episode_indices=invalid)
+            document, rows = _approval_snapshot_document(connection, dataset_id)
+            _insert_export_snapshot(
+                connection,
+                identifier=export_id,
+                dataset_id=dataset_id,
+                staging_path=staging_path,
+                final_path=final_path,
+                document=document,
+                rows=rows,
+                now=now,
+            )
+            return _require_row(connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone())
+
+    def get_export(self, *, export_id: str) -> dict[str, Any] | None:
+        with self._read() as connection:
+            return _row(
                 connection.execute(
                     """
-                    INSERT INTO export_episodes(
-                        export_id, source_episode_index, source_length, review_state, object_name, pickup_hand,
-                        turn_direction, step_2_start_frame, step_3_start_frame, step_4_start_frame,
-                        step_5_start_frame, step_6_start_frame, step_7_start_frame, revision,
-                        approval_revision, reviewer, approved_at, rejection_reason, prompt_template_sha256
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    SELECT export.*, dataset.alias AS dataset_alias, dataset.source_path,
+                           dataset.source_manifest_sha256, dataset.prompt_template_version,
+                           dataset.prompt_template_sha256
+                    FROM exports AS export
+                    JOIN datasets AS dataset ON dataset.id=export.dataset_id
+                    WHERE export.id=?
                     """,
-                    (
-                        identifier,
-                        row["source_episode_index"],
-                        row["source_length"],
-                        row["review_state"],
-                        row["object_name"],
-                        row["pickup_hand"],
-                        row["turn_direction"],
-                        row["step_2_start_frame"],
-                        row["step_3_start_frame"],
-                        row["step_4_start_frame"],
-                        row["step_5_start_frame"],
-                        row["step_6_start_frame"],
-                        row["step_7_start_frame"],
-                        row["revision"],
-                        row["approval_revision"],
-                        row["reviewer"],
-                        row["approved_at"],
-                        row["rejection_reason"],
-                        row["prompt_template_sha256"],
-                    ),
+                    (export_id,),
+                ).fetchone()
+            )
+
+    def list_export_episodes(self, *, export_id: str) -> list[dict[str, Any]]:
+        with self._read() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM export_episodes WHERE export_id=? ORDER BY source_episode_index",
+                    (export_id,),
                 )
-            return _require_row(connection.execute("SELECT * FROM exports WHERE id=?", (identifier,)).fetchone())
+            ]
+
+    def claim_export_build(self, *, export_id: str) -> dict[str, Any]:
+        """Atomically claim a queued export and return its immutable snapshot."""
+        with self._write() as connection:
+            current = _require_row(
+                connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone(),
+                "export not found",
+            )
+            if current["state"] != ExportState.QUEUED.value:
+                raise StateTransitionConflict(
+                    entity="export",
+                    identifier=export_id,
+                    expected_state=ExportState.QUEUED.value,
+                    current_state=current["state"],
+                )
+            connection.execute(
+                "UPDATE exports SET state=?, updated_at=? WHERE id=?",
+                (ExportState.BUILDING.value, _utc_now(), export_id),
+            )
+            return {
+                "export": _require_row(
+                    connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone()
+                ),
+                "episodes": [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM export_episodes WHERE export_id=? ORDER BY source_episode_index",
+                        (export_id,),
+                    )
+                ],
+            }
+
+    def fail_export_build(self, *, export_id: str, failure_summary: str) -> dict[str, Any]:
+        """Terminally abandon an ambiguous build without touching its evidence."""
+        if not re.fullmatch(r"export_[a-z0-9_]+", failure_summary):
+            raise ValueError("export failure summary must be a sanitized error code")
+        with self._write() as connection:
+            current = _require_row(
+                connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone(),
+                "export not found",
+            )
+            if current["state"] != ExportState.BUILDING.value:
+                raise StateTransitionConflict(
+                    entity="export",
+                    identifier=export_id,
+                    expected_state=ExportState.BUILDING.value,
+                    current_state=current["state"],
+                )
+            connection.execute(
+                "UPDATE exports SET state=?, failure_summary=?, updated_at=? WHERE id=?",
+                (ExportState.FAILED.value, failure_summary, _utc_now(), export_id),
+            )
+            return _require_row(connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone())
 
     def set_export_state(
         self, *, export_id: str, expected_state: ExportState, state: ExportState
@@ -1391,6 +1517,95 @@ def _approval_snapshot_document(
         },
         episodes,
     )
+
+
+def _valid_export_approval(row: Mapping[str, Any], *, prompt_template_sha256: str) -> bool:
+    if (
+        row["approval_revision"] != row["revision"]
+        or not isinstance(row["reviewer"], str)
+        or not row["reviewer"]
+        or not isinstance(row["approved_at"], str)
+        or not row["approved_at"]
+    ):
+        return False
+    if row["review_state"] == ReviewState.APPROVED_REJECT.value:
+        return True
+    transitions = [row[column] for column in _STEP_COLUMNS]
+    return (
+        isinstance(row["object_name"], str)
+        and bool(row["object_name"])
+        and row["object_name"] == " ".join(row["object_name"].split())
+        and row["pickup_hand"] in {"left", "right"}
+        and row["turn_direction"] in {"left", "right"}
+        and row["prompt_template_sha256"] == prompt_template_sha256
+        and all(type(value) is int for value in transitions)
+        and 0 < transitions[0]
+        and all(left < right for left, right in zip(transitions, transitions[1:]))
+        and transitions[-1] < row["source_length"]
+    )
+
+
+def _insert_export_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    identifier: str,
+    dataset_id: int,
+    staging_path: str,
+    final_path: str,
+    document: Mapping[str, Any],
+    rows: list[dict[str, Any]],
+    now: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO exports(
+            id, dataset_id, state, approval_snapshot_sha256, staging_path,
+            final_path, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            identifier,
+            dataset_id,
+            ExportState.QUEUED.value,
+            canonical_json_sha256(document),
+            staging_path,
+            final_path,
+            now,
+            now,
+        ),
+    )
+    for row in rows:
+        connection.execute(
+            """
+            INSERT INTO export_episodes(
+                export_id, source_episode_index, source_length, review_state, object_name, pickup_hand,
+                turn_direction, step_2_start_frame, step_3_start_frame, step_4_start_frame,
+                step_5_start_frame, step_6_start_frame, step_7_start_frame, revision,
+                approval_revision, reviewer, approved_at, rejection_reason, prompt_template_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                identifier,
+                row["source_episode_index"],
+                row["source_length"],
+                row["review_state"],
+                row["object_name"],
+                row["pickup_hand"],
+                row["turn_direction"],
+                row["step_2_start_frame"],
+                row["step_3_start_frame"],
+                row["step_4_start_frame"],
+                row["step_5_start_frame"],
+                row["step_6_start_frame"],
+                row["step_7_start_frame"],
+                row["revision"],
+                row["approval_revision"],
+                row["reviewer"],
+                row["approved_at"],
+                row["rejection_reason"],
+                row["prompt_template_sha256"],
+            ),
+        )
 
 
 _SCHEMA_SIGNATURE_QUERY = """

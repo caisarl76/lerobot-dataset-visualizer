@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import secrets
 from typing import Any, Literal
 
@@ -9,6 +11,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .assets import LocalAssetService
 from .db import RetryableDatabaseError
+from .exporter import ExportError, ExportService
 from .review import ReviewError, ReviewService
 from .worker import BatchError, BatchService
 
@@ -53,6 +56,10 @@ class RetryBatchBody(_StrictBody):
     failure_states: list[Literal["manual_only", "retryable", "cancelled"]] | None = None
 
 
+class StartExportBody(_StrictBody):
+    dataset_alias: str
+
+
 def _review_response(operation: Any) -> JSONResponse:
     try:
         return JSONResponse(operation())
@@ -64,6 +71,7 @@ def build_curation_router(
     asset_service: LocalAssetService | None = None,
     review_service: ReviewService | None = None,
     batch_service: BatchService | None = None,
+    export_service: ExportService | None = None,
     bearer_token: str | None = None,
 ) -> APIRouter:
     router = APIRouter()
@@ -86,10 +94,18 @@ def build_curation_router(
             headers=request.headers,
         )
 
-    if review_service is None and batch_service is None:
+    if export_service is None and review_service is not None and os.environ.get("CURATION_OUTPUT"):
+        export_service = ExportService(
+            database=review_service.database,
+            source_registry=review_service.source_registry,
+            workspace=review_service.database.path.parent,
+            final_path=Path(os.environ["CURATION_OUTPUT"]),
+        )
+
+    if review_service is None and batch_service is None and export_service is None:
         return router
     if not bearer_token:
-        raise ValueError("bearer_token is required when review_service is configured")
+        raise ValueError("bearer_token is required when a curation service is configured")
 
     def require_curation_bearer(authorization: str | None = Header(default=None)) -> None:
         prefix = "Bearer "
@@ -104,6 +120,22 @@ def build_curation_router(
             )
 
     curation = APIRouter(dependencies=[Depends(require_curation_bearer)])
+
+    if export_service is not None:
+
+        def export_response(operation: Any, *, success_status: int = 200) -> JSONResponse:
+            try:
+                return JSONResponse(operation(), status_code=success_status)
+            except (ExportError, RetryableDatabaseError) as error:
+                return JSONResponse(error.payload, status_code=error.status_code)
+
+        @curation.post("/api/curation/exports")
+        def start_export(body: StartExportBody) -> JSONResponse:
+            return export_response(lambda: export_service.create(body.dataset_alias), success_status=201)
+
+        @curation.get("/api/curation/exports/{export_id}")
+        def export_status(export_id: str) -> JSONResponse:
+            return export_response(lambda: export_service.status(export_id))
 
     if batch_service is not None:
 
