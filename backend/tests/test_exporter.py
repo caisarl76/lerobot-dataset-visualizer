@@ -19,6 +19,9 @@ import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 import pytest
 
+UNKNOWN_XLSX_NAME = "unknown-ancillary.xlsx"
+UNKNOWN_XLSX_BYTES = b"PK\x03\x04unknown-xlsx-like-ancillary\x00\xff"
+
 
 def _hold_export_lock(workspace: str, export_id: str, ready: Any, release: Any) -> None:
     from curation.exporter import _exclusive_export_execution
@@ -141,6 +144,7 @@ def _rich_case(
         extra.parent.mkdir(parents=True, exist_ok=True)
         extra.write_bytes(bytes([index, 0, 255]))
     (source / "LICENSE.txt").write_text("global ancillary bytes\n")
+    (source / UNKNOWN_XLSX_NAME).write_bytes(UNKNOWN_XLSX_BYTES)
     (source / "data" / "chunk-000" / "calibration.bin").write_bytes(b"supplemental-data-asset")
 
     workspace = tmp_path / "workspace"
@@ -207,6 +211,28 @@ def _ipc_hash(column: pa.ChunkedArray, field: pa.Field) -> str:
     with ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
     return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+
+
+def test_staging_export_carries_an_unknown_top_level_xlsx_asset_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    source, _, database, registry, service, _ = _rich_case(tmp_path)
+    record = registry.records["local/pnp_trash"]
+    expected_hash = hashlib.sha256(UNKNOWN_XLSX_BYTES).hexdigest()
+
+    assert record.file_hashes[UNKNOWN_XLSX_NAME] == expected_hash
+    assert f"{expected_hash}  {UNKNOWN_XLSX_NAME}\n".encode() in record.manifest_path.read_bytes()
+
+    created = service.create("local/pnp_trash")
+    StagingExporter(database=database, source_registry=registry).run(created["export_id"])
+
+    output = Path(created["staging_path"]) / UNKNOWN_XLSX_NAME
+    source_asset = source / UNKNOWN_XLSX_NAME
+    assert output.read_bytes() == UNKNOWN_XLSX_BYTES
+    assert (output.stat().st_dev, output.stat().st_ino) != (
+        source_asset.stat().st_dev,
+        source_asset.stat().st_ino,
+    )
 
 
 def test_staging_export_preserves_arrow_semantics_and_rewrites_only_four_columns(tmp_path: Path) -> None:

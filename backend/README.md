@@ -38,6 +38,13 @@ export NEXT_PUBLIC_DATASET_URL=http://127.0.0.1:8000/api/local-datasets
 export ISAAC_GROOT_ROOT=/home/jihun/work/Isaac-GR00T
 ```
 
+The user-approved 2026-08-28 source authority contains 190 immutable regular
+files. Its canonical manifest SHA-256 is
+`5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577`.
+The top-level ancillary `pnp_trash.xlsx` is 13,644 bytes with SHA-256
+`989f6968e5cf8ee0972b850199c948dd75ce140480c82cbe368053cde6ab34c9`;
+it remains an immutable source asset and is not annotation authority.
+
 The operator's existing server/runtime configuration must separately provide
 the variables `CURATION_BEARER_TOKEN`, `COSMOS_BASE_URL`, `COSMOS_MODEL`,
 `COSMOS_API_KEY_ENV`, and `COSMOS_ENDPOINT_IDENTITY`. Do not put their values

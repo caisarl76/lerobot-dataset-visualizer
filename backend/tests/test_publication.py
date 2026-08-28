@@ -32,7 +32,7 @@ from curation.validation import (
     seal_staging_tree,
 )
 import pytest
-from test_exporter import _rich_case
+from test_exporter import UNKNOWN_XLSX_BYTES, UNKNOWN_XLSX_NAME, _rich_case
 
 
 def _race_destination(final: str, barrier: multiprocessing.Barrier, sentinel: bytes | None) -> None:
@@ -479,6 +479,9 @@ def test_validated_exporter_runs_ordered_gates_and_publishes_complete_tree(tmp_p
     assert not Path(created["staging_path"]).exists()
     assert (final / "meta/curation_provenance.json").is_file()
     assert (final / "meta/curation_checksums.sha256").is_file()
+    assert (final / UNKNOWN_XLSX_NAME).read_bytes() == UNKNOWN_XLSX_BYTES
+    provenance = json.loads((final / "meta/curation_provenance.json").read_text())
+    assert provenance["source"]["file_count"] == len(registry.records["local/pnp_trash"].file_hashes)
     assert "stale" not in json.loads((final / "meta/stats.json").read_text())
     assert json.loads((final / "meta/relative_stats.json").read_text()) == {}
     assert database.get_export(export_id=created["export_id"])["state"] == "published"

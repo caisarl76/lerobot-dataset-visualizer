@@ -2561,7 +2561,7 @@ def _absolute_workspace(value: str) -> Path:
     path = Path(value)
     if not path.is_absolute():
         raise argparse.ArgumentTypeError("workspace must be an absolute path")
-    return path
+    return path.resolve()
 
 
 def build_cli_parser() -> argparse.ArgumentParser:

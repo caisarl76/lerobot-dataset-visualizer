@@ -19,6 +19,7 @@ import time
 from uuid import uuid4
 
 import av
+from curation.config import CurationSettings
 from curation.contact_sheets import (
     ContactSheetDatasetIdentity,
     proposal_contact_sheet_path,
@@ -685,6 +686,36 @@ def test_cli_parser_freezes_exact_run_and_resume_contract(tmp_path: Path) -> Non
         parser.parse_args(["run", all_zero])
     with pytest.raises(SystemExit):
         parser.parse_args(["--workspace", str(workspace), "run", "--job-id", "not-a-uuid"])
+
+
+def test_cli_workspace_canonicalizes_a_symlinked_ancestor_to_the_runtime_authority(
+    tmp_path: Path,
+) -> None:
+    real_outputs = tmp_path / "real-outputs"
+    real_workspace = real_outputs / "curation-workspace"
+    real_workspace.mkdir(parents=True)
+    linked_outputs = tmp_path / "linked-outputs"
+    linked_outputs.symlink_to(real_outputs, target_is_directory=True)
+    lexical_workspace = linked_outputs / real_workspace.name
+    source = tmp_path / "source"
+    source.mkdir()
+
+    environment = _trusted_runtime_environment(workspace=real_workspace, source=source)
+    environment["CURATION_WORKSPACE"] = str(lexical_workspace)
+    settings = CurationSettings.from_env(environment)
+    parser = build_cli_parser()
+    job_id = "00000000-0000-0000-0000-000000000000"
+
+    arguments = parser.parse_args(["--workspace", str(lexical_workspace), "run", "--job-id", job_id])
+    authority = TrustedWorkerAuthority.from_settings(
+        settings,
+        cli_workspace=arguments.workspace,
+    )
+
+    assert arguments.workspace == real_workspace.resolve()
+    assert authority.workspace == settings.workspace
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--workspace", "relative/workspace", "resume", "--job-id", job_id])
 
 
 def test_cli_entrypoint_exact_state_and_conflict_exit_codes(
@@ -2534,8 +2565,11 @@ def test_cli_rejects_workspace_outside_trusted_settings_before_database_access_o
 ) -> None:
     database, _, _, job_id = lifecycle
     before = _job_evidence_snapshot(database, job_id)
+    untrusted_target = tmp_path / "separate-workspace"
+    untrusted_target.mkdir()
     untrusted_workspace = tmp_path / "untrusted-workspace"
-    untrusted_workspace.symlink_to(database.path.parent, target_is_directory=True)
+    untrusted_workspace.symlink_to(untrusted_target, target_is_directory=True)
+    assert untrusted_workspace.resolve() != database.path.parent.resolve()
 
     assert cli_main(["--workspace", str(untrusted_workspace), "run", "--job-id", job_id]) == 2
 

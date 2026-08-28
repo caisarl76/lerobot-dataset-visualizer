@@ -118,13 +118,17 @@ before continuing.
 ## Filesystem and dependency preflight
 
 Run this section before starting a new curation. Stop on any failed assertion.
-Before touching the live tree, obtain the canonical 189-file manifest SHA-256
-from an independently reviewed and approved inventory record. In the same
-shell that runs source preflight, enter that recorded value as a shell-local
-variable:
+The user-approved 2026-08-28 source authority contains 190 immutable regular
+files. Its independently reviewed canonical manifest SHA-256 is
+`5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577`.
+The top-level ancillary `pnp_trash.xlsx` is 13,644 bytes with SHA-256
+`989f6968e5cf8ee0972b850199c948dd75ce140480c82cbe368053cde6ab34c9`.
+It is immutable source evidence, is copied as an ancillary asset, and is not
+annotation authority. In the same shell that runs source preflight, enter the
+independently approved manifest value as a shell-local variable:
 
 ```bash
-read -r -p 'Paste independently approved 189-file manifest SHA-256: ' APPROVED_SOURCE_MANIFEST_SHA256
+read -r -p 'Paste independently approved 190-file manifest SHA-256: ' APPROVED_SOURCE_MANIFEST_SHA256
 ```
 
 Never populate `APPROVED_SOURCE_MANIFEST_SHA256` with `sha256sum`, command
@@ -138,8 +142,16 @@ set -euo pipefail
 : "${CURATION_WORKSPACE:?FAIL: CURATION_WORKSPACE is required}"
 : "${CURATION_OUTPUT:?FAIL: CURATION_OUTPUT is required}"
 : "${APPROVED_SOURCE_MANIFEST_SHA256:?FAIL: approved source manifest SHA-256 is required}"
+PINNED_SOURCE_MANIFEST_SHA256=5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577
+PINNED_ANCILLARY_NAME=pnp_trash.xlsx
+PINNED_ANCILLARY_SHA256=989f6968e5cf8ee0972b850199c948dd75ce140480c82cbe368053cde6ab34c9
+PINNED_ANCILLARY_SIZE=13644
 if [[ ! "$APPROVED_SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   printf '%s\n' 'FAIL: approved source manifest SHA-256 must be 64 lowercase hex characters' >&2
+  exit 1
+fi
+if test "$APPROVED_SOURCE_MANIFEST_SHA256" != "$PINNED_SOURCE_MANIFEST_SHA256"; then
+  printf '%s\n' 'FAIL: entered source manifest SHA-256 does not match the approved record' >&2
   exit 1
 fi
 
@@ -147,16 +159,17 @@ SOURCE_DATASET=/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash
 test -d "$SOURCE_DATASET"
 test ! -L "$SOURCE_DATASET"
 SOURCE_FILE_COUNT=$(find -P "$SOURCE_DATASET" -type f | wc -l)
-if test "$SOURCE_FILE_COUNT" -ne 189; then
-  printf 'FAIL: source regular-file count must be 189; found %s\n' "$SOURCE_FILE_COUNT" >&2
+if test "$SOURCE_FILE_COUNT" -ne 190; then
+  printf 'FAIL: source regular-file count must be 190; found %s\n' "$SOURCE_FILE_COUNT" >&2
   exit 1
 fi
 test -z "$(find -P "$SOURCE_DATASET" -type l -print -quit)"
 
 VISUALIZER_ROOT=/home/jihun/work/lerobot-dataset-visualizer
 test -x "$VISUALIZER_ROOT/backend/.venv/bin/python"
-PROSPECTIVE_SOURCE_MANIFEST_SHA256=$(
+PROSPECTIVE_SOURCE_AUTHORITY=$(
   PYTHONPATH="$VISUALIZER_ROOT" SOURCE_DATASET="$SOURCE_DATASET" \
+    PINNED_ANCILLARY_NAME="$PINNED_ANCILLARY_NAME" \
     "$VISUALIZER_ROOT/backend/.venv/bin/python" - <<'PY'
 import hashlib
 import os
@@ -165,16 +178,33 @@ from pathlib import Path
 from backend.curation.source import _manifest_bytes
 
 root = Path(os.environ["SOURCE_DATASET"]).resolve(strict=True)
-manifest, _, _ = _manifest_bytes(root)
+manifest, hashes, identities = _manifest_bytes(root)
+ancillary_name = os.environ["PINNED_ANCILLARY_NAME"]
 print(hashlib.sha256(manifest).hexdigest())
+print(hashes.get(ancillary_name, ""))
+identity = identities.get(ancillary_name)
+print(-1 if identity is None else identity.size)
 PY
 )
+mapfile -t SOURCE_AUTHORITY_FIELDS <<< "$PROSPECTIVE_SOURCE_AUTHORITY"
+if test "${#SOURCE_AUTHORITY_FIELDS[@]}" -ne 3; then
+  printf '%s\n' 'FAIL: prospective source authority output is invalid' >&2
+  exit 1
+fi
+PROSPECTIVE_SOURCE_MANIFEST_SHA256=${SOURCE_AUTHORITY_FIELDS[0]}
+PROSPECTIVE_ANCILLARY_SHA256=${SOURCE_AUTHORITY_FIELDS[1]}
+PROSPECTIVE_ANCILLARY_SIZE=${SOURCE_AUTHORITY_FIELDS[2]}
 if [[ ! "$PROSPECTIVE_SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   printf '%s\n' 'FAIL: prospective source manifest SHA-256 is invalid' >&2
   exit 1
 fi
 if test "$PROSPECTIVE_SOURCE_MANIFEST_SHA256" != "$APPROVED_SOURCE_MANIFEST_SHA256"; then
   printf '%s\n' 'FAIL: prospective source manifest SHA-256 does not match approved record' >&2
+  exit 1
+fi
+if test "$PROSPECTIVE_ANCILLARY_SHA256" != "$PINNED_ANCILLARY_SHA256" \
+  || test "$PROSPECTIVE_ANCILLARY_SIZE" != "$PINNED_ANCILLARY_SIZE"; then
+  printf '%s\n' 'FAIL: pnp_trash.xlsx does not match the approved ancillary asset' >&2
   exit 1
 fi
 
@@ -198,16 +228,11 @@ filesystems, plus local operational headroom for reports and GR00T statistics.
 An existing workspace is resumable evidence: inspect it; never clear it to
 force a fresh run.
 
-The approved source snapshot contains exactly 189 regular files. A count of
-190 is a hard stop, including when the additional file is a top-level
-`pnp_trash.xlsx`. Do not delete, move, ignore, or otherwise mutate the source
-implicitly. Task 15 remains blocked until the operator explicitly resolves the
-post-snapshot source drift and a new immutable manifest expectation is agreed.
-No approved canonical hash for the intended 189-file tree is currently
-recorded in this repository or runbook. Do not invent or bless one. Task 15
-remains blocked until the XLSX drift is explicitly resolved by the operator
-without implicit source mutation and the exact canonical 189-file manifest
-hash is independently recorded and approved.
+The 190-file count, canonical manifest digest, and ancillary XLSX digest and
+size are one indivisible source contract. Do not delete, move, rewrite, ignore,
+or parse the XLSX as annotation authority. Any mismatch is a hard stop and
+requires a new explicit source approval; never bless a value computed from the
+candidate live tree.
 
 ### 2. Linux atomic no-clobber support
 
@@ -366,16 +391,21 @@ value:
 set -euo pipefail
 : "${CURATION_WORKSPACE:?FAIL: CURATION_WORKSPACE is required}"
 : "${APPROVED_SOURCE_MANIFEST_SHA256:?FAIL: approved source manifest SHA-256 is required}"
+PINNED_SOURCE_MANIFEST_SHA256=5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577
 if [[ ! "$APPROVED_SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
   printf '%s\n' 'FAIL: approved source manifest SHA-256 must be 64 lowercase hex characters' >&2
+  exit 1
+fi
+if test "$APPROVED_SOURCE_MANIFEST_SHA256" != "$PINNED_SOURCE_MANIFEST_SHA256"; then
+  printf '%s\n' 'FAIL: entered source manifest SHA-256 does not match the approved record' >&2
   exit 1
 fi
 
 SOURCE_MANIFEST="$CURATION_WORKSPACE/source-files.sha256"
 test -f "$SOURCE_MANIFEST"
 SOURCE_MANIFEST_FILE_COUNT=$(wc -l < "$SOURCE_MANIFEST")
-if test "$SOURCE_MANIFEST_FILE_COUNT" -ne 189; then
-  printf 'FAIL: persisted source manifest must contain 189 files; found %s\n' "$SOURCE_MANIFEST_FILE_COUNT" >&2
+if test "$SOURCE_MANIFEST_FILE_COUNT" -ne 190; then
+  printf 'FAIL: persisted source manifest must contain 190 files; found %s\n' "$SOURCE_MANIFEST_FILE_COUNT" >&2
   exit 1
 fi
 SOURCE_MANIFEST_SHA256=$(sha256sum "$SOURCE_MANIFEST" | awk '{print $1}')
@@ -736,10 +766,34 @@ absent, confirm all 92 decisions and at least one keep, and ensure no export is
 active. Create the immutable approval snapshot:
 
 ```bash
-test ! -e "$CURATION_OUTPUT" && test ! -L "$CURATION_OUTPUT"
-cd /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash
-sha256sum --check "$CURATION_WORKSPACE/source-files.sha256"
+set -euo pipefail
+: "${CURATION_WORKSPACE:?FAIL: CURATION_WORKSPACE is required}"
+: "${CURATION_OUTPUT:?FAIL: CURATION_OUTPUT is required}"
+PINNED_SOURCE_MANIFEST_SHA256=5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577
+SOURCE_MANIFEST="$CURATION_WORKSPACE/source-files.sha256"
+if test ! -f "$SOURCE_MANIFEST"; then
+  printf '%s\n' 'FAIL: persisted source manifest is unavailable' >&2
+  exit 1
+fi
+SOURCE_MANIFEST_FILE_COUNT=$(wc -l < "$SOURCE_MANIFEST")
+if test "$SOURCE_MANIFEST_FILE_COUNT" -ne 190; then
+  printf 'FAIL: persisted source manifest must contain 190 files; found %s\n' "$SOURCE_MANIFEST_FILE_COUNT" >&2
+  exit 1
+fi
+SOURCE_MANIFEST_SHA256=$(sha256sum "$SOURCE_MANIFEST" | awk '{print $1}')
+if test "$SOURCE_MANIFEST_SHA256" != "$PINNED_SOURCE_MANIFEST_SHA256"; then
+  printf '%s\n' 'FAIL: persisted source manifest SHA-256 does not match approved record' >&2
+  exit 1
+fi
 
+if test -e "$CURATION_OUTPUT" || test -L "$CURATION_OUTPUT"; then
+  printf '%s\n' 'FAIL: curation output already exists' >&2
+  exit 1
+fi
+cd /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash
+sha256sum --check "$SOURCE_MANIFEST"
+
+CURATION_API=http://127.0.0.1:3000/api/curation
 EXPORT_RESPONSE=$(curl -fsS -H 'Content-Type: application/json' \
   -H 'Origin: http://127.0.0.1:3000' \
   -d '{"dataset_alias":"local/pnp_trash"}' \

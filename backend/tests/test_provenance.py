@@ -15,6 +15,10 @@ from curation.validation import (
 )
 import pytest
 
+APPROVED_DESIGN = Path(
+    "/home/jihun/work/GR00T-WholeBodyControl/docs/superpowers/specs/2026-08-18-pnp-trash-cosmos-curation-design.md"
+)
+
 
 def _artifact(root: Path, relative: str, contents: bytes, kind: str) -> dict[str, object]:
     path = root / relative
@@ -149,6 +153,15 @@ def _structural_result(document: dict[str, object]) -> dict[str, object]:
         "approval_snapshot_sha256": document["approval"]["snapshot_sha256"],
         "source_manifest_sha256": document["source"]["manifest_sha256"],
     }
+
+
+def test_approved_design_provenance_version_matches_the_production_contract(tmp_path: Path) -> None:
+    design = APPROVED_DESIGN.read_text()
+    section = design.split("The output contains `meta/curation_provenance.json`", 1)[1]
+    example = json.loads(section.split("```json", 1)[1].split("```", 1)[0])
+    production = _document(tmp_path)
+
+    assert example["schema_version"] == production["schema_version"] == 2
 
 
 def test_closed_provenance_schema_excludes_secrets_and_raw_reasoning(tmp_path: Path) -> None:

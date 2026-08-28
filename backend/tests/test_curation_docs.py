@@ -47,6 +47,12 @@ PYTHON_SETTINGS_NAMES = (
     "CURATION_BACKEND_HOST",
 )
 
+APPROVED_SOURCE_FILE_COUNT = 190
+APPROVED_SOURCE_MANIFEST_SHA256 = "5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a12466add8722c2e0da9577"
+APPROVED_ANCILLARY_NAME = "pnp_trash.xlsx"
+APPROVED_ANCILLARY_SHA256 = "989f6968e5cf8ee0972b850199c948dd75ce140480c82cbe368053cde6ab34c9"
+APPROVED_ANCILLARY_SIZE = 13_644
+
 
 def _source_preflight(runbook: str) -> str:
     return _bash_block_after(runbook, "### 1. Source, final destination, ownership, and free space")
@@ -145,7 +151,26 @@ def test_docs_assign_full_settings_to_python_processes_and_only_server_subset_to
     assert re.search(r"(?m)^\| Variable named by `COSMOS_API_KEY_ENV` .*\| Backend and worker only", runbook)
 
 
-def test_source_preflight_fails_closed_on_a_sanitized_190_file_fixture(tmp_path: Path) -> None:
+def test_docs_freeze_the_approved_190_file_source_authority() -> None:
+    documents = (
+        (REPOSITORY_ROOT / ".env.example").read_text(),
+        (REPOSITORY_ROOT / "backend" / "README.md").read_text(),
+        (REPOSITORY_ROOT / "docs" / "pnp-trash-curation-runbook.md").read_text(),
+    )
+
+    for document in documents:
+        normalized = re.sub(r"\s+", " ", document)
+        assert "190 immutable regular files" in normalized
+        assert APPROVED_SOURCE_MANIFEST_SHA256 in normalized
+        assert APPROVED_ANCILLARY_NAME in normalized
+        assert APPROVED_ANCILLARY_SHA256 in normalized
+        assert "13,644 bytes" in normalized
+        assert "189 regular files" not in normalized
+        assert "189-file" not in normalized
+        assert "No approved canonical hash" not in normalized
+
+
+def test_source_preflight_fails_closed_on_a_sanitized_191_file_fixture(tmp_path: Path) -> None:
     runbook = (REPOSITORY_ROOT / "docs" / "pnp-trash-curation-runbook.md").read_text()
     preflight = _source_preflight(runbook)
     assert preflight.startswith("set -euo pipefail\n")
@@ -154,7 +179,7 @@ def test_source_preflight_fails_closed_on_a_sanitized_190_file_fixture(tmp_path:
 
     source = tmp_path / "source"
     source.mkdir()
-    for index in range(190):
+    for index in range(191):
         (source / f"file-{index:03d}").write_bytes(b"fixture")
     preflight = preflight.replace("/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash", str(source))
     result = subprocess.run(
@@ -164,7 +189,7 @@ def test_source_preflight_fails_closed_on_a_sanitized_190_file_fixture(tmp_path:
             **os.environ,
             "CURATION_WORKSPACE": str(tmp_path / "workspace"),
             "CURATION_OUTPUT": str(tmp_path / "output"),
-            "APPROVED_SOURCE_MANIFEST_SHA256": "0" * 64,
+            "APPROVED_SOURCE_MANIFEST_SHA256": APPROVED_SOURCE_MANIFEST_SHA256,
         },
         capture_output=True,
         text=True,
@@ -172,7 +197,7 @@ def test_source_preflight_fails_closed_on_a_sanitized_190_file_fixture(tmp_path:
     )
 
     assert result.returncode == 1
-    assert result.stderr == "FAIL: source regular-file count must be 189; found 190\n"
+    assert result.stderr == "FAIL: source regular-file count must be 190; found 191\n"
     assert str(tmp_path) not in result.stderr
 
 
@@ -181,6 +206,10 @@ def test_source_preflight_rejects_unapproved_prospective_hash_before_backend_sta
     preflight = _source_preflight(runbook)
     assert "${APPROVED_SOURCE_MANIFEST_SHA256:?FAIL: approved source manifest SHA-256 is required}" in preflight
     assert "PROSPECTIVE_SOURCE_MANIFEST_SHA256" in preflight
+    assert f"PINNED_SOURCE_MANIFEST_SHA256={APPROVED_SOURCE_MANIFEST_SHA256}" in preflight
+    assert APPROVED_ANCILLARY_NAME in preflight
+    assert APPROVED_ANCILLARY_SHA256 in preflight
+    assert str(APPROVED_ANCILLARY_SIZE) in preflight
     assert "APPROVED_SOURCE_MANIFEST_SHA256=$(" not in preflight
     assert "from backend.curation.source import _manifest_bytes" in preflight
     assert "_manifest_bytes(root)" in preflight
@@ -191,7 +220,7 @@ def test_source_preflight_rejects_unapproved_prospective_hash_before_backend_sta
 
     source = tmp_path / "source"
     source.mkdir()
-    for index in range(189):
+    for index in range(APPROVED_SOURCE_FILE_COUNT):
         (source / f"file-{index:03d}").write_bytes(b"fixture")
     preflight = preflight.replace(
         "/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash", str(source)
@@ -203,7 +232,7 @@ def test_source_preflight_rejects_unapproved_prospective_hash_before_backend_sta
             **os.environ,
             "CURATION_WORKSPACE": str(tmp_path / "workspace"),
             "CURATION_OUTPUT": str(tmp_path / "output"),
-            "APPROVED_SOURCE_MANIFEST_SHA256": "0" * 64,
+            "APPROVED_SOURCE_MANIFEST_SHA256": APPROVED_SOURCE_MANIFEST_SHA256,
         },
         capture_output=True,
         text=True,
@@ -213,6 +242,15 @@ def test_source_preflight_rejects_unapproved_prospective_hash_before_backend_sta
     assert result.returncode == 1
     assert result.stderr == "FAIL: prospective source manifest SHA-256 does not match approved record\n"
     assert str(tmp_path) not in result.stderr
+
+
+def test_persisted_manifest_gate_reuses_the_pinned_non_live_authority() -> None:
+    runbook = (REPOSITORY_ROOT / "docs" / "pnp-trash-curation-runbook.md").read_text()
+    gate = _bash_block_after(runbook, "### Persisted source manifest")
+
+    assert f"PINNED_SOURCE_MANIFEST_SHA256={APPROVED_SOURCE_MANIFEST_SHA256}" in gate
+    assert 'test "$APPROVED_SOURCE_MANIFEST_SHA256" != "$PINNED_SOURCE_MANIFEST_SHA256"' in gate
+    assert "APPROVED_SOURCE_MANIFEST_SHA256=$(" not in gate
 
 
 def test_isaac_preflight_does_not_mask_a_missing_loader_interpreter(tmp_path: Path) -> None:
@@ -421,3 +459,157 @@ esac
     )
 
     assert result.returncode == 9
+
+
+def test_export_gate_reauthenticates_manifest_and_stops_before_export_on_checksum_failure(
+    tmp_path: Path,
+) -> None:
+    runbook = (REPOSITORY_ROOT / "docs" / "pnp-trash-curation-runbook.md").read_text()
+    gate = _bash_block_after(runbook, "## Build, validate, and publish the separate cleaned dataset")
+    assert gate.startswith("set -euo pipefail\n")
+    assert f"PINNED_SOURCE_MANIFEST_SHA256={APPROVED_SOURCE_MANIFEST_SHA256}" in gate
+    assert 'SOURCE_MANIFEST_FILE_COUNT=$(wc -l < "$SOURCE_MANIFEST")' in gate
+    assert 'test "$SOURCE_MANIFEST_FILE_COUNT" -ne 190' in gate
+    assert 'SOURCE_MANIFEST_SHA256=$(sha256sum "$SOURCE_MANIFEST"' in gate
+    assert gate.index("SOURCE_MANIFEST_SHA256=$(sha256sum") < gate.index("EXPORT_RESPONSE=$(curl")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest = workspace / "source-files.sha256"
+    manifest.write_text("".join(f"{'0' * 64}  file-{index:03d}\n" for index in range(190)))
+    source = tmp_path / "source"
+    source.mkdir()
+    visualizer = tmp_path / "visualizer"
+    exporter = visualizer / "backend" / ".venv" / "bin" / "python"
+    exporter.parent.mkdir(parents=True)
+    _write_executable(exporter, "#!/bin/bash\nexit 0\n")
+    gate = gate.replace("/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash", str(source)).replace(
+        "/home/jihun/work/lerobot-dataset-visualizer", str(visualizer)
+    )
+
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    _write_executable(
+        commands / "sha256sum",
+        f"""#!/bin/bash
+case "$1" in
+  --check) exit 9 ;;
+  *) printf '%s  %s\n' '{APPROVED_SOURCE_MANIFEST_SHA256}' "$1" ;;
+esac
+""",
+    )
+    _write_executable(
+        commands / "curl",
+        (
+            "#!/bin/bash\n"
+            "printf '%s' "
+            '\'{"export_id":"11111111-1111-1111-1111-111111111111",'
+            '"approval_snapshot_sha256":'
+            '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\'\n'
+        ),
+    )
+    _write_executable(
+        commands / "jq",
+        """#!/bin/bash
+case "$*" in
+  *.export_id*) cat >/dev/null; printf '%s\n' '11111111-1111-1111-1111-111111111111' ;;
+  *.approval_snapshot_sha256*) cat >/dev/null; printf '%064d\n' 0 ;;
+  *) cat ;;
+esac
+""",
+    )
+    result = subprocess.run(
+        ["bash", "-c", gate],
+        cwd=REPOSITORY_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{commands}:{os.environ['PATH']}",
+            "CURATION_WORKSPACE": str(workspace),
+            "CURATION_OUTPUT": str(tmp_path / "output"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 9
+    assert str(tmp_path) not in result.stderr
+
+
+def test_export_gate_stops_before_export_when_output_already_exists(tmp_path: Path) -> None:
+    runbook = (REPOSITORY_ROOT / "docs" / "pnp-trash-curation-runbook.md").read_text()
+    gate = _bash_block_after(runbook, "## Build, validate, and publish the separate cleaned dataset")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest = workspace / "source-files.sha256"
+    manifest.write_text("".join(f"{'0' * 64}  file-{index:03d}\n" for index in range(190)))
+    source = tmp_path / "source"
+    source.mkdir()
+    visualizer = tmp_path / "visualizer"
+    exporter = visualizer / "backend" / ".venv" / "bin" / "python"
+    exporter.parent.mkdir(parents=True)
+    _write_executable(exporter, "#!/bin/bash\nexit 0\n")
+    gate = gate.replace("/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash", str(source)).replace(
+        "/home/jihun/work/lerobot-dataset-visualizer", str(visualizer)
+    )
+
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    _write_executable(
+        commands / "sha256sum",
+        f"""#!/bin/bash
+case "$1" in
+  --check) exit 0 ;;
+  *) printf '%s  %s\n' '{APPROVED_SOURCE_MANIFEST_SHA256}' "$1" ;;
+esac
+""",
+    )
+    _write_executable(
+        commands / "curl",
+        (
+            "#!/bin/bash\n"
+            "printf '%s\\n' called >> \"$EXPORT_CALL_MARKER\"\n"
+            "printf '%s' "
+            '\'{"export_id":"11111111-1111-1111-1111-111111111111",'
+            '"approval_snapshot_sha256":'
+            '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\'\n'
+        ),
+    )
+    _write_executable(
+        commands / "jq",
+        """#!/bin/bash
+case "$*" in
+  *.export_id*) cat >/dev/null; printf '%s\n' '11111111-1111-1111-1111-111111111111' ;;
+  *.approval_snapshot_sha256*) cat >/dev/null; printf '%064d\n' 0 ;;
+  *) cat ;;
+esac
+""",
+    )
+
+    for output_kind in ("regular", "symlink"):
+        output = tmp_path / f"output-{output_kind}"
+        if output_kind == "regular":
+            output.write_text("occupied\n")
+        else:
+            target = tmp_path / "existing-output-target"
+            target.mkdir(exist_ok=True)
+            output.symlink_to(target, target_is_directory=True)
+        marker = tmp_path / f"export-called-{output_kind}"
+        result = subprocess.run(
+            ["bash", "-c", gate],
+            cwd=REPOSITORY_ROOT,
+            env={
+                **os.environ,
+                "PATH": f"{commands}:{os.environ['PATH']}",
+                "CURATION_WORKSPACE": str(workspace),
+                "CURATION_OUTPUT": str(output),
+                "EXPORT_CALL_MARKER": str(marker),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 1
+        assert result.stderr == "FAIL: curation output already exists\n"
+        assert str(tmp_path) not in result.stderr
+        assert not marker.exists()
