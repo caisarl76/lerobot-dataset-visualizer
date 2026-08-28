@@ -8,6 +8,7 @@ import sqlite3
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
+from curation.config import CurationConfigurationError, CurationSettings
 from curation.db import (
     CurationDatabase,
     IllegalStateTransition,
@@ -16,7 +17,7 @@ from curation.db import (
     StateTransitionConflict,
     canonical_json,
 )
-from curation.exporter import ExportError, StagingExporter
+from curation.exporter import ExportError, ValidatedDatasetExporter
 from curation.source import SourceRegistry
 
 
@@ -61,14 +62,22 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     database = CurationDatabase(database_path)
     try:
         database.validate_worker_compatibility()
+        settings = CurationSettings.from_env()
+        if settings.workspace != arguments.workspace:
+            raise CurationConfigurationError("CLI workspace does not match CURATION_WORKSPACE")
         export = database.get_export(export_id=arguments.export_id)
         if export is None:
             raise ExportError("export not found", {"error": "export_not_found"})
-        registry = SourceRegistry.from_paths(
-            {export["dataset_alias"]: Path(export["source_path"])},
+        registry = SourceRegistry.from_paths(settings.dataset_aliases, workspace=arguments.workspace)
+        exporter = ValidatedDatasetExporter(
+            database=database,
+            source_registry=registry,
             workspace=arguments.workspace,
+            isaac_root=settings.isaac_groot_root,
+            visualizer_root=Path(__file__).parent.parent,
+            cosmos_model=settings.cosmos_model,
+            cosmos_endpoint_identity=settings.cosmos_endpoint_identity,
         )
-        exporter = StagingExporter(database=database, source_registry=registry)
         result = (
             exporter.run(arguments.export_id)
             if arguments.command == "run"
@@ -86,10 +95,10 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     except ExportError as error:
         _print(dict(error.payload) | {"export_id": arguments.export_id})
         return 1
-    except (OSError, ValueError):
+    except (CurationConfigurationError, OSError, ValueError):
         _print({"error": "invalid_export_configuration", "export_id": arguments.export_id})
         return 2
-    _print({"event": "export_staging_built", **result})
+    _print({"event": "export_published", **result})
     return 0
 
 

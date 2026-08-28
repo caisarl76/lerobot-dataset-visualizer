@@ -1179,11 +1179,135 @@ class CurationDatabase:
                     target_state=state.value,
                 )
             connection.execute(
-                "UPDATE exports SET state=?, updated_at=? WHERE id=?", (state.value, _utc_now(), current["id"])
+                "UPDATE exports SET state=?, failure_summary=NULL, updated_at=? WHERE id=?",
+                (state.value, _utc_now(), current["id"]),
             )
             return _require_row(
                 connection.execute("SELECT * FROM exports WHERE id=?", (current["id"],)).fetchone()
             )
+
+    def advance_export_with_artifact(
+        self,
+        *,
+        export_id: str,
+        expected_state: ExportState,
+        state: ExportState,
+        kind: str,
+        relative_path: str,
+        media_type: str,
+        byte_size: int,
+        sha256: str,
+    ) -> dict[str, Any]:
+        """Atomically record one durable gate report and advance its export."""
+
+        contracts = {
+            (
+                ExportState.BUILDING,
+                ExportState.CORE_STRUCTURAL_VALIDATED,
+            ): (ARTIFACT_KIND_STRUCTURAL_REPORT, "structural_artifact_id"),
+            (
+                ExportState.CORE_STRUCTURAL_VALIDATED,
+                ExportState.GROOT_STATS_VALIDATED,
+            ): (ARTIFACT_KIND_GROOT_STATS_REPORT, "gr00t_stats_artifact_id"),
+            (
+                ExportState.GROOT_STATS_VALIDATED,
+                ExportState.GROOT_LOADER_VALIDATED,
+            ): (ARTIFACT_KIND_GROOT_LOADER_REPORT, "gr00t_loader_artifact_id"),
+            (
+                ExportState.PROVENANCE_WRITTEN,
+                ExportState.FINAL_CONSISTENCY_VALIDATED,
+            ): (ARTIFACT_KIND_FINAL_CONSISTENCY_REPORT, "final_consistency_artifact_id"),
+        }
+        contract = contracts.get((expected_state, state))
+        if contract is None or contract[0] != kind:
+            raise ValueError("export artifact does not match the lifecycle transition")
+        path = _safe_relative_path(relative_path)
+        if not isinstance(media_type, str) or not media_type:
+            raise ValueError("artifact media_type is required")
+        if type(byte_size) is not int or byte_size < 0:
+            raise ValueError("artifact byte_size must be a nonnegative integer")
+        if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("artifact sha256 must be lowercase hexadecimal")
+        artifact_id = str(uuid4())
+        pointer = contract[1]
+        now = _utc_now()
+        with self._write() as connection:
+            current = _require_row(
+                connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone(),
+                "export not found",
+            )
+            if current["state"] != expected_state.value:
+                raise StateTransitionConflict(
+                    entity="export",
+                    identifier=export_id,
+                    expected_state=expected_state.value,
+                    current_state=current["state"],
+                )
+            if state not in EXPORT_STATE_TRANSITIONS[expected_state]:
+                raise IllegalStateTransition(
+                    entity="export",
+                    identifier=export_id,
+                    current_state=current["state"],
+                    target_state=state.value,
+                )
+            if current[pointer] is not None:
+                raise ValueError("export gate artifact is already recorded")
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    id, attempt_id, export_id, kind, relative_path, media_type,
+                    byte_size, sha256, created_at
+                ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (artifact_id, export_id, kind, path, media_type, byte_size, sha256, now),
+            )
+            connection.execute(
+                f"UPDATE exports SET state=?, {pointer}=?, failure_summary=NULL, updated_at=? WHERE id=?",
+                (state.value, artifact_id, now, export_id),
+            )
+            return _require_row(
+                connection.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+            )
+
+    def record_export_failure(
+        self,
+        *,
+        export_id: str,
+        expected_state: ExportState,
+        failure_summary: str,
+        terminal: bool,
+    ) -> dict[str, Any]:
+        """Record a sanitized failure, optionally taking the terminal failed edge."""
+
+        if not isinstance(failure_summary, str) or not re.fullmatch(r"[a-z][a-z0-9_]+", failure_summary):
+            raise ValueError("export failure summary must be a sanitized error code")
+        if type(terminal) is not bool:
+            raise ValueError("terminal must be a built-in boolean")
+        with self._write() as connection:
+            current = _require_row(
+                connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone(),
+                "export not found",
+            )
+            if current["state"] != expected_state.value:
+                raise StateTransitionConflict(
+                    entity="export",
+                    identifier=export_id,
+                    expected_state=expected_state.value,
+                    current_state=current["state"],
+                )
+            target = ExportState.FAILED if terminal else expected_state
+            if terminal and target not in EXPORT_STATE_TRANSITIONS[expected_state]:
+                raise IllegalStateTransition(
+                    entity="export",
+                    identifier=export_id,
+                    current_state=current["state"],
+                    target_state=target.value,
+                )
+            connection.execute(
+                "UPDATE exports SET state=?, failure_summary=?, updated_at=? WHERE id=?",
+                (target.value, failure_summary, _utc_now(), export_id),
+            )
+            return _require_row(connection.execute("SELECT * FROM exports WHERE id=?", (export_id,)).fetchone())
 
     def append_http_exchange_history(
         self,

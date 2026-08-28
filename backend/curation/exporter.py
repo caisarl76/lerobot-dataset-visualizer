@@ -13,18 +13,68 @@ from pathlib import Path
 import re
 import shlex
 import stat
-from typing import Any, Sequence
+import subprocess
+from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID, uuid4
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .cosmos_transport import (
+    CONTRACT_VERSION,
+    JPEG_QUALITY,
+    MAX_DURATION_SECONDS,
+    MAX_PAYLOAD_BYTES,
+    MAX_SAMPLED_FRAMES,
+    RESIZE_MAX_LONG_EDGE,
+    TARGET_SAMPLING_FPS,
+)
 from .db import CurationDatabase, ExportSnapshotValidationError, canonical_json
 from .models import ExportState, ReviewState
-from .prompts import PROMPT_TEMPLATE_SHA256, PROMPT_TEMPLATE_VERSION, expand_prompts
+from .prompts import (
+    PROMPT_TEMPLATE_BYTES,
+    PROMPT_TEMPLATE_SHA256,
+    PROMPT_TEMPLATE_VERSION,
+    expand_prompts,
+)
+from .publication import (
+    PublicationError,
+    PublicationIdentity,
+    fsync_directory,
+    pin_publication_source,
+    preflight_rename_noreplace,
+    publish_no_clobber,
+    reconcile_publication_paths,
+    verify_publication_identity,
+)
 from .security import OpenedAsset
 from .source import SourceRecord, SourceRegistry
+from .validation import (
+    ArtifactInstallConflict,
+    FinalConsistencyError,
+    _artifact_descriptor,
+    _hash_file,
+    _read_json,
+    _read_jsonl,
+    _write_new_file,
+    build_curation_provenance,
+    canonical_file_presence,
+    capture_repository_state,
+    install_canonical_file,
+    persist_structural_report,
+    persist_validation_report,
+    read_canonical_file,
+    run_gr00t_loader_validation,
+    run_gr00t_stats_validation,
+    seal_staging_tree,
+    validate_final_consistency,
+    validate_gr00t_loader_outer_report,
+    validate_gr00t_stats_report,
+    validate_structural_dataset,
+    write_checksum_manifest,
+    write_provenance,
+)
 
 
 class ExportError(RuntimeError):
@@ -747,6 +797,1126 @@ class StagingExporter:
         }
 
 
+class ValidatedDatasetExporter:
+    """Resume the fixed validation sequence and publish only its sealed result."""
+
+    def __init__(
+        self,
+        *,
+        database: CurationDatabase,
+        source_registry: SourceRegistry,
+        workspace: Path,
+        isaac_root: Path,
+        visualizer_root: Path,
+        cosmos_model: str,
+        cosmos_endpoint_identity: str,
+        video_frame_counter: Callable[[Path], int] | None = None,
+        stats_validator: Callable[..., dict[str, Any]] = run_gr00t_stats_validation,
+        loader_validator: Callable[..., dict[str, Any]] = run_gr00t_loader_validation,
+        repository_probe: Callable[[Path, str], dict[str, Any]] = capture_repository_state,
+        stats_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        loader_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        parent_fsync: Callable[[Path], None] = fsync_directory,
+        publication_preflight: Callable[[Path], None] = preflight_rename_noreplace,
+        require_contact_sheets: bool = True,
+    ) -> None:
+        if not cosmos_model or not cosmos_endpoint_identity:
+            raise ValueError("Cosmos model and endpoint identity are required for provenance")
+        self.database = database
+        self.source_registry = source_registry
+        self.workspace = Path(workspace).resolve()
+        self.isaac_root = Path(isaac_root)
+        self.visualizer_root = Path(visualizer_root)
+        self.cosmos_model = cosmos_model
+        self.cosmos_endpoint_identity = cosmos_endpoint_identity
+        self.video_frame_counter = video_frame_counter
+        self.stats_validator = stats_validator
+        self.loader_validator = loader_validator
+        self.repository_probe = repository_probe
+        self.stats_runner = stats_runner
+        self.loader_runner = loader_runner
+        self.parent_fsync = parent_fsync
+        self.publication_preflight = publication_preflight
+        self.require_contact_sheets = require_contact_sheets
+        self.builder = StagingExporter(database=database, source_registry=source_registry)
+
+    def run(self, export_id: str) -> dict[str, object]:
+        with _exclusive_export_execution(self.database.path.parent, export_id) as control_fd:
+            export = self._require_export(export_id)
+            if export["state"] != ExportState.QUEUED.value:
+                raise ExportError("export is not queued", {"error": "export_not_queued", "state": export["state"]})
+            self._run_publication_preflight(Path(export["final_path"]).parent)
+            self.builder._run_locked(export_id, control_fd=control_fd)
+            return self._continue(export_id)
+
+    def resume(self, export_id: str) -> dict[str, object]:
+        with _exclusive_export_execution(self.database.path.parent, export_id) as control_fd:
+            export = self._require_export(export_id)
+            state = ExportState(export["state"])
+            if state not in {ExportState.PUBLISHING, ExportState.PUBLISHED, ExportState.FAILED}:
+                self._run_publication_preflight(Path(export["final_path"]).parent)
+            if state is ExportState.QUEUED:
+                self.builder._run_locked(export_id, control_fd=control_fd)
+            elif state is ExportState.BUILDING:
+                self.builder._resume_locked(export_id, control_fd=control_fd)
+            elif state is ExportState.PUBLISHING:
+                self._reconcile_publishing(export)
+            elif state in {ExportState.PUBLISHED, ExportState.FAILED}:
+                raise ExportError(
+                    "export state is not resumable",
+                    {"error": "export_not_resumable", "state": state.value},
+                )
+            return self._continue(export_id)
+
+    def _run_publication_preflight(self, final_parent: Path) -> None:
+        try:
+            self.publication_preflight(final_parent)
+        except PublicationError as error:
+            raise ExportError(
+                "publication no-clobber capability is unavailable",
+                {"error": error.code},
+            ) from error
+
+    def _require_export(self, export_id: str) -> dict[str, Any]:
+        export = self.database.get_export(export_id=export_id)
+        if export is None:
+            raise ExportError("export not found", {"error": "export_not_found"})
+        return export
+
+    def _source_authority(self, export: Mapping[str, Any]) -> SourceRecord:
+        return self.builder._source_authority(dict(export))
+
+    def _structural_report(
+        self,
+        *,
+        root: Path,
+        source: SourceRecord,
+        export: Mapping[str, Any],
+        episodes: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        arguments: dict[str, Any] = {
+            "staging_path": root,
+            "source": source,
+            "export": export,
+            "export_episodes": episodes,
+        }
+        if self.video_frame_counter is not None:
+            arguments["video_frame_counter"] = self.video_frame_counter
+        return validate_structural_dataset(**arguments)
+
+    def _continue(self, export_id: str) -> dict[str, object]:
+        export = self._require_export(export_id)
+        state = ExportState(export["state"])
+        if state is ExportState.PUBLISHED:
+            return self._result(export)
+        if state is ExportState.PUBLISHING:
+            self._reconcile_publishing(export)
+            export = self._require_export(export_id)
+            state = ExportState(export["state"])
+            if state is ExportState.PUBLISHED:
+                return self._result(export)
+        source = self._source_authority(export)
+        episodes = self.database.list_export_episodes(export_id=export_id)
+        staging = Path(export["staging_path"])
+        if state is not ExportState.BUILDING:
+            try:
+                self._verify_recorded_gate_artifacts(export, staging, state)
+            except Exception as error:
+                self._terminal_gate_failure(export, "export_artifact_reconciliation_conflict", error)
+
+        if state is ExportState.BUILDING:
+            try:
+                report = self._structural_report(root=staging, source=source, export=export, episodes=episodes)
+                persist_structural_report(
+                    workspace=self.workspace,
+                    export_id=export_id,
+                    staging_path=staging,
+                    report=report,
+                )
+                self._advance_with_report(
+                    export=export,
+                    expected=ExportState.BUILDING,
+                    target=ExportState.CORE_STRUCTURAL_VALIDATED,
+                    kind="structural_report",
+                    filename="structural-report.json",
+                )
+            except ArtifactInstallConflict as error:
+                self._terminal_gate_failure(export, "export_artifact_reconciliation_conflict", error)
+            except Exception as error:
+                self._terminal_gate_failure(export, "export_structural_validation_failed", error)
+            state = ExportState.CORE_STRUCTURAL_VALIDATED
+            export = self._require_export(export_id)
+
+        if state is ExportState.CORE_STRUCTURAL_VALIDATED:
+            adopted = self._artifact_operation(
+                export,
+                lambda: self._adopt_orphan_validation_report(
+                    export=export,
+                    staging=staging,
+                    filename="gr00t-stats-report.json",
+                    kind="gr00t_stats_report",
+                    expected_state=ExportState.CORE_STRUCTURAL_VALIDATED,
+                    target_state=ExportState.GROOT_STATS_VALIDATED,
+                    validator=lambda report: validate_gr00t_stats_report(
+                        report, staging_path=staging, isaac_root=self.isaac_root
+                    ),
+                ),
+            )
+            if not adopted:
+                report = self.stats_validator(
+                    staging_path=staging,
+                    isaac_root=self.isaac_root,
+                    runner=self.stats_runner,
+                    repository_probe=self.repository_probe,
+                )
+                try:
+                    validate_gr00t_stats_report(report, staging_path=staging, isaac_root=self.isaac_root)
+                except Exception as error:
+                    self._persist_failed_report(export_id, "gr00t-stats-report.json", report)
+                    self._terminal_gate_failure(export, "export_gr00t_stats_failed", error)
+                self._artifact_operation(
+                    export,
+                    lambda: persist_validation_report(
+                        workspace=self.workspace,
+                        export_id=export_id,
+                        staging_path=staging,
+                        filename="gr00t-stats-report.json",
+                        kind="gr00t_stats_report",
+                        report=report,
+                    ),
+                )
+                self._advance_with_report(
+                    export=export,
+                    expected=ExportState.CORE_STRUCTURAL_VALIDATED,
+                    target=ExportState.GROOT_STATS_VALIDATED,
+                    kind="gr00t_stats_report",
+                    filename="gr00t-stats-report.json",
+                )
+            state = ExportState.GROOT_STATS_VALIDATED
+            export = self._require_export(export_id)
+
+        if state is ExportState.GROOT_STATS_VALIDATED:
+            self._artifact_operation(
+                export,
+                lambda: self._verify_recorded_gate_artifacts(export, staging, state),
+            )
+            adopted = self._artifact_operation(
+                export,
+                lambda: self._adopt_orphan_validation_report(
+                    export=export,
+                    staging=staging,
+                    filename="gr00t-loader-report.json",
+                    kind="gr00t_loader_report",
+                    expected_state=ExportState.GROOT_STATS_VALIDATED,
+                    target_state=ExportState.GROOT_LOADER_VALIDATED,
+                    validator=lambda report: validate_gr00t_loader_outer_report(
+                        report, staging_path=staging, isaac_root=self.isaac_root
+                    ),
+                ),
+            )
+            if not adopted:
+                report = self.loader_validator(
+                    staging_path=staging,
+                    isaac_root=self.isaac_root,
+                    runner=self.loader_runner,
+                    repository_probe=self.repository_probe,
+                )
+                try:
+                    validate_gr00t_loader_outer_report(report, staging_path=staging, isaac_root=self.isaac_root)
+                except Exception as error:
+                    self._persist_failed_report(export_id, "gr00t-loader-report.json", report)
+                    self._terminal_gate_failure(export, "export_gr00t_loader_failed", error)
+                self._artifact_operation(
+                    export,
+                    lambda: persist_validation_report(
+                        workspace=self.workspace,
+                        export_id=export_id,
+                        staging_path=staging,
+                        filename="gr00t-loader-report.json",
+                        kind="gr00t_loader_report",
+                        report=report,
+                    ),
+                )
+                self._advance_with_report(
+                    export=export,
+                    expected=ExportState.GROOT_STATS_VALIDATED,
+                    target=ExportState.GROOT_LOADER_VALIDATED,
+                    kind="gr00t_loader_report",
+                    filename="gr00t-loader-report.json",
+                )
+            state = ExportState.GROOT_LOADER_VALIDATED
+            export = self._require_export(export_id)
+
+        if state is ExportState.GROOT_LOADER_VALIDATED:
+            self._artifact_operation(
+                export,
+                lambda: self._verify_recorded_gate_artifacts(export, staging, state),
+            )
+            artifacts = self._validation_artifacts(staging)
+            artifacts.extend(
+                self._artifact_operation(
+                    export,
+                    lambda: self._copy_selected_contact_sheets(export, episodes, staging),
+                )
+            )
+            provenance = self._provenance_document(
+                export=export,
+                source=source,
+                episodes=episodes,
+                artifacts=artifacts,
+                staging=staging,
+            )
+            self._artifact_operation(export, lambda: write_provenance(staging, provenance))
+            self.database.set_export_state(
+                export_id=export_id,
+                expected_state=ExportState.GROOT_LOADER_VALIDATED,
+                state=ExportState.PROVENANCE_WRITTEN,
+            )
+            state = ExportState.PROVENANCE_WRITTEN
+            export = self._require_export(export_id)
+
+        if state is ExportState.PROVENANCE_WRITTEN:
+            self._artifact_operation(
+                export,
+                lambda: self._verify_recorded_gate_artifacts(export, staging, state),
+            )
+            artifacts = self._validation_artifacts(staging)
+            artifacts.extend(
+                self._artifact_operation(
+                    export,
+                    lambda: self._copy_selected_contact_sheets(export, episodes, staging),
+                )
+            )
+            expected_provenance = self._provenance_document(
+                export=export,
+                source=source,
+                episodes=episodes,
+                artifacts=artifacts,
+                staging=staging,
+            )
+            self._artifact_operation(export, lambda: write_provenance(staging, expected_provenance))
+            self._artifact_operation(export, lambda: write_checksum_manifest(staging))
+            seal_staging_tree(staging)
+            provenance = _read_json(staging / "meta/curation_provenance.json")
+            expectations = self._final_expectations(
+                export=export,
+                source=source,
+                episodes=episodes,
+                staging=staging,
+            )
+            try:
+                final_report = validate_final_consistency(
+                    staging_path=staging,
+                    provenance=provenance,
+                    source_roots=[source.root],
+                    stats_report_validator=lambda root: self._verify_recorded_gate_artifacts(
+                        export, root, ExportState.PROVENANCE_WRITTEN
+                    ),
+                    structural_validator=lambda: self._structural_report(
+                        root=staging,
+                        source=source,
+                        export=export,
+                        episodes=episodes,
+                    ),
+                    expectations=expectations,
+                )
+            except Exception as error:
+                self._terminal_gate_failure(export, "export_final_consistency_failed", error)
+            report_path = self.workspace / "exports" / export_id / "final-consistency-report.json"
+            self._artifact_operation(
+                export,
+                lambda: _write_new_file(
+                    report_path,
+                    (canonical_json(final_report) + "\n").encode("utf-8"),
+                    mode=0o600,
+                ),
+            )
+            self._advance_with_report(
+                export=export,
+                expected=ExportState.PROVENANCE_WRITTEN,
+                target=ExportState.FINAL_CONSISTENCY_VALIDATED,
+                kind="final_consistency_report",
+                filename="final-consistency-report.json",
+            )
+            state = ExportState.FINAL_CONSISTENCY_VALIDATED
+            export = self._require_export(export_id)
+
+        if state is ExportState.FINAL_CONSISTENCY_VALIDATED:
+            try:
+                recorded_final_report = self._artifact_operation(
+                    export,
+                    lambda: self._verify_recorded_gate_artifacts(export, staging, state),
+                )
+                identity = pin_publication_source(staging, Path(export["final_path"]))
+                verify_publication_identity(staging, identity)
+                provenance = _read_json(staging / "meta/curation_provenance.json")
+                repeated_final_report = validate_final_consistency(
+                    staging_path=staging,
+                    provenance=provenance,
+                    source_roots=[source.root],
+                    stats_report_validator=lambda root: self._verify_recorded_gate_artifacts(
+                        export, root, ExportState.FINAL_CONSISTENCY_VALIDATED
+                    ),
+                    structural_validator=lambda: self._structural_report(
+                        root=staging,
+                        source=source,
+                        export=export,
+                        episodes=episodes,
+                    ),
+                    expectations=self._final_expectations(
+                        export=export,
+                        source=source,
+                        episodes=episodes,
+                        staging=staging,
+                    ),
+                )
+                if repeated_final_report != recorded_final_report:
+                    raise FinalConsistencyError(
+                        "repeated final-consistency result differs from its recorded report"
+                    )
+                verify_publication_identity(staging, identity)
+                self._artifact_operation(
+                    export,
+                    lambda: _write_new_file(
+                        self._publication_identity_path(export_id),
+                        (canonical_json(identity.to_dict()) + "\n").encode("utf-8"),
+                        mode=0o600,
+                    ),
+                )
+            except PublicationError as error:
+                self.database.record_export_failure(
+                    export_id=export_id,
+                    expected_state=ExportState.FINAL_CONSISTENCY_VALIDATED,
+                    failure_summary=error.code,
+                    terminal=True,
+                )
+                raise ExportError("publication identity changed", {"error": error.code}) from error
+            except FinalConsistencyError as error:
+                self._terminal_gate_failure(export, "export_final_consistency_failed", error)
+            self.database.set_export_state(
+                export_id=export_id,
+                expected_state=ExportState.FINAL_CONSISTENCY_VALIDATED,
+                state=ExportState.PUBLISHING,
+            )
+            try:
+                publish_no_clobber(
+                    staging,
+                    Path(export["final_path"]),
+                    expected_identity=identity,
+                    parent_fsync=self.parent_fsync,
+                    commit_published=lambda: self.database.set_export_state(
+                        export_id=export_id,
+                        expected_state=ExportState.PUBLISHING,
+                        state=ExportState.PUBLISHED,
+                    ),
+                )
+            except PublicationError as error:
+                retryable = error.code == "publish_parent_fsync_failed"
+                self.database.record_export_failure(
+                    export_id=export_id,
+                    expected_state=ExportState.PUBLISHING,
+                    failure_summary=error.code,
+                    terminal=not retryable,
+                )
+                raise ExportError("publication failed", {"error": error.code}) from error
+        return self._result(self._require_export(export_id))
+
+    def _adopt_orphan_validation_report(
+        self,
+        *,
+        export: Mapping[str, Any],
+        staging: Path,
+        filename: str,
+        kind: str,
+        expected_state: ExportState,
+        target_state: ExportState,
+        validator: Callable[[Mapping[str, Any]], None],
+    ) -> bool:
+        workspace_path = self.workspace / "exports" / str(export["id"]) / filename
+        staged_path = staging / "meta/curation_artifacts" / filename
+        workspace_final, workspace_temporary = canonical_file_presence(workspace_path)
+        staged_final, staged_temporary = canonical_file_presence(staged_path)
+        if not workspace_final:
+            if workspace_temporary or staged_final or staged_temporary:
+                raise ArtifactInstallConflict(f"orphan {filename} lacks its canonical workspace final")
+            return False
+        contents = read_canonical_file(workspace_path)
+        try:
+            document = json.loads(contents)
+            if not isinstance(document, dict) or contents != (canonical_json(document) + "\n").encode("utf-8"):
+                raise ValueError("report bytes are not canonical JSON")
+            validator(document)
+        except Exception as error:
+            raise ArtifactInstallConflict(f"orphan {filename} is invalid") from error
+        install_canonical_file(workspace_path, contents, mode=0o600)
+        install_canonical_file(staged_path, contents)
+        self._advance_with_report(
+            export=export,
+            expected=expected_state,
+            target=target_state,
+            kind=kind,
+            filename=filename,
+        )
+        return True
+
+    def _advance_with_report(
+        self,
+        *,
+        export: Mapping[str, Any],
+        expected: ExportState,
+        target: ExportState,
+        kind: str,
+        filename: str,
+    ) -> None:
+        path = self.workspace / "exports" / str(export["id"]) / filename
+        self.database.advance_export_with_artifact(
+            export_id=str(export["id"]),
+            expected_state=expected,
+            state=target,
+            kind=kind,
+            relative_path=path.relative_to(self.workspace).as_posix(),
+            media_type="application/json",
+            byte_size=path.stat().st_size,
+            sha256=_hash_file(path),
+        )
+
+    def _verify_recorded_gate_artifacts(
+        self,
+        export: Mapping[str, Any],
+        staging: Path,
+        state: ExportState,
+    ) -> dict[str, Any] | None:
+        contracts = [
+            (
+                ExportState.CORE_STRUCTURAL_VALIDATED,
+                "structural_artifact_id",
+                "structural_report",
+                "structural-report.json",
+                True,
+            ),
+            (
+                ExportState.GROOT_STATS_VALIDATED,
+                "gr00t_stats_artifact_id",
+                "gr00t_stats_report",
+                "gr00t-stats-report.json",
+                True,
+            ),
+            (
+                ExportState.GROOT_LOADER_VALIDATED,
+                "gr00t_loader_artifact_id",
+                "gr00t_loader_report",
+                "gr00t-loader-report.json",
+                True,
+            ),
+            (
+                ExportState.FINAL_CONSISTENCY_VALIDATED,
+                "final_consistency_artifact_id",
+                "final_consistency_report",
+                "final-consistency-report.json",
+                False,
+            ),
+        ]
+        order = list(ExportState)
+        recorded_final_report: dict[str, Any] | None = None
+        for minimum_state, pointer, kind, filename, has_staged_copy in contracts:
+            if order.index(state) < order.index(minimum_state):
+                continue
+            artifact_id = export.get(pointer)
+            if not isinstance(artifact_id, str):
+                raise ArtifactInstallConflict(f"missing database artifact pointer: {pointer}")
+            with self.database.open_connection() as connection:
+                row = connection.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+            if row is None:
+                raise ArtifactInstallConflict(f"missing database artifact row: {pointer}")
+            artifact = dict(row)
+            workspace_path = self.workspace / "exports" / str(export["id"]) / filename
+            expected_relative = workspace_path.relative_to(self.workspace).as_posix()
+            workspace_contents = read_canonical_file(workspace_path)
+            if (
+                artifact["export_id"] != export["id"]
+                or artifact["kind"] != kind
+                or artifact["relative_path"] != expected_relative
+                or artifact["media_type"] != "application/json"
+                or artifact["byte_size"] != len(workspace_contents)
+                or artifact["sha256"] != hashlib.sha256(workspace_contents).hexdigest()
+            ):
+                raise ArtifactInstallConflict(f"database artifact evidence disagrees: {filename}")
+            if has_staged_copy:
+                staged_path = staging / "meta/curation_artifacts" / filename
+                staged_contents = read_canonical_file(staged_path)
+                if staged_contents != workspace_contents:
+                    raise ArtifactInstallConflict(f"staged artifact evidence disagrees: {filename}")
+            if filename == "gr00t-stats-report.json":
+                try:
+                    document = json.loads(workspace_contents)
+                    if not isinstance(document, dict) or workspace_contents != (
+                        canonical_json(document) + "\n"
+                    ).encode("utf-8"):
+                        raise ValueError("stats report copies are not exact canonical JSON")
+                    validate_gr00t_stats_report(
+                        document,
+                        staging_path=staging,
+                        isaac_root=self.isaac_root,
+                        command_staging_path=Path(str(export["staging_path"])),
+                    )
+                except Exception as error:
+                    raise ArtifactInstallConflict("recorded GR00T stats report or outputs disagree") from error
+            elif filename == "final-consistency-report.json":
+                try:
+                    document = json.loads(workspace_contents)
+                    if not isinstance(document, dict) or workspace_contents != (
+                        canonical_json(document) + "\n"
+                    ).encode("utf-8"):
+                        raise ValueError("final report is not exact canonical JSON")
+                    recorded_final_report = document
+                except Exception as error:
+                    raise ArtifactInstallConflict("recorded final-consistency report is invalid") from error
+        return recorded_final_report
+
+    def _persist_failed_report(self, export_id: str, filename: str, report: Mapping[str, Any]) -> None:
+        path = self.workspace / "exports" / export_id / filename
+        try:
+            _write_new_file(path, (canonical_json(dict(report)) + "\n").encode("utf-8"), mode=0o600)
+        except ArtifactInstallConflict as error:
+            self._terminal_gate_failure(
+                self._require_export(export_id), "export_artifact_reconciliation_conflict", error
+            )
+
+    def _artifact_operation(
+        self,
+        export: Mapping[str, Any],
+        operation: Callable[[], Any],
+    ) -> Any:
+        try:
+            return operation()
+        except ArtifactInstallConflict as error:
+            self._terminal_gate_failure(export, "export_artifact_reconciliation_conflict", error)
+
+    def _terminal_gate_failure(
+        self,
+        export: Mapping[str, Any],
+        code: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        state = ExportState(export["state"])
+        self.database.record_export_failure(
+            export_id=str(export["id"]),
+            expected_state=state,
+            failure_summary=code,
+            terminal=True,
+        )
+        failure = ExportError("export validation failed", {"error": code})
+        if cause is None:
+            raise failure
+        raise failure from cause
+
+    def _validation_artifacts(self, staging: Path) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        for filename, kind in (
+            ("structural-report.json", "structural_report"),
+            ("gr00t-stats-report.json", "gr00t_stats_report"),
+            ("gr00t-loader-report.json", "gr00t_loader_report"),
+        ):
+            path = staging / "meta/curation_artifacts" / filename
+            descriptor = _artifact_descriptor(path, root=staging, kind=kind)
+            artifacts.append(descriptor)
+        return artifacts
+
+    def _authoritative_provenance_artifacts(
+        self,
+        export: Mapping[str, Any],
+        episodes: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        contracts = (
+            ("structural_artifact_id", "structural_report", "structural-report.json"),
+            ("gr00t_stats_artifact_id", "gr00t_stats_report", "gr00t-stats-report.json"),
+            ("gr00t_loader_artifact_id", "gr00t_loader_report", "gr00t-loader-report.json"),
+        )
+        with self.database.open_connection() as connection:
+            for pointer, kind, filename in contracts:
+                artifact_id = export.get(pointer)
+                row = (
+                    None
+                    if not isinstance(artifact_id, str)
+                    else connection.execute("SELECT * FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
+                )
+                if row is None:
+                    raise ArtifactInstallConflict(f"authoritative artifact pointer is missing: {pointer}")
+                evidence = dict(row)
+                workspace_path = self.workspace / "exports" / str(export["id"]) / filename
+                contents = read_canonical_file(workspace_path)
+                digest = hashlib.sha256(contents).hexdigest()
+                expected_relative = workspace_path.relative_to(self.workspace).as_posix()
+                if (
+                    evidence["export_id"] != export["id"]
+                    or evidence["kind"] != kind
+                    or evidence["relative_path"] != expected_relative
+                    or evidence["media_type"] != "application/json"
+                    or evidence["byte_size"] != len(contents)
+                    or evidence["sha256"] != digest
+                ):
+                    raise ArtifactInstallConflict(f"authoritative database artifact disagrees: {filename}")
+                artifacts.append(
+                    {
+                        "bytes": len(contents),
+                        "kind": kind,
+                        "media_type": "application/json",
+                        "path": f"meta/curation_artifacts/{filename}",
+                        "sha256": digest,
+                    }
+                )
+        for source_path, kind, filename in self._selected_contact_sheet_sources(export, episodes):
+            result = source_path.stat(follow_symlinks=False)
+            artifacts.append(
+                {
+                    "bytes": result.st_size,
+                    "kind": kind,
+                    "media_type": "image/png",
+                    "path": f"meta/curation_artifacts/contact_sheets/{filename}",
+                    "sha256": _hash_file(source_path),
+                }
+            )
+        artifacts.sort(key=lambda item: item["path"].encode("utf-8"))
+        if len({item["path"] for item in artifacts}) != len(artifacts):
+            raise ArtifactInstallConflict("authoritative provenance artifact paths are duplicated")
+        return artifacts
+
+    def _copy_selected_contact_sheets(
+        self,
+        export: Mapping[str, Any],
+        episodes: Sequence[Mapping[str, Any]],
+        staging: Path,
+    ) -> list[dict[str, Any]]:
+        selected = self._selected_contact_sheet_sources(export, episodes)
+        artifacts: list[dict[str, Any]] = []
+        for source_path, kind, filename in selected:
+            destination = staging / "meta/curation_artifacts/contact_sheets" / filename
+            _copy_independent_regular_file(source_path, destination)
+            descriptor = _artifact_descriptor(destination, root=staging, kind=kind, media_type="image/png")
+            artifacts.append(descriptor)
+        return artifacts
+
+    def _selected_contact_sheet_sources(
+        self,
+        export: Mapping[str, Any],
+        episodes: Sequence[Mapping[str, Any]],
+    ) -> list[tuple[Path, str, str]]:
+        from .contact_sheets import (
+            ContactSheetDatasetIdentity,
+            final_contact_sheet_path,
+            proposal_contact_sheet_path,
+        )
+
+        identity = ContactSheetDatasetIdentity(
+            dataset_id=int(export["dataset_id"]),
+            dataset_alias=str(export["dataset_alias"]),
+            source_manifest_sha256=str(export["source_manifest_sha256"]),
+        )
+        selected: list[tuple[Path, str, str]] = []
+        with self.database.open_connection() as connection:
+            for row in episodes:
+                if row["review_state"] != ReviewState.APPROVED_KEEP.value:
+                    continue
+                final_relative = final_contact_sheet_path(
+                    identity, row["source_episode_index"], row["approval_revision"]
+                )
+                selected.append(
+                    (self.workspace / final_relative, "final_contact_sheet", Path(final_relative).name)
+                )
+                audit = connection.execute(
+                    """
+                    SELECT details_json FROM audit_events
+                    WHERE dataset_id=? AND operation='keep_approved'
+                        AND new_revision=?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (export["dataset_id"], row["revision"]),
+                ).fetchall()
+                for event in audit:
+                    details = json.loads(event["details_json"])
+                    evidence = details.get("contact_sheet_evidence")
+                    if (
+                        isinstance(evidence, dict)
+                        and evidence.get("source_episode_index") == row["source_episode_index"]
+                    ):
+                        proposal_id = evidence.get("proposal_id")
+                        if proposal_id is not None:
+                            proposal_relative = proposal_contact_sheet_path(identity, proposal_id)
+                            selected.append(
+                                (
+                                    self.workspace / proposal_relative,
+                                    "proposal_contact_sheet",
+                                    Path(proposal_relative).name,
+                                )
+                            )
+                        break
+        if not self.require_contact_sheets:
+            selected = [item for item in selected if item[0].is_file() and not item[0].is_symlink()]
+        for source_path, kind, filename in selected:
+            if not source_path.is_file() or source_path.is_symlink():
+                raise ExportError("contact-sheet evidence is missing", {"error": "export_contact_sheet_missing"})
+        return selected
+
+    def _provenance_document(
+        self,
+        *,
+        export: Mapping[str, Any],
+        source: SourceRecord,
+        episodes: Sequence[Mapping[str, Any]],
+        artifacts: Sequence[Mapping[str, Any]],
+        staging: Path,
+    ) -> dict[str, Any]:
+        kept_rows = [row for row in episodes if row["review_state"] == ReviewState.APPROVED_KEEP.value]
+        rejected_rows = [row for row in episodes if row["review_state"] == ReviewState.APPROVED_REJECT.value]
+        stable = build_stable_tasks(
+            [
+                expand_prompts(
+                    object_name=row["object_name"],
+                    hand=row["pickup_hand"],
+                    turn=row["turn_direction"],
+                )
+                for row in kept_rows
+            ]
+        )
+        cosmos = self._cosmos_provenance(export, kept_rows)
+        stats_report = _read_json(staging / "meta/curation_artifacts/gr00t-stats-report.json")
+        repositories = [
+            self.repository_probe(self.visualizer_root, "lerobot-dataset-visualizer"),
+            stats_report["repository"],
+        ]
+        template_lines = PROMPT_TEMPLATE_BYTES.decode("utf-8").splitlines()[1:]
+        original_tasks = _read_jsonl(source.root / "meta/tasks.jsonl")
+        return build_curation_provenance(
+            source={
+                "dataset_alias": source.alias,
+                "manifest_sha256": source.fingerprint,
+                "file_count": len(source.file_hashes),
+                "original_tasks": original_tasks,
+            },
+            approval={
+                "snapshot_sha256": export["approval_snapshot_sha256"],
+                "prompt_template_version": export["prompt_template_version"],
+                "prompt_template_sha256": export["prompt_template_sha256"],
+                "templates": [
+                    {"step": step, "template": template} for step, template in enumerate(template_lines, start=1)
+                ],
+            },
+            software={"exporter_version": "pnp-trash-curation-v1", "repositories": repositories},
+            cosmos=cosmos,
+            export={
+                "export_id": export["id"],
+                "created_at_utc": export["created_at"],
+                "source_to_output": [
+                    {"source_episode_index": row["source_episode_index"], "output_episode_index": index}
+                    for index, row in enumerate(kept_rows)
+                ],
+            },
+            episodes={
+                "kept": [
+                    {
+                        "source_episode_index": row["source_episode_index"],
+                        "output_episode_index": index,
+                        "object": row["object_name"],
+                        "hand": row["pickup_hand"],
+                        "turn": row["turn_direction"],
+                        "transition_frames": [row[f"step_{step}_start_frame"] for step in range(2, 8)],
+                        "reviewer": row["reviewer"],
+                        "revision": row["revision"],
+                        "approved_at": row["approved_at"],
+                    }
+                    for index, row in enumerate(kept_rows)
+                ],
+                "rejected": [
+                    {
+                        "source_episode_index": row["source_episode_index"],
+                        "reason": row["rejection_reason"],
+                        "reviewer": row["reviewer"],
+                        "revision": row["revision"],
+                        "approved_at": row["approved_at"],
+                    }
+                    for row in rejected_rows
+                ],
+            },
+            tasks=[
+                {"task_index": task.task_index, "ordering_step": task.ordering_step, "prompt": task.prompt}
+                for task in stable
+            ],
+            artifacts=artifacts,
+        )
+
+    def _final_expectations(
+        self,
+        *,
+        export: Mapping[str, Any],
+        source: SourceRecord,
+        episodes: Sequence[Mapping[str, Any]],
+        staging: Path,
+    ) -> dict[str, Any]:
+        kept_rows = [row for row in episodes if row["review_state"] == ReviewState.APPROVED_KEEP.value]
+        rejected_rows = [row for row in episodes if row["review_state"] == ReviewState.APPROVED_REJECT.value]
+        stable = build_stable_tasks(
+            [
+                expand_prompts(
+                    object_name=row["object_name"],
+                    hand=row["pickup_hand"],
+                    turn=row["turn_direction"],
+                )
+                for row in kept_rows
+            ]
+        )
+        template_lines = PROMPT_TEMPLATE_BYTES.decode("utf-8").splitlines()[1:]
+        return {
+            "approval_snapshot_sha256": export["approval_snapshot_sha256"],
+            "source_manifest_sha256": source.fingerprint,
+            "prompt_template_version": export["prompt_template_version"],
+            "prompt_template_sha256": export["prompt_template_sha256"],
+            "templates": [
+                {"step": step, "template": template} for step, template in enumerate(template_lines, start=1)
+            ],
+            "source_to_output": [
+                {"source_episode_index": row["source_episode_index"], "output_episode_index": index}
+                for index, row in enumerate(kept_rows)
+            ],
+            "episodes": {
+                "kept": [
+                    {
+                        "source_episode_index": row["source_episode_index"],
+                        "output_episode_index": index,
+                        "object": row["object_name"],
+                        "hand": row["pickup_hand"],
+                        "turn": row["turn_direction"],
+                        "transition_frames": [row[f"step_{step}_start_frame"] for step in range(2, 8)],
+                        "reviewer": row["reviewer"],
+                        "revision": row["revision"],
+                        "approved_at": row["approved_at"],
+                    }
+                    for index, row in enumerate(kept_rows)
+                ],
+                "rejected": [
+                    {
+                        "source_episode_index": row["source_episode_index"],
+                        "reason": row["rejection_reason"],
+                        "reviewer": row["reviewer"],
+                        "revision": row["revision"],
+                        "approved_at": row["approved_at"],
+                    }
+                    for row in rejected_rows
+                ],
+            },
+            "tasks": [
+                {"task_index": task.task_index, "ordering_step": task.ordering_step, "prompt": task.prompt}
+                for task in stable
+            ],
+            "structural_report_sha256": _hash_file(staging / "meta/curation_artifacts/structural-report.json"),
+            "artifacts": self._authoritative_provenance_artifacts(export, episodes),
+        }
+
+    def _publication_identity_path(self, export_id: str) -> Path:
+        return self.workspace / "exports" / export_id / "publication-identity.json"
+
+    def _cosmos_provenance(
+        self, export: Mapping[str, Any], kept_rows: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        proposal_ids: set[str] = set()
+        with self.database.open_connection() as connection:
+            for row in kept_rows:
+                events = connection.execute(
+                    """
+                    SELECT details_json FROM audit_events
+                    WHERE dataset_id=? AND operation='keep_approved' AND new_revision=?
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    (export["dataset_id"], row["revision"]),
+                ).fetchall()
+                for event in events:
+                    details = json.loads(event["details_json"])
+                    evidence = details.get("contact_sheet_evidence")
+                    if (
+                        isinstance(evidence, dict)
+                        and evidence.get("source_episode_index") == row["source_episode_index"]
+                    ):
+                        if isinstance(evidence.get("proposal_id"), str):
+                            proposal_ids.add(evidence["proposal_id"])
+                        break
+            attempt_rows: list[Mapping[str, Any]] = []
+            for proposal_id in sorted(proposal_ids):
+                row = connection.execute(
+                    """
+                    SELECT attempt.id AS attempt_id, attempt.job_id
+                    FROM cosmos_proposals AS proposal
+                    JOIN cosmos_attempts AS attempt ON attempt.id=proposal.attempt_id
+                    WHERE proposal.id=?
+                    """,
+                    (proposal_id,),
+                ).fetchone()
+                if row is None:
+                    raise ExportError("proposal provenance is missing", {"error": "export_provenance_invalid"})
+                attempt_rows.append(dict(row))
+            attempt_ids = sorted({row["attempt_id"] for row in attempt_rows})
+            job_ids = sorted({row["job_id"] for row in attempt_rows})
+            workspace_artifacts: list[dict[str, Any]] = []
+            for attempt_id in attempt_ids:
+                for artifact in connection.execute(
+                    "SELECT id, sha256 FROM artifacts WHERE attempt_id=? ORDER BY id", (attempt_id,)
+                ):
+                    workspace_artifacts.append({"artifact_id": artifact["id"], "sha256": artifact["sha256"]})
+        return {
+            "model": self.cosmos_model,
+            "endpoint_identity": self.cosmos_endpoint_identity,
+            "contract_version": CONTRACT_VERSION,
+            "sampling": {
+                "target_fps": TARGET_SAMPLING_FPS,
+                "resize_max_long_edge": RESIZE_MAX_LONG_EDGE,
+                "jpeg_quality": JPEG_QUALITY,
+            },
+            "limits": {
+                "max_duration_s": MAX_DURATION_SECONDS,
+                "max_frames": MAX_SAMPLED_FRAMES,
+                "max_payload_bytes": MAX_PAYLOAD_BYTES,
+            },
+            "job_ids": job_ids,
+            "attempt_ids": attempt_ids,
+            "workspace_artifacts": sorted(workspace_artifacts, key=lambda row: row["artifact_id"]),
+        }
+
+    def _reconcile_publishing(self, export: Mapping[str, Any]) -> None:
+        source = self._source_authority(export)
+        episodes = self.database.list_export_episodes(export_id=export["id"])
+        try:
+            identity = PublicationIdentity.from_dict(
+                _read_json(self._publication_identity_path(str(export["id"])))
+            )
+        except Exception as error:
+            self.database.record_export_failure(
+                export_id=export["id"],
+                expected_state=ExportState.PUBLISHING,
+                failure_summary="publish_identity_invalid",
+                terminal=True,
+            )
+            raise ExportError(
+                "publication identity requires operator inspection",
+                {"error": "publish_identity_invalid"},
+            ) from error
+
+        def final_gate(path: Path) -> None:
+            recorded_final_report = self._verify_recorded_gate_artifacts(
+                export,
+                path,
+                ExportState.PUBLISHING,
+            )
+            provenance = _read_json(path / "meta/curation_provenance.json")
+            repeated_final_report = validate_final_consistency(
+                staging_path=path,
+                provenance=provenance,
+                source_roots=[source.root],
+                stats_report_validator=lambda root: self._verify_recorded_gate_artifacts(
+                    export, root, ExportState.PUBLISHING
+                ),
+                structural_validator=lambda: self._structural_report(
+                    root=path, source=source, export=export, episodes=episodes
+                ),
+                expectations=self._final_expectations(
+                    export=export,
+                    source=source,
+                    episodes=episodes,
+                    staging=path,
+                ),
+            )
+            if repeated_final_report != recorded_final_report:
+                raise FinalConsistencyError("reconciled final-consistency result differs from its recorded report")
+
+        try:
+            result = reconcile_publication_paths(
+                Path(export["staging_path"]),
+                Path(export["final_path"]),
+                final_gate=final_gate,
+                parent_fsync=self.parent_fsync,
+                commit_published=lambda: self.database.set_export_state(
+                    export_id=export["id"],
+                    expected_state=ExportState.PUBLISHING,
+                    state=ExportState.PUBLISHED,
+                ),
+                return_to_validated=lambda: self.database.set_export_state(
+                    export_id=export["id"],
+                    expected_state=ExportState.PUBLISHING,
+                    state=ExportState.FINAL_CONSISTENCY_VALIDATED,
+                ),
+                fail_operator=lambda code: self.database.record_export_failure(
+                    export_id=export["id"],
+                    expected_state=ExportState.PUBLISHING,
+                    failure_summary=code,
+                    terminal=True,
+                ),
+                expected_identity=identity,
+            )
+        except (ArtifactInstallConflict, FinalConsistencyError) as error:
+            code = "publish_artifact_reconciliation_conflict"
+            self.database.record_export_failure(
+                export_id=export["id"],
+                expected_state=ExportState.PUBLISHING,
+                failure_summary=code,
+                terminal=True,
+            )
+            raise ExportError("publication reconciliation failed", {"error": code}) from error
+        except PublicationError as error:
+            if error.code == "publish_parent_fsync_failed":
+                self.database.record_export_failure(
+                    export_id=export["id"],
+                    expected_state=ExportState.PUBLISHING,
+                    failure_summary=error.code,
+                    terminal=False,
+                )
+            else:
+                self.database.record_export_failure(
+                    export_id=export["id"],
+                    expected_state=ExportState.PUBLISHING,
+                    failure_summary=error.code,
+                    terminal=True,
+                )
+            raise ExportError("publication reconciliation failed", {"error": error.code}) from error
+        if result == "failed":
+            raise ExportError(
+                "publication paths require operator inspection", {"error": "publish_reconciliation_failed"}
+            )
+
+    @staticmethod
+    def _result(export: Mapping[str, Any]) -> dict[str, object]:
+        return {
+            "approval_snapshot_sha256": export["approval_snapshot_sha256"],
+            "export_id": export["id"],
+            "final_path": export["final_path"],
+            "state": export["state"],
+        }
+
+
+def _copy_independent_regular_file(source: Path, destination: Path) -> None:
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("artifact source is not a regular file")
+        contents = bytearray()
+        offset = 0
+        while chunk := os.pread(source_fd, 1024 * 1024, offset):
+            contents.extend(chunk)
+            offset += len(chunk)
+        after = os.fstat(source_fd)
+        if (source_stat.st_dev, source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ArtifactInstallConflict("contact-sheet source changed while copying")
+    finally:
+        os.close(source_fd)
+    install_canonical_file(destination, bytes(contents))
+    destination_stat = destination.stat(follow_symlinks=False)
+    if (source_stat.st_dev, source_stat.st_ino) == (destination_stat.st_dev, destination_stat.st_ino):
+        raise ValueError("artifact copy is a hardlink")
+
+
 @dataclass(frozen=True)
 class StableTask:
     task_index: int
@@ -786,6 +1956,8 @@ _KNOWN_REWRITTEN_METADATA = frozenset(
         "meta/episodes.jsonl",
         "meta/tasks.jsonl",
         "meta/episodes_stats.jsonl",
+        "meta/stats.json",
+        "meta/relative_stats.json",
     }
 )
 _REPLACED_COLUMNS = ("episode_index", "frame_index", "index", "task_index")
@@ -862,41 +2034,46 @@ def _exclusive_export_execution(workspace: Path, export_id: str):
     directory_fd = -1
     descriptor = -1
     try:
-        directory_fd = _open_absolute_directory(lock_directory, create=True)
-        descriptor = os.open(
-            "executor.lock",
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=directory_fd,
-        )
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ExportError("export executor lock is not a regular file", {"error": "export_path_invalid"})
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno in {errno.EACCES, errno.EAGAIN}:
-                raise ExportError(
-                    "another executor is already running this export",
-                    {"error": "export_executor_busy", "export_id": export_id},
-                ) from None
+            directory_fd = _open_absolute_directory(lock_directory, create=True)
+            descriptor = os.open(
+                "executor.lock",
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ExportError("export executor lock is not a regular file", {"error": "export_path_invalid"})
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise ExportError(
+                        "another executor is already running this export",
+                        {"error": "export_executor_busy", "export_id": export_id},
+                    ) from None
+                raise
+            os.fsync(directory_fd)
+            directory_stat = os.fstat(directory_fd)
+        except ExportError:
             raise
-        os.fsync(directory_fd)
-        directory_stat = os.fstat(directory_fd)
+        except OSError as error:
+            raise ExportError("export executor lock is unsafe", {"error": "export_path_invalid"}) from error
+
         yield directory_fd
-        current_directory_fd = _open_absolute_directory(lock_directory, create=False)
         try:
-            current_stat = os.fstat(current_directory_fd)
-        finally:
-            os.close(current_directory_fd)
+            current_directory_fd = _open_absolute_directory(lock_directory, create=False)
+            try:
+                current_stat = os.fstat(current_directory_fd)
+            finally:
+                os.close(current_directory_fd)
+        except OSError as error:
+            raise ExportError("export executor lock is unsafe", {"error": "export_path_invalid"}) from error
         if (current_stat.st_dev, current_stat.st_ino) != (
             directory_stat.st_dev,
             directory_stat.st_ino,
         ):
             raise ExportError("export control directory changed", {"error": "export_path_invalid"})
-    except ExportError:
-        raise
-    except OSError as error:
-        raise ExportError("export executor lock is unsafe", {"error": "export_path_invalid"}) from error
     finally:
         if descriptor >= 0:
             os.close(descriptor)

@@ -11,6 +11,7 @@ from curation.db import CurationDatabase, RetryableDatabaseError, StateTransitio
 from curation.exporter import ExportError, ExportService, StagingExporter
 from curation.models import ReviewState
 from curation.prompts import PROMPT_TEMPLATE_SHA256, PROMPT_TEMPLATE_VERSION, expand_prompts
+from curation.publication import PublicationError
 from curation.source import SourceRegistry
 import numpy as np
 import pyarrow as pa
@@ -123,6 +124,8 @@ def _rich_case(
     (source / "meta" / "episodes_stats.jsonl").write_text(
         "".join(json.dumps({"episode_index": index, "stats": {}}) + "\n" for index in range(3))
     )
+    (source / "meta/stats.json").write_text('{"stale":{"mean":[999]}}\n')
+    (source / "meta/relative_stats.json").write_text('{"stale_action":{}}\n')
     modality = {
         "state": {"joint": {"start": 0, "end": 2, "original_key": "observation.state"}},
         "annotation": {"human.task_description": {"original_key": "task_index"}},
@@ -225,6 +228,8 @@ def test_staging_export_preserves_arrow_semantics_and_rewrites_only_four_columns
         "total_frames": 16,
     }
     assert database.get_export(export_id=created["export_id"])["state"] == "building"
+    assert not (staging / "meta/stats.json").exists()
+    assert not (staging / "meta/relative_stats.json").exists()
     assert registry.records["local/pnp_trash"].manifest_path.read_bytes() == manifest_before
     assert {path: _sha256(source / path) for path in source_hashes_before} == source_hashes_before
 
@@ -752,22 +757,50 @@ def test_resume_preserves_staging_when_durable_ownership_receipt_mismatches(tmp_
 
 
 def test_export_cli_freezes_run_and_resume_commands_and_runs_out_of_process_contract(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from curation_export import build_cli_parser, cli_main
+    import curation_export as cli_module
 
-    _, workspace, _, _, service, _ = _rich_case(tmp_path)
+    source, workspace, _, _, service, _ = _rich_case(tmp_path)
     created = service.create("local/pnp_trash")
+    settings = type(
+        "Settings",
+        (),
+        {
+            "workspace": workspace.resolve(),
+            "dataset_aliases": {"local/pnp_trash": source},
+            "isaac_groot_root": tmp_path,
+            "cosmos_model": "cosmos",
+            "cosmos_endpoint_identity": "h100",
+        },
+    )()
+    monkeypatch.setattr(cli_module.CurationSettings, "from_env", classmethod(lambda cls: settings))
+
+    class FakeValidatedExporter:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, export_id: str) -> dict[str, object]:
+            return {
+                "export_id": export_id,
+                "state": "published",
+                "final_path": created["final_path"],
+                "approval_snapshot_sha256": created["approval_snapshot_sha256"],
+            }
+
+        resume = run
+
+    monkeypatch.setattr(cli_module, "ValidatedDatasetExporter", FakeValidatedExporter)
     zero = "00000000-0000-0000-0000-000000000000"
-    parser = build_cli_parser()
+    parser = cli_module.build_cli_parser()
     assert parser.parse_args(["--workspace", str(workspace), "run", "--export-id", zero]).command == "run"
     assert parser.parse_args(["--workspace", str(workspace), "resume", "--export-id", zero]).command == "resume"
 
-    assert cli_main(["--workspace", str(workspace), "run", "--export-id", created["export_id"]]) == 0
+    assert cli_module.cli_main(["--workspace", str(workspace), "run", "--export-id", created["export_id"]]) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["event"] == "export_staging_built"
+    assert output["event"] == "export_published"
     assert output["export_id"] == created["export_id"]
-    assert Path(created["staging_path"]).is_dir()
+    assert output["state"] == "published"
 
 
 def test_export_cli_sanitizes_retryable_database_failure(
@@ -800,10 +833,23 @@ def test_export_cli_sanitizes_lifecycle_conflict(
 ) -> None:
     import curation_export as cli_module
 
-    _, workspace, _, _, service, _ = _rich_case(tmp_path)
+    source, workspace, _, _, service, _ = _rich_case(tmp_path)
     created = service.create("local/pnp_trash")
 
-    def conflict(self: StagingExporter, export_id: str) -> dict[str, object]:
+    settings = type(
+        "Settings",
+        (),
+        {
+            "workspace": workspace.resolve(),
+            "dataset_aliases": {"local/pnp_trash": source},
+            "isaac_groot_root": tmp_path,
+            "cosmos_model": "cosmos",
+            "cosmos_endpoint_identity": "h100",
+        },
+    )()
+    monkeypatch.setattr(cli_module.CurationSettings, "from_env", classmethod(lambda cls: settings))
+
+    def conflict(self: object, export_id: str) -> dict[str, object]:
         raise StateTransitionConflict(
             entity="export",
             identifier=export_id,
@@ -811,13 +857,60 @@ def test_export_cli_sanitizes_lifecycle_conflict(
             current_state="building",
         )
 
-    monkeypatch.setattr(cli_module.StagingExporter, "run", conflict)
+    monkeypatch.setattr(cli_module.ValidatedDatasetExporter, "run", conflict)
 
     assert cli_module.cli_main(["--workspace", str(workspace), "run", "--export-id", created["export_id"]]) == 1
     assert json.loads(capsys.readouterr().out) == {
         "error": "export_state_conflict",
         "export_id": created["export_id"],
     }
+
+
+def test_export_cli_emits_exact_sanitized_json_for_unsupported_publication_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import curation_export as cli_module
+
+    source, workspace, database, _, service, _ = _rich_case(tmp_path)
+    created = service.create("local/pnp_trash")
+    settings = type(
+        "Settings",
+        (),
+        {
+            "workspace": workspace.resolve(),
+            "dataset_aliases": {"local/pnp_trash": source},
+            "isaac_groot_root": tmp_path,
+            "cosmos_model": "cosmos",
+            "cosmos_endpoint_identity": "h100",
+        },
+    )()
+    monkeypatch.setattr(cli_module.CurationSettings, "from_env", classmethod(lambda cls: settings))
+    exporter_type = cli_module.ValidatedDatasetExporter
+
+    def exporter_factory(**kwargs):
+        exporter = exporter_type(**kwargs)
+        exporter.publication_preflight = lambda parent: (_ for _ in ()).throw(
+            PublicationError(
+                "publish_noreplace_unsupported",
+                "secret /srv/private/path authorization=token",
+            )
+        )
+        return exporter
+
+    monkeypatch.setattr(cli_module, "ValidatedDatasetExporter", exporter_factory)
+    exit_code = cli_module.cli_main(["--workspace", str(workspace), "run", "--export-id", created["export_id"]])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert captured.out == (
+        '{"error":"publish_noreplace_unsupported","export_id":"' + created["export_id"] + '"}\n'
+    )
+    assert "secret" not in captured.out
+    assert "/srv/private" not in captured.out
+    assert database.get_export(export_id=created["export_id"])["state"] == "queued"
 
 
 @pytest.mark.parametrize(
