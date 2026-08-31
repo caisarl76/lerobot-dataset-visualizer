@@ -12,7 +12,8 @@
     "src/components/__tests__/task-index-curation-workspace.test.tsx",
     "src/context/__tests__/curation-context.test.tsx",
     "src/utils/__tests__/curationClient.test.ts",
-    "src/utils/__tests__/curationTimeline.test.ts"
+    "src/utils/__tests__/curationTimeline.test.ts",
+    "src/utils/__tests__/episodeViewerTabs.test.ts"
   ],
   "include": ["src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["node_modules", "src/**/__tests__/**"]
