@@ -27,7 +27,10 @@ and inspects the outgoing request:
 ```ts
 test("marks every curation mutation, including bodyless cancellation, but not reads", async () => {
   const mutations: Array<[string, () => Promise<unknown>]> = [
-    ["workspace open", () => openCurationWorkspace("local/pnp_trash", "curator")],
+    [
+      "workspace open",
+      () => openCurationWorkspace("local/pnp_trash", "curator"),
+    ],
     [
       "draft save",
       () =>
@@ -41,8 +44,7 @@ test("marks every curation mutation, including bodyless cancellation, but not re
     ],
     [
       "keep approval",
-      () =>
-        approveEpisodeKeep("local/pnp_trash", 0, 0, "curator", "reviewer"),
+      () => approveEpisodeKeep("local/pnp_trash", 0, 0, "curator", "reviewer"),
     ],
     [
       "reject approval",
@@ -56,10 +58,7 @@ test("marks every curation mutation, including bodyless cancellation, but not re
           "bad grasp",
         ),
     ],
-    [
-      "episode reopen",
-      () => reopenEpisode("local/pnp_trash", 0, 0, "curator"),
-    ],
+    ["episode reopen", () => reopenEpisode("local/pnp_trash", 0, 0, "curator")],
     ["batch start", () => startCurationBatch("local/pnp_trash")],
     [
       "batch retry",
@@ -257,25 +256,33 @@ test("accepts an absent-origin marker fallback for JSON and bodyless mutations",
   ) as typeof fetch;
 
   const draft = await PATCH(
-    request("episodes/7/draft", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ expected_revision: 3 }),
-    }, {
-      origin: null,
-      fetchSite: null,
-      marker: MUTATION_MARKER,
-    }),
+    request(
+      "episodes/7/draft",
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ expected_revision: 3 }),
+      },
+      {
+        origin: null,
+        fetchSite: null,
+        marker: MUTATION_MARKER,
+      },
+    ),
     context("episodes", "7", "draft"),
   );
   const cancel = await POST(
-    request("batches/job-1/cancel", {
-      method: "POST",
-    }, {
-      origin: null,
-      fetchSite: null,
-      marker: MUTATION_MARKER,
-    }),
+    request(
+      "batches/job-1/cancel",
+      {
+        method: "POST",
+      },
+      {
+        origin: null,
+        fetchSite: null,
+        marker: MUTATION_MARKER,
+      },
+    ),
     context("batches", "job-1", "cancel"),
   );
 
@@ -297,9 +304,7 @@ mutation evidence; and all invalid supplied marker forms:
 test("rejects every untrusted browser shape before upstream access", async () => {
   const fetchSpy = mock(async () => Response.json({ unexpected: true }));
   globalThis.fetch = fetchSpy as typeof fetch;
-  const rejected: Array<
-    [string, "GET" | "POST" | "PATCH", BrowserMetadata]
-  > = [
+  const rejected: Array<[string, "GET" | "POST" | "PATCH", BrowserMetadata]> = [
     ["missing Host", "GET", { host: null }],
     ["empty Host", "GET", { host: "" }],
     ["duplicate Host", "GET", { host: `${BROWSER_HOST}, ${BROWSER_HOST}` }],
@@ -340,11 +345,7 @@ test("rejects every untrusted browser shape before upstream access", async () =>
     ["cross-site Fetch-Site", "GET", { fetchSite: "cross-site" }],
     ["none Fetch-Site", "GET", { fetchSite: "none" }],
     ["empty Fetch-Site", "GET", { fetchSite: "" }],
-    [
-      "duplicate Fetch-Site",
-      "GET",
-      { fetchSite: "same-origin, same-origin" },
-    ],
+    ["duplicate Fetch-Site", "GET", { fetchSite: "same-origin, same-origin" }],
     ["empty marker", "GET", { marker: "" }],
     ["wrong marker", "GET", { marker: "cross-origin" }],
     [
@@ -400,10 +401,14 @@ test("ignores forwarded authority when the direct authority is trusted", async (
   globalThis.fetch = fetchSpy as typeof fetch;
 
   const response = await GET(
-    request("summary", {}, {
-      forwardedHost: "attacker.example:3000",
-      forwardedProto: "https",
-    }),
+    request(
+      "summary",
+      {},
+      {
+        forwardedHost: "attacker.example:3000",
+        forwardedProto: "https",
+      },
+    ),
     context("summary"),
   );
 
