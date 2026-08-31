@@ -44,18 +44,20 @@ input behavior can be tested without mounting the full episode viewer.
 - No Task 15 worker, batch, Cosmos proposal, or review action.
 - The `local/pnp_trash` plus `v2.1` dataset predicate remains the sole reason
   the Annotations tab defaults to task-index mode.
-- Existing URLs without `tab` retain their current session-restoration
-  behavior.
+- URLs without `tab` retain legacy session restoration, except that an
+  unavailable persisted `urdf` value is rejected using the existing URDF
+  visibility predicate.
 
 ## Verification
 
 Test-first resolver coverage will prove query precedence, the legacy persisted
 whitelist, default fallback, repeated-query rejection, and eligible/ineligible
-URDF behavior. A separate initialization-path component test will render the
-real episode viewer with controlled dataset metadata, URL, and session storage;
-it must prove the viewer actually uses the resolver and reaches Annotations for
-`?tab=annotations`. That wiring test also covers a repeated query and both
-eligible and ineligible URDF cases.
+URDF behavior for both query and persisted inputs. A separate
+initialization-path component test will render the real episode viewer with
+controlled dataset metadata, URL, and session storage; it must prove the viewer
+actually uses the resolver and reaches Annotations for `?tab=annotations`.
+That wiring test also covers a repeated query and eligible/ineligible URDF
+cases from both authority sources.
 
 After the frontend suite passes, the live Task 14 browser gate must prove that
 the documented URL renders the task-index workspace, seven-phase timeline,
