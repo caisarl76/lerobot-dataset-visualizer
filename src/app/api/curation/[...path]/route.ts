@@ -4,6 +4,10 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const UPSTREAM_TIMEOUT_MS = 120_000;
+const TRUSTED_BROWSER_ORIGIN = "http://127.0.0.1:3000";
+const TRUSTED_BROWSER_HOST = "127.0.0.1:3000";
+const CURATION_REQUEST_HEADER = "x-curation-request";
+const CURATION_REQUEST_VALUE = "same-origin";
 const JSON_CONTENT_TYPE = /^application\/(?:[a-z0-9.+-]*\+)?json(?:\s*;|$)/i;
 const FORBIDDEN_ASSET_SEGMENTS = new Set([
   "asset",
@@ -72,12 +76,24 @@ function isJsonContentType(value: string | null): boolean {
   return value !== null && JSON_CONTENT_TYPE.test(value);
 }
 
-function isSameOriginMutation(request: NextRequest): boolean {
+function isTrustedBrowserRequest(
+  request: NextRequest,
+  method: "GET" | "POST" | "PATCH",
+): boolean {
+  const host = request.headers.get("host");
   const origin = request.headers.get("origin");
   const fetchSite = request.headers.get("sec-fetch-site");
-  if (origin !== null && origin !== request.nextUrl.origin) return false;
+  const marker = request.headers.get(CURATION_REQUEST_HEADER);
+
+  if (host !== TRUSTED_BROWSER_HOST) return false;
+  if (origin !== null && origin !== TRUSTED_BROWSER_ORIGIN) return false;
   if (fetchSite !== null && fetchSite !== "same-origin") return false;
-  return origin === request.nextUrl.origin || fetchSite === "same-origin";
+  if (marker !== null && marker !== CURATION_REQUEST_VALUE) return false;
+  if (method === "GET") return true;
+  return (
+    origin === TRUSTED_BROWSER_ORIGIN ||
+    (origin === null && marker === CURATION_REQUEST_VALUE)
+  );
 }
 
 async function forward(
@@ -85,7 +101,7 @@ async function forward(
   context: RouteContext,
   method: "GET" | "POST" | "PATCH",
 ): Promise<Response> {
-  if (method !== "GET" && !isSameOriginMutation(request)) {
+  if (!isTrustedBrowserRequest(request, method)) {
     return json({ error: "curation_cross_origin_forbidden" }, 403);
   }
 
@@ -167,4 +183,14 @@ export function PATCH(
   context: RouteContext,
 ): Promise<Response> {
   return forward(request, context, "PATCH");
+}
+
+export function OPTIONS(): Response {
+  return new Response(null, {
+    status: 405,
+    headers: {
+      allow: "GET, POST, PATCH",
+      "cache-control": "no-store",
+    },
+  });
 }

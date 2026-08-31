@@ -8,10 +8,13 @@ import {
 } from "bun:test";
 import { NextRequest } from "next/server";
 
-import { GET, PATCH, POST, dynamic, runtime } from "../route";
+import { GET, OPTIONS, PATCH, POST, dynamic, runtime } from "../route";
 
 const BACKEND_URL = "http://127.0.0.1:8000";
 const SERVER_TOKEN = "server-curation-secret";
+const BROWSER_ORIGIN = "http://127.0.0.1:3000";
+const BROWSER_HOST = "127.0.0.1:3000";
+const MUTATION_MARKER = "same-origin";
 const nativeFetch = globalThis.fetch;
 const mock = Object.assign(
   function typedFetchMock<
@@ -29,17 +32,47 @@ const mock = Object.assign(
 
 type RouteHandler = typeof GET;
 
+interface BrowserMetadata {
+  host?: string | null;
+  origin?: string | null;
+  fetchSite?: string | null;
+  marker?: string | null;
+  forwardedHost?: string | null;
+  forwardedProto?: string | null;
+}
+
 function request(
   path: string,
   init: ConstructorParameters<typeof NextRequest>[1] = {},
+  metadata: BrowserMetadata = {},
 ): NextRequest {
   const headers = new Headers(init.headers);
-  if (init.method === "POST" || init.method === "PATCH") {
-    if (!headers.has("origin")) headers.set("origin", "http://localhost");
-    if (!headers.has("sec-fetch-site"))
-      headers.set("sec-fetch-site", "same-origin");
+  const mutation = init.method === "POST" || init.method === "PATCH";
+  const values = {
+    host: metadata.host === undefined ? BROWSER_HOST : metadata.host,
+    origin:
+      metadata.origin === undefined
+        ? mutation
+          ? BROWSER_ORIGIN
+          : null
+        : metadata.origin,
+    "sec-fetch-site":
+      metadata.fetchSite === undefined
+        ? mutation
+          ? "same-origin"
+          : null
+        : metadata.fetchSite,
+    "x-curation-request":
+      metadata.marker === undefined ? null : metadata.marker,
+    "x-forwarded-host":
+      metadata.forwardedHost === undefined ? null : metadata.forwardedHost,
+    "x-forwarded-proto":
+      metadata.forwardedProto === undefined ? null : metadata.forwardedProto,
+  };
+  for (const [name, value] of Object.entries(values)) {
+    if (value !== null) headers.set(name, value);
   }
-  return new NextRequest(`http://localhost/api/curation/${path}`, {
+  return new NextRequest(`${BROWSER_ORIGIN}/api/curation/${path}`, {
     ...init,
     headers,
   });
@@ -53,9 +86,14 @@ async function call(
   handler: RouteHandler,
   path: string[],
   init: ConstructorParameters<typeof NextRequest>[1] = {},
+  metadata: BrowserMetadata = {},
 ) {
   return handler(
-    request(`${path.join("/")}?dataset_alias=local%2Fpnp_trash`, init),
+    request(
+      `${path.join("/")}?dataset_alias=local%2Fpnp_trash`,
+      init,
+      metadata,
+    ),
     context(...path),
   );
 }
@@ -82,6 +120,23 @@ describe("curation same-origin proxy", () => {
   test("declares a dynamic Node route", () => {
     expect(runtime).toBe("nodejs");
     expect(dynamic).toBe("force-dynamic");
+  });
+
+  test("OPTIONS is a nonpermissive 405 response", () => {
+    const fetchSpy = mock(async () => Response.json({ unexpected: true }));
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    const response = OPTIONS();
+
+    expect(response.status).toBe(405);
+    const permissiveCorsHeaders: string[] = [];
+    response.headers.forEach((_value, name) => {
+      if (name.startsWith("access-control-allow-")) {
+        permissiveCorsHeaders.push(name);
+      }
+    });
+    expect(permissiveCorsHeaders).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   test("GET preserves path, query, status, JSON, and disables caching", async () => {
@@ -131,22 +186,39 @@ describe("curation same-origin proxy", () => {
         },
       ) as typeof fetch;
 
-      const response = await call(handler, ["episodes", "7", "draft"], {
-        method,
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          authorization: "Bearer browser-supplied-token",
+      const response = await call(
+        handler,
+        ["episodes", "7", "draft"],
+        {
+          method,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            authorization: "Bearer browser-supplied-token",
+          },
+          body,
         },
-        body,
-      });
+        {
+          marker: MUTATION_MARKER,
+          forwardedHost: "attacker.example:3000",
+          forwardedProto: "https",
+        },
+      );
 
       expect(observedInit?.method).toBe(method);
-      expect(new Headers(observedInit?.headers).get("content-type")).toBe(
+      const upstreamHeaders = new Headers(observedInit?.headers);
+      expect(upstreamHeaders.get("content-type")).toBe(
         "application/json; charset=utf-8",
       );
-      expect(new Headers(observedInit?.headers).get("authorization")).toBe(
+      expect(upstreamHeaders.get("authorization")).toBe(
         `Bearer ${SERVER_TOKEN}`,
       );
+      const upstreamHeaderNames: string[] = [];
+      upstreamHeaders.forEach((_value, name) => upstreamHeaderNames.push(name));
+      expect(upstreamHeaderNames.sort()).toEqual([
+        "authorization",
+        "content-type",
+      ]);
+      expect(upstreamHeaders.has("x-curation-request")).toBe(false);
       expect(observedInit?.body).toBe(body);
       expect(await response.json()).toEqual({ revision: 4 });
     });
@@ -216,18 +288,277 @@ describe("curation same-origin proxy", () => {
     expect(new Headers(observedInit?.headers).has("content-type")).toBe(false);
   });
 
+  test("accepts an absent-origin marker fallback for JSON and bodyless mutations", async () => {
+    const observed: RequestInit[] = [];
+    globalThis.fetch = mock(
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        observed.push(init ?? {});
+        return Response.json(
+          observed.length === 1
+            ? { revision: 4 }
+            : { job_id: "job-1", state: "cancelled", changed: true },
+        );
+      },
+    ) as typeof fetch;
+
+    const draft = await PATCH(
+      request(
+        "episodes/7/draft",
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ expected_revision: 3 }),
+        },
+        {
+          origin: null,
+          fetchSite: null,
+          marker: MUTATION_MARKER,
+        },
+      ),
+      context("episodes", "7", "draft"),
+    );
+    const cancel = await POST(
+      request(
+        "batches/job-1/cancel",
+        { method: "POST" },
+        {
+          origin: null,
+          fetchSite: null,
+          marker: MUTATION_MARKER,
+        },
+      ),
+      context("batches", "job-1", "cancel"),
+    );
+
+    expect(draft.status).toBe(200);
+    expect(cancel.status).toBe(200);
+    expect(observed[1]?.body).toBeUndefined();
+    expect(new Headers(observed[1]?.headers).has("content-type")).toBe(false);
+  });
+
+  test("rejects every untrusted browser shape before upstream access", async () => {
+    const fetchSpy = mock(async () => Response.json({ unexpected: true }));
+    globalThis.fetch = fetchSpy as typeof fetch;
+    const rejected: Array<[string, "GET" | "POST" | "PATCH", BrowserMetadata]> =
+      [
+        ["missing Host", "GET", { host: null }],
+        ["empty Host", "GET", { host: "" }],
+        ["duplicate Host", "GET", { host: `${BROWSER_HOST}, ${BROWSER_HOST}` }],
+        ["scheme-bearing Host", "GET", { host: BROWSER_ORIGIN }],
+        ["wrong Host", "GET", { host: "localhost:3000" }],
+        ["wrong Host port", "GET", { host: "127.0.0.1:3001" }],
+        [
+          "DNS rebinding Host and Origin",
+          "GET",
+          {
+            host: "attacker.example:3000",
+            origin: "http://attacker.example:3000",
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "forwarded authority cannot replace Host",
+          "GET",
+          {
+            host: "attacker.example:3000",
+            forwardedHost: BROWSER_HOST,
+            forwardedProto: "http",
+          },
+        ],
+        [
+          "cross-origin GET",
+          "GET",
+          {
+            origin: "http://attacker.example:3000",
+            fetchSite: "cross-site",
+          },
+        ],
+        [
+          "empty Origin",
+          "POST",
+          { origin: "", fetchSite: "same-origin", marker: MUTATION_MARKER },
+        ],
+        [
+          "null Origin",
+          "POST",
+          {
+            origin: "null",
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "malformed Origin",
+          "POST",
+          {
+            origin: "not-an-origin",
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "duplicate Origin",
+          "POST",
+          {
+            origin: `${BROWSER_ORIGIN}, ${BROWSER_ORIGIN}`,
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "wrong Origin scheme",
+          "POST",
+          {
+            origin: "https://127.0.0.1:3000",
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "wrong Origin host",
+          "POST",
+          {
+            origin: "http://localhost:3000",
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "wrong Origin port",
+          "POST",
+          {
+            origin: "http://127.0.0.1:3001",
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "same-site Fetch-Site",
+          "POST",
+          { origin: null, fetchSite: "same-site", marker: MUTATION_MARKER },
+        ],
+        [
+          "cross-site Fetch-Site",
+          "POST",
+          { origin: null, fetchSite: "cross-site", marker: MUTATION_MARKER },
+        ],
+        [
+          "none Fetch-Site",
+          "POST",
+          { origin: null, fetchSite: "none", marker: MUTATION_MARKER },
+        ],
+        [
+          "empty Fetch-Site",
+          "POST",
+          { origin: null, fetchSite: "", marker: MUTATION_MARKER },
+        ],
+        [
+          "duplicate Fetch-Site",
+          "POST",
+          {
+            origin: null,
+            fetchSite: "same-origin, same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "empty marker",
+          "POST",
+          { origin: BROWSER_ORIGIN, fetchSite: "same-origin", marker: "" },
+        ],
+        [
+          "wrong marker",
+          "POST",
+          {
+            origin: BROWSER_ORIGIN,
+            fetchSite: "same-origin",
+            marker: "cross-origin",
+          },
+        ],
+        ["wrong marker on GET", "GET", { marker: "cross-origin" }],
+        [
+          "duplicate marker",
+          "POST",
+          {
+            origin: BROWSER_ORIGIN,
+            fetchSite: "same-origin",
+            marker: `${MUTATION_MARKER}, ${MUTATION_MARKER}`,
+          },
+        ],
+        [
+          "mutation without Origin or marker",
+          "POST",
+          { origin: null, fetchSite: "same-origin", marker: null },
+        ],
+        [
+          "marker cannot rescue a wrong Origin",
+          "POST",
+          {
+            origin: "http://attacker.example:3000",
+            fetchSite: "same-origin",
+            marker: MUTATION_MARKER,
+          },
+        ],
+        [
+          "valid Origin cannot rescue a wrong marker",
+          "PATCH",
+          {
+            origin: BROWSER_ORIGIN,
+            fetchSite: "same-origin",
+            marker: "wrong",
+          },
+        ],
+      ];
+
+    for (const [name, method, metadata] of rejected) {
+      const handler = method === "GET" ? GET : method === "POST" ? POST : PATCH;
+      const response = await handler(
+        request("summary", { method }, metadata),
+        context("summary"),
+      );
+      expect({ name, status: response.status }).toEqual({ name, status: 403 });
+      expect({ name, body: await response.json() }).toEqual({
+        name,
+        body: { error: "curation_cross_origin_forbidden" },
+      });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  test("ignores forwarded authority when the direct authority is trusted", async () => {
+    const fetchSpy = mock(async () => Response.json({ ok: true }));
+    globalThis.fetch = fetchSpy as typeof fetch;
+
+    const response = await GET(
+      request(
+        "summary",
+        {},
+        {
+          forwardedHost: "attacker.example:3000",
+          forwardedProto: "https",
+        },
+      ),
+      context("summary"),
+    );
+
+    expect(response.status).toBe(200);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
   test("rejects a cross-origin bodyless cancellation without contacting upstream", async () => {
     const fetchSpy = mock(async () => Response.json({ unexpected: true }));
     globalThis.fetch = fetchSpy as typeof fetch;
 
     const response = await POST(
-      request("batches/job-1/cancel", {
-        method: "POST",
-        headers: {
+      request(
+        "batches/job-1/cancel",
+        { method: "POST" },
+        {
           origin: "https://attacker.example",
-          "sec-fetch-site": "cross-site",
+          fetchSite: "cross-site",
         },
-      }),
+      ),
       context("batches", "job-1", "cancel"),
     );
 
