@@ -17,10 +17,12 @@ describe("resolveInitialEpisodeViewerTab", () => {
     expect(resolve("tab=doctor", "episodes")).toBe("doctor");
   });
 
-  test("rejects repeated and unknown query values", () => {
+  test("rejects empty, repeated, and unknown query values", () => {
+    expect(resolve("tab=", "frames")).toBe("frames");
     expect(resolve("tab=annotations&tab=doctor", "statistics")).toBe(
       "statistics",
     );
+    expect(resolve("tab=annotations&tab=annotations", "frames")).toBe("frames");
     expect(resolve("tab=unknown", "frames")).toBe("frames");
   });
 

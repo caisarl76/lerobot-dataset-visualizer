@@ -40,11 +40,15 @@ mock.module("@/context/annotations-context", () => ({
 mock.module("@/context/curation-context", () => ({
   CurationProvider: ({ children }: PropsWithChildren) => children,
   CurationRouteSync: () => null,
+  useCuration: () => {
+    throw new Error("workspace leaf must remain mocked");
+  },
 }));
 
+const { isTaskIndexCurationDataset } =
+  await import("@/components/task-index-curation-workspace");
 mock.module("@/components/task-index-curation-workspace", () => ({
-  isTaskIndexCurationDataset: (repoId: string, codebaseVersion: string) =>
-    repoId === "local/pnp_trash" && codebaseVersion === "v2.1",
+  isTaskIndexCurationDataset,
   TaskIndexCurationWorkspace: () => (
     <div data-testid="task-index-workspace-probe" />
   ),
