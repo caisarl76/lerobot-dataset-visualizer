@@ -2,7 +2,9 @@ import { afterEach, describe, expect, mock as bunMock, test } from "bun:test";
 
 import {
   CurationClientError,
+  applyEpisodeProposal,
   approveEpisodeKeep,
+  approveEpisodeReject,
   cancelCurationBatch,
   fetchCurationAudit,
   fetchCurationBatch,
@@ -10,6 +12,7 @@ import {
   fetchEpisodeCuration,
   fetchGripDiagnostic,
   openCurationWorkspace,
+  reopenEpisode,
   retryCurationBatch,
   saveEpisodeDraft,
   startCurationBatch,
@@ -167,6 +170,92 @@ afterEach(() => {
 });
 
 describe("curation client runtime contracts", () => {
+  test("marks every curation mutation, including bodyless cancellation, but not reads", async () => {
+    const mutations: Array<[string, () => Promise<unknown>]> = [
+      [
+        "workspace open",
+        () => openCurationWorkspace("local/pnp_trash", "curator"),
+      ],
+      [
+        "draft save",
+        () =>
+          saveEpisodeDraft("local/pnp_trash", 0, 0, "curator", {
+            transitionFrames: [1, 2, 3, 4, 5, 6],
+          }),
+      ],
+      [
+        "proposal apply",
+        () => applyEpisodeProposal("local/pnp_trash", 0, 0, "curator"),
+      ],
+      [
+        "keep approval",
+        () =>
+          approveEpisodeKeep("local/pnp_trash", 0, 0, "curator", "reviewer"),
+      ],
+      [
+        "reject approval",
+        () =>
+          approveEpisodeReject(
+            "local/pnp_trash",
+            0,
+            0,
+            "curator",
+            "reviewer",
+            "bad grasp",
+          ),
+      ],
+      [
+        "episode reopen",
+        () => reopenEpisode("local/pnp_trash", 0, 0, "curator"),
+      ],
+      ["batch start", () => startCurationBatch("local/pnp_trash")],
+      [
+        "batch retry",
+        () =>
+          retryCurationBatch(
+            "job-1",
+            { failureStates: ["manual_only"] },
+            "local/pnp_trash",
+          ),
+      ],
+      ["batch cancel", () => cancelCurationBatch("job-1")],
+    ];
+
+    for (const [name, operation] of mutations) {
+      let observedInit: RequestInit | undefined;
+      globalThis.fetch = mock(
+        async (_input: string | URL | Request, init?: RequestInit) => {
+          observedInit = init;
+          return Response.json({ malformed: name });
+        },
+      ) as typeof fetch;
+
+      await expect(operation()).rejects.toMatchObject({
+        code: "invalid_response",
+      });
+      const headers = new Headers(observedInit?.headers);
+      expect(headers.get("x-curation-request")).toBe("same-origin");
+      if (name === "batch cancel") {
+        expect(observedInit?.body).toBeUndefined();
+        expect(headers.has("content-type")).toBe(false);
+      }
+    }
+
+    let readHeaders = new Headers();
+    globalThis.fetch = mock(
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        readHeaders = new Headers(init?.headers);
+        return Response.json({ malformed: "summary" });
+      },
+    ) as typeof fetch;
+    await expect(fetchCurationSummary("local/pnp_trash")).rejects.toMatchObject(
+      {
+        code: "invalid_response",
+      },
+    );
+    expect(readHeaders.has("x-curation-request")).toBe(false);
+  });
+
   test("rejects malformed successful payloads from every response decoder without retaining raw data", async () => {
     const operations: Array<[string, () => Promise<unknown>]> = [
       ["workspace", () => openCurationWorkspace("local/pnp_trash", "curator")],

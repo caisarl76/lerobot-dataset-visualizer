@@ -1073,6 +1073,9 @@ function curationUrl(path: string): string {
   return new URL(path, window.location.origin).toString();
 }
 
+const CURATION_REQUEST_HEADER = "x-curation-request";
+const CURATION_REQUEST_VALUE = "same-origin";
+
 async function requestJson<T>(
   path: string,
   decoder: Decoder<T>,
@@ -1082,9 +1085,13 @@ async function requestJson<T>(
     signal?: AbortSignal;
   } = {},
 ): Promise<T> {
+  const method = options.method ?? "GET";
   const headers = new Headers({ accept: "application/json" });
+  if (method !== "GET") {
+    headers.set(CURATION_REQUEST_HEADER, CURATION_REQUEST_VALUE);
+  }
   const init: RequestInit = {
-    method: options.method ?? "GET",
+    method,
     cache: "no-store",
     credentials: "same-origin",
     signal: options.signal,
