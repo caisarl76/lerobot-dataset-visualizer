@@ -28,7 +28,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from .config import CurationConfigurationError, CurationSettings
+from .config import CurationConfigurationError, WorkerSettings
 from .contact_sheets import ContactSheetCoordinator, ContactSheetUnavailable
 from .cosmos_contract import CosmosContractError, CosmosProposal, build_cosmos_proposal
 from .cosmos_transport import (
@@ -165,7 +165,7 @@ class TrustedWorkerAuthority:
     @classmethod
     def from_settings(
         cls,
-        settings: CurationSettings,
+        settings: WorkerSettings,
         *,
         cli_workspace: Path,
     ) -> TrustedWorkerAuthority:
@@ -2658,7 +2658,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as error:
         return int(error.code)
     try:
-        settings = CurationSettings.from_env()
+        settings = WorkerSettings.from_env()
         trusted_authority = TrustedWorkerAuthority.from_settings(
             settings,
             cli_workspace=args.workspace,

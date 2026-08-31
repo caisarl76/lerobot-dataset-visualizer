@@ -11,7 +11,7 @@ import sys
 from uuid import uuid4
 
 from curation.assets import LocalAssetService, _read_interval
-from curation.config import _REQUIRED, legacy_browser_origin
+from curation.config import CURATION_REQUIRED_ENV_NAMES, legacy_browser_origin
 from curation.security import CurationLoopbackGuard
 import curation.source as source_module
 from curation.source import SourceRegistry
@@ -386,7 +386,7 @@ def test_local_asset_route_rejects_unregistered_or_unsafe_targets(
 @pytest.fixture
 def legacy_cors_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """Load an isolated legacy app, with all curation configuration absent."""
-    for name in _REQUIRED:
+    for name in CURATION_REQUIRED_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("LEROBOT_ANNOTATE_BROWSER_ORIGIN", "http://127.0.0.1:3000")
     module_name = f"legacy_cors_test_{uuid4().hex}"

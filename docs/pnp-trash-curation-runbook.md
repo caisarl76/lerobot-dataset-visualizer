@@ -15,6 +15,7 @@ this procedure.
 Use this non-secret mapping verbatim:
 
 ```bash
+export CURATION_REPO_ROOT=/home/jihun/work/GR00T-WholeBodyControl/worktrees/lerobot-dataset-visualizer-pnp-trash
 export CURATION_DATASET_ALIASES_JSON='{"local/pnp_trash":"/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash"}'
 export CURATION_WORKSPACE=/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation
 export CURATION_OUTPUT=/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_cleaned
@@ -24,57 +25,62 @@ export NEXT_PUBLIC_DATASET_URL=http://127.0.0.1:8000/api/local-datasets
 export ISAAC_GROOT_ROOT=/home/jihun/work/Isaac-GR00T
 ```
 
-`backend.app:app`, `backend/curation_worker.py`, and
-`backend/curation_export.py` all call `CurationSettings.from_env()`. Launch all
-three Python processes with the five non-secret mapping values consumed by
-`CurationSettings` (`CURATION_DATASET_ALIASES_JSON`, `CURATION_WORKSPACE`,
-`CURATION_OUTPUT`, `CURATION_BROWSER_ORIGIN`, and `ISAAC_GROOT_ROOT`), all five
-external runtime names, including the `COSMOS_API_KEY_ENV` name. Only the
-backend and worker receive the actual credential variable named by
-`COSMOS_API_KEY_ENV`; the exporter must not receive that secret. The backend reads the variable named by
-`COSMOS_API_KEY_ENV` during batch capability validation before it creates a
-job; the worker reads it for Cosmos calls. The exporter performs no Cosmos call
-and launches without the target credential variable. Neither CLI accepts a
-secret argument.
+`backend.app:app` uses `CurationSettings.from_env()`,
+`backend/curation_worker.py` uses `WorkerSettings.from_env()`, and
+`backend/curation_export.py` uses `ExportSettings.from_env()`. FastAPI alone
+requires output, browser origin, bearer, and backend-host configuration. The
+worker requires aliases, workspace, Cosmos base/model/API-key environment
+variable name/endpoint identity, and its frozen limits. The exporter requires
+aliases, workspace, Isaac-GR00T root, Cosmos model, and endpoint identity.
+Only the backend and worker receive the actual credential variable named by
+`COSMOS_API_KEY_ENV`; the exporter must not receive that secret. The backend
+reads the variable named by `COSMOS_API_KEY_ENV` during batch capability
+validation before it creates a job; the worker reads it only for Cosmos calls.
+The exporter receives neither the bearer nor Cosmos base/API-key configuration
+and makes no Cosmos call. Neither CLI accepts a secret argument.
 
 Next.js requires only `CURATION_BACKEND_URL`, `CURATION_BEARER_TOKEN`, and
 `NEXT_PUBLIC_DATASET_URL`. Its bearer value must exactly match the backend's;
 the other Python settings and the Cosmos credential must not be supplied to
 browser code.
 
-| Variable                               | Visibility                                     | Owner                                                 | Startup validation                                                                                                    |
-| -------------------------------------- | ---------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `CURATION_DATASET_ALIASES_JSON`        | Non-secret, server-only                        | All three Python processes                            | Nonempty JSON object; every key is one `org/dataset` alias and every value is an absolute, existing dataset directory |
-| `CURATION_WORKSPACE`                   | Non-secret, server-only                        | All three Python processes                            | Canonical absolute path, separate from every source and output; CLI value must equal the persisted workspace          |
-| `CURATION_OUTPUT`                      | Non-secret, server-only                        | All three Python processes                            | Canonical absolute path, separate from source/workspace; must be absent before the no-clobber export                  |
-| `CURATION_BROWSER_ORIGIN`              | Non-secret, server-only                        | All three Python processes; backend uses it for CORS  | Exactly one HTTP(S) origin with no credentials, path, query, fragment, or comma-separated alternatives                |
-| `CURATION_BACKEND_URL`                 | Non-secret, server-only                        | Next.js only                                          | Absolute HTTP(S) URL with no credentials, query, or fragment; this run requires the exact loopback mapping above      |
-| `NEXT_PUBLIC_DATASET_URL`              | Public                                         | Next.js and browser URL builder                       | Exact loopback local-asset prefix above; it carries no credential                                                     |
-| `ISAAC_GROOT_ROOT`                     | Non-secret, server-only                        | All three Python processes; exporter uses it          | Canonical absolute path; the preflight must import the exact loader/config and find `gr00t/data/stats.py`             |
-| `CURATION_BACKEND_HOST`                | Non-secret, optional                           | All three Python processes; backend guard consumes it | Defaults to `127.0.0.1`; must parse as loopback or literal `localhost`                                                |
-| `CURATION_BEARER_TOKEN`                | Secret                                         | All three Python processes; Next.js also consumes it  | Required and nonempty; Next.js and backend values must match; never browser-visible                                   |
-| `COSMOS_BASE_URL`                      | External/private configuration                 | All three Python processes                            | Absolute HTTP(S), no whitespace, credentials, query, fragment, invalid port, or redirect following                    |
-| `COSMOS_MODEL`                         | External/private configuration                 | All three Python processes                            | Required, nonempty, and exactly present in the configured `/v1/models` response                                       |
-| `COSMOS_API_KEY_ENV`                   | External/private configuration; names a secret | All three Python processes                            | Required nonempty variable name                                                                                       |
-| Variable named by `COSMOS_API_KEY_ENV` | Secret                                         | Backend and worker only                               | Required for backend batch creation and worker calls; prohibited from the exporter environment                        |
-| `COSMOS_ENDPOINT_IDENTITY`             | External/private configuration                 | All three Python processes                            | Required and nonempty; stable operator identity for the existing H100 service                                         |
+| Variable                               | Visibility                                     | Owner                               | Startup validation                                                                                                    |
+| -------------------------------------- | ---------------------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `CURATION_REPO_ROOT`                   | Non-secret, operator shell                     | Every documented repository command | Canonical absolute clean Git worktree authenticated by the checkout preflight                                         |
+| `CURATION_DATASET_ALIASES_JSON`        | Non-secret, server-only                        | FastAPI, worker, and exporter       | Nonempty JSON object; every key is one `org/dataset` alias and every value is an absolute, existing dataset directory |
+| `CURATION_WORKSPACE`                   | Non-secret, server-only                        | FastAPI, worker, and exporter       | Canonical absolute path, separate from every source and output; CLI value must equal the persisted workspace          |
+| `CURATION_OUTPUT`                      | Non-secret, server-only                        | FastAPI only                        | Canonical absolute path, separate from source/workspace; must be absent before the no-clobber export                  |
+| `CURATION_BROWSER_ORIGIN`              | Non-secret, server-only                        | FastAPI only                        | Exactly one HTTP(S) origin with no credentials, path, query, fragment, or comma-separated alternatives                |
+| `CURATION_BACKEND_URL`                 | Non-secret, server-only                        | Next.js only                        | Absolute HTTP(S) URL with no credentials, query, or fragment; this run requires the exact loopback mapping above      |
+| `NEXT_PUBLIC_DATASET_URL`              | Public                                         | Next.js and browser URL builder     | Exact loopback local-asset prefix above; it carries no credential                                                     |
+| `ISAAC_GROOT_ROOT`                     | Non-secret, server-only                        | FastAPI and exporter                | Canonical absolute path; the preflight must import the exact loader/config and find `gr00t/data/stats.py`             |
+| `CURATION_BACKEND_HOST`                | Non-secret, optional                           | FastAPI only                        | Defaults to `127.0.0.1`; must parse as loopback or literal `localhost`                                                |
+| `CURATION_BEARER_TOKEN`                | Secret                                         | FastAPI and Next.js only            | Required and nonempty; Next.js and backend values must match; never browser-visible                                   |
+| `COSMOS_BASE_URL`                      | External/private configuration                 | FastAPI and worker only             | Absolute HTTP(S), no whitespace, credentials, query, fragment, invalid port, or redirect following                    |
+| `COSMOS_MODEL`                         | External/private configuration                 | FastAPI, worker, and exporter       | Required, nonempty, and exactly present in the configured `/v1/models` response                                       |
+| `COSMOS_API_KEY_ENV`                   | External/private configuration; names a secret | FastAPI and worker only             | Required distinct variable name; reserved process/configuration collisions are rejected                               |
+| Variable named by `COSMOS_API_KEY_ENV` | Secret                                         | Backend and worker only             | Required for backend batch creation and worker calls; prohibited from the exporter environment                        |
+| `COSMOS_ENDPOINT_IDENTITY`             | External/private configuration                 | All three Python processes          | Required and nonempty; stable operator identity for the existing H100 service                                         |
 
 The operator's existing server/runtime configuration must provide these names;
 their values do not belong in the repository or this runbook:
 
-- `CURATION_BEARER_TOKEN`: present in all three Python launch environments and
-  the Next.js server process; only FastAPI and Next.js consume it at runtime.
+- `CURATION_BEARER_TOKEN`: present only in the FastAPI and Next.js server
+  environments; their values must match.
 - `COSMOS_BASE_URL`: OpenAI-compatible H100 endpoint ending at `/v1`.
 - `COSMOS_MODEL`: exact model ID returned by `/v1/models`.
 - `COSMOS_API_KEY_ENV`: name of the external environment variable that holds
   the Cosmos API key. The key itself is read indirectly by the backend before
   batch creation and by the worker during Cosmos calls; do not supply the
-  target secret to the exporter.
+  target secret to the exporter. The target may be a distinct name such as
+  `COSMOS_API_KEY`, but it must not collide with an inherited process name,
+  any `CURATION_*`/`NEXT_PUBLIC_*` name, or the named Cosmos/Isaac settings in
+  the table.
 - `COSMOS_ENDPOINT_IDENTITY`: stable non-secret operator identity recorded in
   provenance, supplied from the existing Cosmos runtime configuration.
 
-`CURATION_BACKEND_HOST` is optional and defaults to `127.0.0.1`; it may only be
-a loopback address. The backend owns dataset aliases, workspace/output paths,
+`CURATION_BACKEND_HOST` is FastAPI-only, optional, and defaults to
+`127.0.0.1`; it may only be a loopback address. The backend owns dataset aliases, workspace/output paths,
 the browser-origin allowlist, Cosmos job snapshots, and Isaac-GR00T path. The
 worker owns 2 fps sampling and Cosmos calls. The exporter owns staging,
 validation, and no-clobber publication. Next.js owns `CURATION_BACKEND_URL`
@@ -85,13 +91,128 @@ Never define a `NEXT_PUBLIC_*` token, API key, Cosmos base URL, model, or
 endpoint identity. Do not use `set -x` in a shell containing the external
 credentials.
 
+### Least-privilege Python process launchers
+
+Define these launchers in every operator shell that will run a worker or
+exporter. `env -i` prevents unrelated ambient variables from crossing the
+process boundary. The worker receives the credential named by
+`COSMOS_API_KEY_ENV`; the exporter receives neither that dynamic credential
+nor its name or Cosmos base URL.
+
+```bash
+run_curation_worker() {
+  : "${CURATION_REPO_ROOT:?FAIL: CURATION_REPO_ROOT is required}"
+  : "${CURATION_DATASET_ALIASES_JSON:?FAIL: CURATION_DATASET_ALIASES_JSON is required}"
+  : "${CURATION_WORKSPACE:?FAIL: CURATION_WORKSPACE is required}"
+  : "${COSMOS_BASE_URL:?FAIL: COSMOS_BASE_URL is required}"
+  : "${COSMOS_MODEL:?FAIL: COSMOS_MODEL is required}"
+  : "${COSMOS_API_KEY_ENV:?FAIL: COSMOS_API_KEY_ENV is required}"
+  : "${COSMOS_ENDPOINT_IDENTITY:?FAIL: COSMOS_ENDPOINT_IDENTITY is required}"
+  case "$COSMOS_API_KEY_ENV" in
+    PATH|HOME|USER|LOGNAME|SHELL|PWD|OLDPWD|TMPDIR|PYTHONPATH|PYTHONHOME|LD_PRELOAD|LD_LIBRARY_PATH|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|CURATION_*|NEXT_PUBLIC_*|COSMOS_BASE_URL|COSMOS_MODEL|COSMOS_API_KEY_ENV|COSMOS_ENDPOINT_IDENTITY|ISAAC_GROOT_ROOT)
+      printf '%s\n' 'FAIL: configured Cosmos credential target is reserved' >&2
+      return 1
+      ;;
+  esac
+  if [[ ! "$COSMOS_API_KEY_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+    || test -z "${!COSMOS_API_KEY_ENV:-}"; then
+    printf '%s\n' 'FAIL: configured Cosmos credential is unavailable' >&2
+    return 1
+  fi
+  env -i \
+    PATH="$PATH" \
+    CURATION_DATASET_ALIASES_JSON="$CURATION_DATASET_ALIASES_JSON" \
+    CURATION_WORKSPACE="$CURATION_WORKSPACE" \
+    COSMOS_BASE_URL="$COSMOS_BASE_URL" \
+    COSMOS_MODEL="$COSMOS_MODEL" \
+    COSMOS_API_KEY_ENV="$COSMOS_API_KEY_ENV" \
+    COSMOS_ENDPOINT_IDENTITY="$COSMOS_ENDPOINT_IDENTITY" \
+    "$COSMOS_API_KEY_ENV=${!COSMOS_API_KEY_ENV}" \
+    "$CURATION_REPO_ROOT/backend/.venv/bin/python" \
+    "$CURATION_REPO_ROOT/backend/curation_worker.py" "$@"
+}
+
+run_curation_exporter() {
+  : "${CURATION_REPO_ROOT:?FAIL: CURATION_REPO_ROOT is required}"
+  : "${CURATION_DATASET_ALIASES_JSON:?FAIL: CURATION_DATASET_ALIASES_JSON is required}"
+  : "${CURATION_WORKSPACE:?FAIL: CURATION_WORKSPACE is required}"
+  : "${COSMOS_MODEL:?FAIL: COSMOS_MODEL is required}"
+  : "${COSMOS_ENDPOINT_IDENTITY:?FAIL: COSMOS_ENDPOINT_IDENTITY is required}"
+  : "${ISAAC_GROOT_ROOT:?FAIL: ISAAC_GROOT_ROOT is required}"
+  env -i \
+    PATH="$PATH" \
+    CURATION_DATASET_ALIASES_JSON="$CURATION_DATASET_ALIASES_JSON" \
+    CURATION_WORKSPACE="$CURATION_WORKSPACE" \
+    COSMOS_MODEL="$COSMOS_MODEL" \
+    COSMOS_ENDPOINT_IDENTITY="$COSMOS_ENDPOINT_IDENTITY" \
+    ISAAC_GROOT_ROOT="$ISAAC_GROOT_ROOT" \
+    "$CURATION_REPO_ROOT/backend/.venv/bin/python" \
+    "$CURATION_REPO_ROOT/backend/curation_export.py" "$@"
+}
+```
+
 ## Install and static regression gates
+
+### 0. Trusted implementation checkout
+
+Before executing repository code, obtain the full 40-character commit SHA
+from an independently reviewed approval record and enter it shell-locally. Do
+not derive this trust value from the checkout being authenticated:
+
+```bash
+read -r -p 'Paste independently approved curation commit SHA: ' APPROVED_CURATION_COMMIT_SHA
+```
+
+#### Checkout authentication gate
+
+Authenticate the one checkout used by every later command:
+
+```bash
+set -euo pipefail
+: "${CURATION_REPO_ROOT:?FAIL: CURATION_REPO_ROOT is required}"
+: "${APPROVED_CURATION_COMMIT_SHA:?FAIL: approved curation commit SHA is required}"
+if [[ "$CURATION_REPO_ROOT" != /* ]] || test ! -d "$CURATION_REPO_ROOT"; then
+  printf '%s\n' 'FAIL: curation checkout must be an absolute directory' >&2
+  exit 1
+fi
+CANONICAL_CURATION_REPO_ROOT=$(realpath "$CURATION_REPO_ROOT")
+if test "$CANONICAL_CURATION_REPO_ROOT" != "$CURATION_REPO_ROOT"; then
+  printf '%s\n' 'FAIL: curation checkout path must already be canonical' >&2
+  exit 1
+fi
+if test ! -e "$CURATION_REPO_ROOT/.git" || test -L "$CURATION_REPO_ROOT/.git"; then
+  printf '%s\n' 'FAIL: curation checkout is not a Git worktree' >&2
+  exit 1
+fi
+if [[ ! "$APPROVED_CURATION_COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  printf '%s\n' 'FAIL: approved curation commit SHA must be 40 lowercase hex characters' >&2
+  exit 1
+fi
+if test "$(git -C "$CURATION_REPO_ROOT" rev-parse --is-inside-work-tree)" != true \
+  || test "$(git -C "$CURATION_REPO_ROOT" rev-parse --show-toplevel)" != "$CURATION_REPO_ROOT"; then
+  printf '%s\n' 'FAIL: curation checkout is not the Git worktree root' >&2
+  exit 1
+fi
+if test "$(git -C "$CURATION_REPO_ROOT" rev-parse HEAD)" != "$APPROVED_CURATION_COMMIT_SHA"; then
+  printf '%s\n' 'FAIL: checkout HEAD does not match the independently approved commit' >&2
+  exit 1
+fi
+if ! git -C "$CURATION_REPO_ROOT" merge-base --is-ancestor 60ef88c \
+  "$APPROVED_CURATION_COMMIT_SHA"; then
+  printf '%s\n' 'FAIL: approved checkout predates the minimum curation baseline' >&2
+  exit 1
+fi
+if test -n "$(git -C "$CURATION_REPO_ROOT" status --porcelain --untracked-files=all)"; then
+  printf '%s\n' 'FAIL: curation checkout is not clean' >&2
+  exit 1
+fi
+```
 
 From the repository root, create the backend environment and install frontend
 dependencies if needed:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 python -m venv backend/.venv
 backend/.venv/bin/python -m pip install -r backend/requirements.txt
 bun install
@@ -100,7 +221,7 @@ bun install
 Before real data operations, run both complete gates:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python -m pytest -q backend/tests
 ```
 
@@ -108,12 +229,37 @@ Expected: PASS, including `test_legacy_v31_regression.py` and the curation
 modules.
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
-bun run format && bun run validate
+cd "$CURATION_REPO_ROOT"
+bun run format:check && bun run validate
 ```
 
-Expected: PASS. `format` may only produce formatting changes that are reviewed
-before continuing.
+Expected: PASS. Both commands are read-only checks; this gate must not rewrite
+the authenticated checkout.
+
+#### Post-static checkout reauthentication gate
+
+Reauthenticate the exact HEAD and clean tree after installation and every
+static command, before any runtime preflight or service start:
+
+```bash
+set -euo pipefail
+: "${CURATION_REPO_ROOT:?FAIL: CURATION_REPO_ROOT is required}"
+: "${APPROVED_CURATION_COMMIT_SHA:?FAIL: approved curation commit SHA is required}"
+if test "$(git -C "$CURATION_REPO_ROOT" rev-parse HEAD)" != "$APPROVED_CURATION_COMMIT_SHA"; then
+  printf '%s\n' 'FAIL: checkout HEAD changed during install or static gates' >&2
+  exit 1
+fi
+if test -n "$(git -C "$CURATION_REPO_ROOT" status --porcelain --untracked-files=all)"; then
+  printf '%s\n' 'FAIL: curation checkout is not clean after static gates' >&2
+  exit 1
+fi
+```
+
+Configured FastAPI startup creates the canonical source manifest and
+initializes curation.sqlite3 before serving. Task 14 integration is not
+complete: the approved-source loopback and browser smoke remains pending until
+the operator loads the secure runtime configuration and executes the remaining
+runbook gates.
 
 ## Filesystem and dependency preflight
 
@@ -165,12 +311,11 @@ if test "$SOURCE_FILE_COUNT" -ne 190; then
 fi
 test -z "$(find -P "$SOURCE_DATASET" -type l -print -quit)"
 
-VISUALIZER_ROOT=/home/jihun/work/lerobot-dataset-visualizer
-test -x "$VISUALIZER_ROOT/backend/.venv/bin/python"
+test -x "$CURATION_REPO_ROOT/backend/.venv/bin/python"
 PROSPECTIVE_SOURCE_AUTHORITY=$(
-  PYTHONPATH="$VISUALIZER_ROOT" SOURCE_DATASET="$SOURCE_DATASET" \
+  PYTHONPATH="$CURATION_REPO_ROOT" SOURCE_DATASET="$SOURCE_DATASET" \
     PINNED_ANCILLARY_NAME="$PINNED_ANCILLARY_NAME" \
-    "$VISUALIZER_ROOT/backend/.venv/bin/python" - <<'PY'
+    "$CURATION_REPO_ROOT/backend/.venv/bin/python" - <<'PY'
 import hashlib
 import os
 from pathlib import Path
@@ -241,7 +386,7 @@ the output parent and proves both the `EEXIST` and successful
 `renameat2(RENAME_NOREPLACE)` paths:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python -c 'from pathlib import Path; from backend.curation.publication import preflight_rename_noreplace; preflight_rename_noreplace(Path("/home/jihun/work/GR00T-WholeBodyControl/outputs")); print("renameat2 RENAME_NOREPLACE: PASS")'
 ```
 
@@ -279,7 +424,7 @@ The export later invokes this checkout with embodiment
 Run the check against all 92 immutable source videos:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python - <<'PY'
 from pathlib import Path
 import subprocess
@@ -325,7 +470,7 @@ In the fully configured backend terminal, use the repository-root module path
 exactly:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
@@ -333,7 +478,7 @@ Start Next.js in a second terminal containing only `CURATION_BACKEND_URL`,
 `CURATION_BEARER_TOKEN`, and `NEXT_PUBLIC_DATASET_URL`:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 bun run dev --hostname 127.0.0.1 --port 3000
 ```
 
@@ -574,18 +719,21 @@ through the Next.js JSON proxy.
 Check `/v1/models` without putting the credential in a command line or output:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python - <<'PY'
 import os
 
 import httpx
 
-key_name = os.environ["COSMOS_API_KEY_ENV"]
+from backend.curation.config import CurationSettings
+
+settings = CurationSettings.from_env()
+key_name = settings.cosmos_api_key_env
 key = os.environ.get(key_name)
 if not key:
     raise SystemExit("FAIL: Cosmos credential variable is unavailable")
-model = os.environ["COSMOS_MODEL"]
-url = os.environ["COSMOS_BASE_URL"].rstrip("/") + "/models"
+model = settings.cosmos_model
+url = settings.cosmos_base_url.rstrip("/") + "/models"
 with httpx.Client(trust_env=False, follow_redirects=False) as client:
     response = client.get(
         url,
@@ -605,6 +753,8 @@ same-origin Next.js proxy:
 
 ```bash
 set -euo pipefail
+: "${CURATION_REPO_ROOT:?FAIL: CURATION_REPO_ROOT is required}"
+: "${CURATION_WORKSPACE:?FAIL: CURATION_WORKSPACE is required}"
 CURATION_API=http://127.0.0.1:3000/api/curation
 OPEN_RESPONSE=$(curl -fsS -H 'Content-Type: application/json' \
   -H 'Origin: http://127.0.0.1:3000' \
@@ -612,9 +762,43 @@ OPEN_RESPONSE=$(curl -fsS -H 'Content-Type: application/json' \
   "$CURATION_API/workspaces/open")
 printf '%s\n' "$OPEN_RESPONSE" | jq -e .
 
+SMOKE_SOURCE_EPISODE_INDEX=4
+: "${SOURCE_DATASET:?FAIL: SOURCE_DATASET is required}"
+: "${CURATION_DATASET_ALIASES_JSON:?FAIL: CURATION_DATASET_ALIASES_JSON is required}"
+if ! SMOKE_ALIAS_SOURCE=$(printf '%s' "$CURATION_DATASET_ALIASES_JSON" \
+  | jq -er '.["local/pnp_trash"] | select(type == "string" and length > 0)' 2>/dev/null); then
+  printf '%s\n' 'FAIL: configured smoke dataset alias is invalid' >&2
+  exit 1
+fi
+if test "$SMOKE_ALIAS_SOURCE" != "$SOURCE_DATASET"; then
+  printf '%s\n' 'FAIL: smoke source does not match the configured dataset alias' >&2
+  exit 1
+fi
+if ! { SMOKE_SOURCE_PATH=$(realpath -e -- "$SOURCE_DATASET"); } 2>/dev/null; then
+  printf '%s\n' 'FAIL: smoke source canonical target is unavailable' >&2
+  exit 1
+fi
+if test ! -d "$SMOKE_SOURCE_PATH" || test -L "$SMOKE_SOURCE_PATH"; then
+  printf '%s\n' 'FAIL: smoke source canonical target is unavailable' >&2
+  exit 1
+fi
+: "${APPROVED_SOURCE_MANIFEST_SHA256:?FAIL: approved source manifest SHA-256 is required}"
+SMOKE_REPRESENTATIVE_AUTHORITY=$(
+  "$CURATION_REPO_ROOT/backend/.venv/bin/python" \
+    -m backend.curation.runbook_validation representative \
+    --workspace "$CURATION_WORKSPACE" \
+    --source-path "$SMOKE_SOURCE_PATH" \
+    --source-manifest-sha256 "$APPROVED_SOURCE_MANIFEST_SHA256" \
+    --source-episode-index "$SMOKE_SOURCE_EPISODE_INDEX"
+)
+printf '%s' "$SMOKE_REPRESENTATIVE_AUTHORITY" | jq -e \
+  '. == {source_episode_index:4,frame_count:2060,duration_s:41.2,sampled_frame_count:83}' \
+  >/dev/null
+SMOKE_REQUEST=$(jq -cn --argjson index "$SMOKE_SOURCE_EPISODE_INDEX" \
+  '{dataset_alias:"local/pnp_trash",episode_indices:[$index]}')
 SMOKE_RESPONSE=$(curl -fsS -H 'Content-Type: application/json' \
   -H 'Origin: http://127.0.0.1:3000' \
-  -d '{"dataset_alias":"local/pnp_trash","episode_indices":[0]}' \
+  -d "$SMOKE_REQUEST" \
   "$CURATION_API/batches")
 SMOKE_JOB_ID=$(printf '%s' "$SMOKE_RESPONSE" | jq -er '.job_id')
 if test -z "$SMOKE_JOB_ID"; then
@@ -622,47 +806,173 @@ if test -z "$SMOKE_JOB_ID"; then
   exit 1
 fi
 
-cd /home/jihun/work/lerobot-dataset-visualizer
-backend/.venv/bin/python backend/curation_worker.py \
+run_curation_worker \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   run --job-id "$SMOKE_JOB_ID"
 SMOKE_STATE_RESPONSE=$(curl -fsS "$CURATION_API/batches/$SMOKE_JOB_ID")
 printf '%s\n' "$SMOKE_STATE_RESPONSE" | jq
 SMOKE_STATE=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.state')
-case "$SMOKE_STATE" in
-  completed | completed_with_failures) ;;
-  *)
-    printf 'FAIL: one-episode Cosmos smoke ended in unexpected state: %s\n' "$SMOKE_STATE" >&2
+if ! test "$SMOKE_STATE" = completed; then
+  printf 'FAIL: one-episode Cosmos smoke requires terminal state completed; found %s\n' \
+    "$SMOKE_STATE" >&2
+  exit 1
+fi
+SMOKE_SUCCEEDED=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.counts.succeeded // 0')
+SMOKE_MANUAL_ONLY=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.counts.manual_only // 0')
+SMOKE_RETRYABLE=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.counts.retryable // 0')
+SMOKE_PROPOSAL_COVERAGE=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.active_proposal_coverage')
+SMOKE_EPISODE_COUNT=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.episodes | length')
+SMOKE_EPISODE_INDEX=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.episodes[0].source_episode_index')
+SMOKE_ATTEMPT_STATE=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.episodes[0].state')
+SMOKE_ATTEMPT_ID=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.episodes[0].attempt_id')
+if ! test "$SMOKE_SUCCEEDED" -eq 1 \
+  || ! test "$SMOKE_MANUAL_ONLY" -eq 0 \
+  || ! test "$SMOKE_RETRYABLE" -eq 0 \
+  || ! test "$SMOKE_PROPOSAL_COVERAGE" -eq 1 \
+  || ! test "$SMOKE_EPISODE_COUNT" -eq 1 \
+  || ! test "$SMOKE_EPISODE_INDEX" -eq "$SMOKE_SOURCE_EPISODE_INDEX" \
+  || ! test "$SMOKE_ATTEMPT_STATE" = succeeded \
+  || test -z "$SMOKE_ATTEMPT_ID"; then
+  printf '%s\n' 'FAIL: one-episode Cosmos smoke did not produce exactly one successful proposal' >&2
+  exit 1
+fi
+
+SMOKE_EPISODE_RESPONSE=$(curl -fsS \
+  "$CURATION_API/episodes/$SMOKE_SOURCE_EPISODE_INDEX?dataset_alias=local%2Fpnp_trash")
+SMOKE_PROPOSAL_ID=$(printf '%s' "$SMOKE_EPISODE_RESPONSE" | jq -er '.active_proposal.id')
+SMOKE_PROPOSAL_ATTEMPT_ID=$(printf '%s' "$SMOKE_EPISODE_RESPONSE" \
+  | jq -er '.active_proposal.attempt_id')
+if test "$SMOKE_PROPOSAL_ATTEMPT_ID" != "$SMOKE_ATTEMPT_ID"; then
+  printf '%s\n' 'FAIL: active proposal does not belong to the exact smoke attempt' >&2
+  exit 1
+fi
+SMOKE_DATASET_ID=$(printf '%s' "$SMOKE_STATE_RESPONSE" | jq -er '.configuration.dataset_id')
+SMOKE_SOURCE_MANIFEST_SHA256=$(printf '%s' "$SMOKE_STATE_RESPONSE" \
+  | jq -er '.configuration.source_manifest_sha256')
+if [[ ! "$SMOKE_SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  printf '%s\n' 'FAIL: smoke source manifest identity is invalid' >&2
+  exit 1
+fi
+
+SMOKE_ATTEMPT_ROOT="$CURATION_WORKSPACE/artifacts/cosmos/$SMOKE_ATTEMPT_ID"
+REQUEST_ARTIFACT="$SMOKE_ATTEMPT_ROOT/request.json"
+RESPONSE_ARTIFACT="$SMOKE_ATTEMPT_ROOT/response.txt"
+PARSED_ARTIFACT="$SMOKE_ATTEMPT_ROOT/parsed.json"
+SMOKE_CONTACT_NAMESPACE="$CURATION_WORKSPACE/contact_sheets/datasets/dataset_${SMOKE_DATASET_ID}_${SMOKE_SOURCE_MANIFEST_SHA256}"
+PROPOSAL_CONTACT_SHEET="$SMOKE_CONTACT_NAMESPACE/proposals/proposal_${SMOKE_PROPOSAL_ID}.png"
+PROPOSAL_CONTACT_RECEIPT="$SMOKE_CONTACT_NAMESPACE/receipts/proposals/proposal_${SMOKE_PROPOSAL_ID}.png.receipt.json"
+
+require_smoke_regular_file() {
+  if ! test -f "$1" || test -L "$1"; then
+    printf 'FAIL: one-episode %s artifact is unavailable\n' "$2" >&2
     exit 1
-    ;;
-esac
+  fi
+}
+require_smoke_regular_file "$REQUEST_ARTIFACT" request
+require_smoke_regular_file "$RESPONSE_ARTIFACT" response
+require_smoke_regular_file "$PARSED_ARTIFACT" parsed
+require_smoke_regular_file "$PROPOSAL_CONTACT_SHEET" contact-sheet
+require_smoke_regular_file "$PROPOSAL_CONTACT_RECEIPT" contact-sheet-receipt
+
+cd "$CURATION_REPO_ROOT"
+SMOKE_AUTHORITY_JSON=$(
+  backend/.venv/bin/python -m backend.curation.runbook_validation smoke \
+    --workspace "$CURATION_WORKSPACE" \
+    --status-json "$SMOKE_STATE_RESPONSE" \
+    --episode-json "$SMOKE_EPISODE_RESPONSE" \
+    --expected-smoke-job-id "$SMOKE_JOB_ID"
+)
+SMOKE_AUTHORITY_SHA256=$(printf '%s' "$SMOKE_AUTHORITY_JSON" | sha256sum | awk '{print $1}')
+if [[ ! "$SMOKE_AUTHORITY_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+  printf '%s\n' 'FAIL: canonical smoke authority hash is invalid' >&2
+  exit 1
+fi
+AUTHORITATIVE_RESPONSE_RELATIVE_PATH=$(printf '%s' "$SMOKE_AUTHORITY_JSON" \
+  | jq -er '.artifacts.authoritative_response.relative_path')
+AUTHORITATIVE_RESPONSE_ARTIFACT="$CURATION_WORKSPACE/$AUTHORITATIVE_RESPONSE_RELATIVE_PATH"
+
+printf 'Raw response: %s\nParsed proposal: %s\nSampling request: %s\nContact sheet: %s\n' \
+  "$AUTHORITATIVE_RESPONSE_ARTIFACT" "$PARSED_ARTIFACT" "$REQUEST_ARTIFACT" "$PROPOSAL_CONTACT_SHEET"
+SMOKE_CONFIRMATION_EXPECTED="CONFIRM SMOKE EVIDENCE $SMOKE_JOB_ID $SMOKE_ATTEMPT_ID"
+printf 'Required confirmation: %s\n' "$SMOKE_CONFIRMATION_EXPECTED"
+if ! read -r -p 'After inspecting the raw response, parsed proposal, sampling evidence, contact sheet, and UI, type the exact confirmation: ' SMOKE_EVIDENCE_CONFIRMED; then
+  printf '%s\n' 'FAIL: one-episode evidence and UI inspection were not explicitly confirmed' >&2
+  exit 1
+fi
+if test "$SMOKE_EVIDENCE_CONFIRMED" != "$SMOKE_CONFIRMATION_EXPECTED"; then
+  printf '%s\n' 'FAIL: one-episode evidence and UI inspection were not explicitly confirmed' >&2
+  exit 1
+fi
+export CONFIRMED_SMOKE_JOB_ID="$SMOKE_JOB_ID"
+export CONFIRMED_SMOKE_ATTEMPT_ID="$SMOKE_ATTEMPT_ID"
+export CONFIRMED_SMOKE_SOURCE_EPISODE_INDEX="$SMOKE_SOURCE_EPISODE_INDEX"
+export CONFIRMED_SMOKE_AUTHORITY_JSON="$SMOKE_AUTHORITY_JSON"
+export CONFIRMED_SMOKE_AUTHORITY_SHA256="$SMOKE_AUTHORITY_SHA256"
+export SMOKE_EVIDENCE_CONFIRMED
+printf 'Preserve these shell variables before the full batch: %s\n' \
+  "$SMOKE_CONFIRMATION_EXPECTED"
 ```
 
-Require terminal `completed` or `completed_with_failures`; a `manual_only`
-episode remains eligible for human review and is never automatically rejected.
-For a successful proposal, inspect its immutable artifacts:
-
-```bash
-find "$CURATION_WORKSPACE/artifacts/cosmos" -type f -path '*/request.json' -print
-find "$CURATION_WORKSPACE/artifacts/cosmos" -type f -path '*/response.txt' -print
-find "$CURATION_WORKSPACE/artifacts/cosmos" -type f -path '*/parsed.json' -print
-find "$CURATION_WORKSPACE/contact_sheets" -type f -path '*/proposals/*.png' -print
-```
-
-In `request.json`, require `sampling.original_fps == 50`,
-`sampling.target_fps == 2`, increasing source-frame indices and recorded
-parquet timestamps, plus `request_body.media_io_kwargs.video.fps == 50` and
-`do_sample_frames == false`. Confirm the base64 payload is replaced by a hash.
-Inspect the raw response, parsed v2 status/times, six-cell proposal contact
-sheet, and UI rendering. Null transitions must render `not observed`
-placeholders without fabricated images or deltas.
+Only exact terminal `completed` with one succeeded attempt, no
+`manual_only`/`retryable` attempt, and one active proposal is a valid smoke.
+The operator confirmation is mandatory after inspecting the raw response,
+parsed v2 status/times, strict 50-to-2 fps sampling proof, six-cell proposal
+contact sheet and receipt, and UI rendering. Null transitions must render
+`not observed` placeholders without fabricated images or deltas.
 
 ## Run and monitor the full Cosmos batch
 
-The API only persists a queued job. It never launches a worker. After the smoke
-job is terminal, create the full 92-episode batch:
+The API only persists a queued job. It never launches a worker. Create the full
+92-episode batch only in the same authenticated shell after the exact smoke job
+and attempt evidence plus UI inspection were explicitly confirmed:
 
 ```bash
+set -euo pipefail
+if test -z "${CONFIRMED_SMOKE_JOB_ID:-}"; then
+  printf '%s\n' 'FAIL: confirmed one-episode smoke job ID is required' >&2
+  exit 1
+fi
+if test -z "${CONFIRMED_SMOKE_ATTEMPT_ID:-}"; then
+  printf '%s\n' 'FAIL: confirmed one-episode smoke attempt ID is required' >&2
+  exit 1
+fi
+if test "${CONFIRMED_SMOKE_SOURCE_EPISODE_INDEX:-}" != 4; then
+  printf '%s\n' 'FAIL: confirmed smoke must bind pinned representative episode 4' >&2
+  exit 1
+fi
+if test -z "${CONFIRMED_SMOKE_AUTHORITY_JSON:-}" \
+  || [[ ! "${CONFIRMED_SMOKE_AUTHORITY_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+  printf '%s\n' 'FAIL: canonical confirmed smoke authority is required' >&2
+  exit 1
+fi
+SMOKE_CONFIRMATION_EXPECTED="CONFIRM SMOKE EVIDENCE $CONFIRMED_SMOKE_JOB_ID $CONFIRMED_SMOKE_ATTEMPT_ID"
+if test "${SMOKE_EVIDENCE_CONFIRMED:-}" != "$SMOKE_CONFIRMATION_EXPECTED"; then
+  printf '%s\n' 'FAIL: smoke evidence and UI confirmation do not match the exact job and attempt' >&2
+  exit 1
+fi
+CURATION_API=http://127.0.0.1:3000/api/curation
+CONFIRMED_AUTHORITY_ACTUAL_SHA256=$(printf '%s' "$CONFIRMED_SMOKE_AUTHORITY_JSON" \
+  | sha256sum | awk '{print $1}')
+if test "$CONFIRMED_AUTHORITY_ACTUAL_SHA256" != "$CONFIRMED_SMOKE_AUTHORITY_SHA256"; then
+  printf '%s\n' 'FAIL: confirmed smoke authority hash does not match' >&2
+  exit 1
+fi
+CURRENT_SMOKE_STATUS=$(curl -fsS "$CURATION_API/batches/$CONFIRMED_SMOKE_JOB_ID")
+SMOKE_SOURCE_EPISODE_INDEX="$CONFIRMED_SMOKE_SOURCE_EPISODE_INDEX"
+CURRENT_SMOKE_EPISODE=$(curl -fsS \
+  "$CURATION_API/episodes/$SMOKE_SOURCE_EPISODE_INDEX?dataset_alias=local%2Fpnp_trash")
+cd "$CURATION_REPO_ROOT"
+CURRENT_SMOKE_AUTHORITY_JSON=$(
+  backend/.venv/bin/python -m backend.curation.runbook_validation smoke \
+    --workspace "$CURATION_WORKSPACE" \
+    --status-json "$CURRENT_SMOKE_STATUS" \
+    --episode-json "$CURRENT_SMOKE_EPISODE" \
+    --expected-smoke-job-id "$CONFIRMED_SMOKE_JOB_ID"
+)
+if test "$CURRENT_SMOKE_AUTHORITY_JSON" != "$CONFIRMED_SMOKE_AUTHORITY_JSON"; then
+  printf '%s\n' 'FAIL: current smoke evidence does not match the confirmed authority' >&2
+  exit 1
+fi
 BATCH_RESPONSE=$(curl -fsS -H 'Content-Type: application/json' \
   -H 'Origin: http://127.0.0.1:3000' \
   -d '{"dataset_alias":"local/pnp_trash"}' \
@@ -670,9 +980,18 @@ BATCH_RESPONSE=$(curl -fsS -H 'Content-Type: application/json' \
 JOB_ID=$(printf '%s' "$BATCH_RESPONSE" | jq -er '.job_id')
 test -n "$JOB_ID"
 printf '%s\n' "$BATCH_RESPONSE" | jq
+FULL_BATCH_STATUS=$(curl -fsS "$CURATION_API/batches/$JOB_ID")
+backend/.venv/bin/python -m backend.curation.runbook_validation full-batch \
+  --workspace "$CURATION_WORKSPACE" \
+  --authority-json "$CONFIRMED_SMOKE_AUTHORITY_JSON" \
+  --authority-sha256 "$CONFIRMED_SMOKE_AUTHORITY_SHA256" \
+  --smoke-status-json "$CURRENT_SMOKE_STATUS" \
+  --smoke-episode-json "$CURRENT_SMOKE_EPISODE" \
+  --full-status-json "$FULL_BATCH_STATUS" \
+  --expected-full-job-id "$JOB_ID" \
+  --expected-smoke-job-id "$CONFIRMED_SMOKE_JOB_ID"
 
-cd /home/jihun/work/lerobot-dataset-visualizer
-backend/.venv/bin/python backend/curation_worker.py \
+run_curation_worker \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   run --job-id "$JOB_ID"
 ```
@@ -716,8 +1035,7 @@ RETRY_RESPONSE=$(curl -fsS -H 'Content-Type: application/json' \
 RETRY_JOB_ID=$(printf '%s' "$RETRY_RESPONSE" | jq -er '.job_id')
 test -n "$RETRY_JOB_ID"
 
-cd /home/jihun/work/lerobot-dataset-visualizer
-backend/.venv/bin/python backend/curation_worker.py \
+run_curation_worker \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   run --job-id "$RETRY_JOB_ID"
 ```
@@ -804,9 +1122,8 @@ test -n "$EXPORT_ID"
 test "${#APPROVAL_SNAPSHOT_SHA256}" -eq 64
 printf '%s\n' "$EXPORT_RESPONSE" | jq
 
-cd /home/jihun/work/lerobot-dataset-visualizer
 test -n "$EXPORT_ID"
-backend/.venv/bin/python backend/curation_export.py \
+run_curation_exporter \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   run --export-id "$EXPORT_ID"
 ```
@@ -856,9 +1173,8 @@ move, chmod, or repair staging/final paths manually.
   explicit operator retry.
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
 test -n "$JOB_ID"
-backend/.venv/bin/python backend/curation_worker.py \
+run_curation_worker \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   resume --job-id "$JOB_ID"
 ```
@@ -879,9 +1195,8 @@ backend/.venv/bin/python backend/curation_worker.py \
   run `resume` after fixing only the external filesystem condition.
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
 test -n "$EXPORT_ID"
-backend/.venv/bin/python backend/curation_export.py \
+run_curation_exporter \
   --workspace /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation \
   resume --export-id "$EXPORT_ID"
 ```
@@ -907,7 +1222,7 @@ sha256sum --check meta/curation_checksums.sha256
 cd /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash
 sha256sum --check /home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation/source-files.sha256
 
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python -m pytest -q backend/tests
 bun run validate
 ```

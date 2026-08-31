@@ -16,6 +16,7 @@ variable must validate before the backend starts.
 From the repository root:
 
 ```bash
+cd "$CURATION_REPO_ROOT"
 python -m venv backend/.venv
 backend/.venv/bin/python -m pip install -r backend/requirements.txt
 bun install
@@ -29,6 +30,7 @@ uses the same virtual environment as the service.
 Use this non-secret mapping verbatim:
 
 ```bash
+export CURATION_REPO_ROOT=/home/jihun/work/GR00T-WholeBodyControl/worktrees/lerobot-dataset-visualizer-pnp-trash
 export CURATION_DATASET_ALIASES_JSON='{"local/pnp_trash":"/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash"}'
 export CURATION_WORKSPACE=/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_curation
 export CURATION_OUTPUT=/home/jihun/work/GR00T-WholeBodyControl/outputs/pnp_trash_cleaned
@@ -50,21 +52,30 @@ the variables `CURATION_BEARER_TOKEN`, `COSMOS_BASE_URL`, `COSMOS_MODEL`,
 `COSMOS_API_KEY_ENV`, and `COSMOS_ENDPOINT_IDENTITY`. Do not put their values
 in this repository.
 
-`backend.app:app`, `backend/curation_worker.py`, and
-`backend/curation_export.py` all call `CurationSettings.from_env()`. Every one
-of those three Python processes therefore requires the complete settings
-environment: the five non-secret mapping values consumed by
-`CurationSettings` (`CURATION_DATASET_ALIASES_JSON`, `CURATION_WORKSPACE`,
-`CURATION_OUTPUT`, `CURATION_BROWSER_ORIGIN`, and `ISAAC_GROOT_ROOT`), all five
-external runtime names, including the `COSMOS_API_KEY_ENV` name. Only the
-backend and worker receive the actual credential variable named by
-`COSMOS_API_KEY_ENV`; the exporter must not receive that secret. The backend reads the variable named by
-`COSMOS_API_KEY_ENV` during batch capability validation before it creates a
-job; the worker reads it for Cosmos calls. The exporter makes no Cosmos call
-and launches without the target credential variable. Neither CLI accepts a
-secret argument. `CURATION_BACKEND_HOST` is optional and defaults to
-`127.0.0.1`; all three Python entrypoints reject a non-loopback value while
-loading settings.
+`backend.app:app` uses `CurationSettings.from_env()`,
+`backend/curation_worker.py` uses `WorkerSettings.from_env()`, and
+`backend/curation_export.py` uses `ExportSettings.from_env()`. FastAPI alone
+requires output, browser origin, bearer, and backend-host configuration. The
+worker requires aliases, workspace, Cosmos base/model/API-key environment
+variable name/endpoint identity, and its frozen limits. The exporter requires
+aliases, workspace, Isaac-GR00T root, Cosmos model, and endpoint identity.
+Only the backend and worker receive the actual credential variable named by
+`COSMOS_API_KEY_ENV`; the exporter must not receive that secret. The backend
+reads the variable named by `COSMOS_API_KEY_ENV` during batch capability
+validation before it creates a job; the worker reads it only when building a
+Cosmos attempt processor. A distinct name such as `COSMOS_API_KEY` is valid;
+FastAPI and the worker reject collisions with inherited process names,
+`CURATION_*`/`NEXT_PUBLIC_*`, and named Cosmos/Isaac settings before reading
+or forwarding the target. The exporter receives neither the bearer nor Cosmos
+base/API-key configuration and makes no Cosmos call. Neither CLI accepts a
+secret argument. `CURATION_BACKEND_HOST` is FastAPI-only, optional, defaults
+to `127.0.0.1`, and rejects a non-loopback value.
+
+Do not launch either CLI directly from the ambient operator environment. Use
+the runbook's explicit `env -i` `run_curation_worker` and
+`run_curation_exporter` functions. They enforce the process-specific
+allowlists and remove the dynamic Cosmos credential from the exporter even
+when it is present in the parent shell.
 
 Next.js requires only `CURATION_BACKEND_URL`, `CURATION_BEARER_TOKEN`, and
 `NEXT_PUBLIC_DATASET_URL`. Its bearer value must exactly match the backend's.
@@ -84,7 +95,7 @@ Start the backend from the repository root. This package-relative import is
 intentional and is the supported curation entrypoint:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 8000
 ```
 
@@ -92,7 +103,7 @@ Start Next.js in a second terminal containing only `CURATION_BACKEND_URL`,
 `CURATION_BEARER_TOKEN`, and `NEXT_PUBLIC_DATASET_URL`:
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 bun run dev --hostname 127.0.0.1 --port 3000
 ```
 
@@ -100,6 +111,10 @@ Open
 `http://127.0.0.1:3000/local/pnp_trash/episode_0?tab=annotations` only after
 the runbook preflight passes. FastAPI never starts a Cosmos worker or exporter
 in the background; their persisted IDs must be run through the separate CLIs.
+Configured FastAPI startup creates the canonical source manifest and
+initializes curation.sqlite3 before serving. Task 14 integration is not
+complete: the approved-source loopback and browser smoke remains pending until
+the operator loads the secure runtime configuration and executes the runbook.
 
 ## Curation routes
 
@@ -152,13 +167,13 @@ supported; it is not used by the PnP-trash curation workspace.
 ## Regression gates
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
+cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python -m pytest -q backend/tests
 ```
 
 ```bash
-cd /home/jihun/work/lerobot-dataset-visualizer
-bun run format && bun run validate
+cd "$CURATION_REPO_ROOT"
+bun run format:check && bun run validate
 ```
 
 The backend suite includes the v3.1 compatibility gate. Both commands are

@@ -8,7 +8,7 @@ import sqlite3
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
-from curation.config import CurationConfigurationError, CurationSettings
+from curation.config import CurationConfigurationError, ExportSettings
 from curation.db import (
     CurationDatabase,
     IllegalStateTransition,
@@ -62,7 +62,7 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
     database = CurationDatabase(database_path)
     try:
         database.validate_worker_compatibility()
-        settings = CurationSettings.from_env()
+        settings = ExportSettings.from_env()
         if settings.workspace != arguments.workspace:
             raise CurationConfigurationError("CLI workspace does not match CURATION_WORKSPACE")
         export = database.get_export(export_id=arguments.export_id)

@@ -800,7 +800,7 @@ def test_export_cli_freezes_run_and_resume_commands_and_runs_out_of_process_cont
             "cosmos_endpoint_identity": "h100",
         },
     )()
-    monkeypatch.setattr(cli_module.CurationSettings, "from_env", classmethod(lambda cls: settings))
+    monkeypatch.setattr(cli_module.ExportSettings, "from_env", classmethod(lambda cls: settings))
 
     class FakeValidatedExporter:
         def __init__(self, **kwargs):
@@ -827,6 +827,54 @@ def test_export_cli_freezes_run_and_resume_commands_and_runs_out_of_process_cont
     assert output["event"] == "export_published"
     assert output["export_id"] == created["export_id"]
     assert output["state"] == "published"
+
+
+def test_export_cli_runs_without_backend_or_worker_only_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import curation_export as cli_module
+
+    source, workspace, _, _, service, _ = _rich_case(tmp_path)
+    created = service.create("local/pnp_trash")
+    minimal = {
+        "CURATION_DATASET_ALIASES_JSON": json.dumps({"local/pnp_trash": str(source)}),
+        "CURATION_WORKSPACE": str(workspace),
+        "ISAAC_GROOT_ROOT": str(tmp_path / "isaac"),
+        "COSMOS_MODEL": "cosmos",
+        "COSMOS_ENDPOINT_IDENTITY": "h100",
+    }
+    for name, value in minimal.items():
+        monkeypatch.setenv(name, value)
+    for name in (
+        "CURATION_OUTPUT",
+        "CURATION_BROWSER_ORIGIN",
+        "CURATION_BEARER_TOKEN",
+        "COSMOS_BASE_URL",
+        "COSMOS_API_KEY_ENV",
+        "TEST_COSMOS_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    class FakeValidatedExporter:
+        def __init__(self, **kwargs: object):
+            pass
+
+        def run(self, export_id: str) -> dict[str, object]:
+            return {
+                "export_id": export_id,
+                "state": "published",
+                "final_path": created["final_path"],
+                "approval_snapshot_sha256": created["approval_snapshot_sha256"],
+            }
+
+        resume = run
+
+    monkeypatch.setattr(cli_module, "ValidatedDatasetExporter", FakeValidatedExporter)
+
+    assert cli_module.cli_main(["--workspace", str(workspace), "run", "--export-id", created["export_id"]]) == 0
+    assert json.loads(capsys.readouterr().out)["event"] == "export_published"
 
 
 def test_export_cli_sanitizes_retryable_database_failure(
@@ -873,7 +921,7 @@ def test_export_cli_sanitizes_lifecycle_conflict(
             "cosmos_endpoint_identity": "h100",
         },
     )()
-    monkeypatch.setattr(cli_module.CurationSettings, "from_env", classmethod(lambda cls: settings))
+    monkeypatch.setattr(cli_module.ExportSettings, "from_env", classmethod(lambda cls: settings))
 
     def conflict(self: object, export_id: str) -> dict[str, object]:
         raise StateTransitionConflict(
@@ -912,7 +960,7 @@ def test_export_cli_emits_exact_sanitized_json_for_unsupported_publication_prefl
             "cosmos_endpoint_identity": "h100",
         },
     )()
-    monkeypatch.setattr(cli_module.CurationSettings, "from_env", classmethod(lambda cls: settings))
+    monkeypatch.setattr(cli_module.ExportSettings, "from_env", classmethod(lambda cls: settings))
     exporter_type = cli_module.ValidatedDatasetExporter
 
     def exporter_factory(**kwargs):

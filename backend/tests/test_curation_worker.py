@@ -19,7 +19,7 @@ import time
 from uuid import uuid4
 
 import av
-from curation.config import CurationSettings
+from curation.config import WorkerSettings
 from curation.contact_sheets import (
     ContactSheetDatasetIdentity,
     proposal_contact_sheet_path,
@@ -702,7 +702,7 @@ def test_cli_workspace_canonicalizes_a_symlinked_ancestor_to_the_runtime_authori
 
     environment = _trusted_runtime_environment(workspace=real_workspace, source=source)
     environment["CURATION_WORKSPACE"] = str(lexical_workspace)
-    settings = CurationSettings.from_env(environment)
+    settings = WorkerSettings.from_env(environment)
     parser = build_cli_parser()
     job_id = "00000000-0000-0000-0000-000000000000"
 
@@ -716,6 +716,33 @@ def test_cli_workspace_canonicalizes_a_symlinked_ancestor_to_the_runtime_authori
     assert authority.workspace == settings.workspace
     with pytest.raises(SystemExit):
         parser.parse_args(["--workspace", "relative/workspace", "resume", "--job-id", job_id])
+
+
+def test_worker_cli_runs_without_fastapi_or_exporter_only_environment(
+    lifecycle: tuple[CurationDatabase, BatchRepository, MutableClock, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database, repository, _, job_id = lifecycle
+    for name in (
+        "CURATION_OUTPUT",
+        "CURATION_BROWSER_ORIGIN",
+        "CURATION_BEARER_TOKEN",
+        "ISAAC_GROOT_ROOT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def process_attempt(attempt: dict[str, object], owner: str) -> None:
+        repository.finish_attempt_manual_only(str(attempt["id"]), owner=owner, reason="test-only")
+
+    monkeypatch.setattr(worker_module, "build_attempt_processor", lambda **kwargs: process_attempt)
+
+    assert cli_main(["--workspace", str(database.path.parent), "run", "--job-id", job_id]) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {
+        "event": "worker_terminal",
+        "job_id": job_id,
+        "state": "completed_with_failures",
+    }
 
 
 def test_cli_entrypoint_exact_state_and_conflict_exit_codes(
