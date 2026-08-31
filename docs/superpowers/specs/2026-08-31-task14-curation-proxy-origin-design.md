@@ -74,7 +74,7 @@ headers, the marker, a browser authorization header, or other client headers.
 
 This preserves the existing three-variable Next.js boundary:
 `CURATION_BACKEND_URL`, `CURATION_BEARER_TOKEN`, and
-`NEXT_PUBLIC_LOCAL_DATASET_BASE_URL`. The already configured, non-secret
+`NEXT_PUBLIC_DATASET_URL`. The already configured, non-secret
 `CURATION_BROWSER_ORIGIN` remains FastAPI-only; no new Next.js environment
 coupling is introduced.
 
