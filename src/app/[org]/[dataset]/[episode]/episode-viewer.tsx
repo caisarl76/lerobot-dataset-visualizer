@@ -10,6 +10,10 @@ import {
 } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { postParentMessageWithParams } from "@/utils/postParentMessage";
+import {
+  resolveInitialEpisodeViewerTab,
+  type ActiveTab,
+} from "@/utils/episodeViewerTabs";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
 import PlaybackBar from "@/components/playback-bar";
 import { TimeProvider, useTime } from "@/context/time-context";
@@ -75,16 +79,6 @@ function isKeyboardFocusInsideTextEntry(target: EventTarget | null): boolean {
     (tag === "A" && target.hasAttribute("href"))
   );
 }
-
-type ActiveTab =
-  | "episodes"
-  | "annotations"
-  | "statistics"
-  | "frames"
-  | "insights"
-  | "filtering"
-  | "doctor"
-  | "urdf";
 
 // Subscribes to `currentTime` so its parent doesn't have to. Keeping this
 // in a leaf component means the throttled time ticks (~12.5/s during
@@ -339,6 +333,9 @@ function EpisodeViewerInner({
     datasetInfo.repoId,
     datasetInfo.codebase_version,
   );
+  const urdfAvailable =
+    hasURDFSupport(datasetInfo.robot_type) &&
+    datasetInfo.codebase_version >= "v3.0";
   const [annotationMode, setAnnotationMode] = useState<"atoms" | "task_index">(
     taskIndexDataset ? "task_index" : "atoms",
   );
@@ -346,26 +343,15 @@ function EpisodeViewerInner({
   // Tab state & lazy stats — read sessionStorage in the initializer so the
   // correct tab renders on the very first frame (no post-mount flash).
   // Safe because EpisodeViewerInner only mounts client-side (behind a loading gate).
-  const [activeTab, setActiveTab] = useState<ActiveTab>(() => {
-    if (typeof window !== "undefined") {
-      const stored = sessionStorage.getItem("activeTab");
-      if (
-        stored &&
-        [
-          "episodes",
-          "annotations",
-          "statistics",
-          "frames",
-          "insights",
-          "filtering",
-          "urdf",
-        ].includes(stored)
-      ) {
-        return stored as ActiveTab;
-      }
-    }
-    return "episodes";
-  });
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() =>
+    resolveInitialEpisodeViewerTab(
+      searchParams,
+      typeof window === "undefined"
+        ? null
+        : sessionStorage.getItem("activeTab"),
+      { urdfAvailable },
+    ),
+  );
   const isLoading = activeTab === "episodes" && (!videosReady || !chartsReady);
 
   useEffect(() => {
@@ -419,13 +405,10 @@ function EpisodeViewerInner({
   // Eagerly load the URDFViewer bundle + warm the STL geometry cache while
   // the user is on the Episodes tab, so the 3D Replay tab opens faster.
   useEffect(() => {
-    if (
-      hasURDFSupport(datasetInfo.robot_type) &&
-      datasetInfo.codebase_version >= "v3.0"
-    ) {
+    if (urdfAvailable) {
       void import("@/components/urdf-viewer");
     }
-  }, [datasetInfo.robot_type, datasetInfo.codebase_version]);
+  }, [urdfAvailable]);
 
   // Persist UI state across episode navigations. One effect instead of
   // three near-identical writes — fewer commit hooks per render and the
@@ -696,9 +679,7 @@ function EpisodeViewerInner({
           "Annotations",
           "Edit subtask / plan / memory / interjection / VQA atoms (lerobot v3.1 schema)",
         )}
-        {hasURDFSupport(datasetInfo.robot_type) &&
-          datasetInfo.codebase_version >= "v3.0" &&
-          renderTab("urdf", "3D Replay")}
+        {urdfAvailable && renderTab("urdf", "3D Replay")}
         {renderTab("statistics", "Statistics")}
         {renderTab("filtering", "Filtering")}
         {renderTab("frames", "Frames")}

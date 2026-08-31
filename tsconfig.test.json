@@ -7,6 +7,7 @@
     "incremental": false
   },
   "files": [
+    "src/app/[org]/[dataset]/[episode]/__tests__/episode-viewer-tabs.test.tsx",
     "src/app/api/curation/[...path]/__tests__/route.test.ts",
     "src/components/__tests__/task-index-curation-timeline.test.tsx",
     "src/components/__tests__/task-index-curation-workspace.test.tsx",
