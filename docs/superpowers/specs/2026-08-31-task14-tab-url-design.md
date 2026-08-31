@@ -12,14 +12,27 @@ URL does not reach the task-index curation workspace.
 
 Resolve the initial viewer tab with this precedence:
 
-1. a recognized `tab` query value;
-2. a recognized `sessionStorage.activeTab` value;
+1. one non-repeated, recognized, available `tab` query value;
+2. a recognized, available `sessionStorage.activeTab` value;
 3. `episodes`.
 
-Recognized values are exactly the existing `ActiveTab` union. Unknown, empty,
-or repeated query values do not become application state. This change is
-initial-load authority only: tab clicks retain the existing state and session
-persistence behavior, and no new router writes are introduced.
+Query values may name any member of the existing `ActiveTab` union, including
+`doctor`. Persisted values intentionally retain the narrower legacy whitelist,
+which omits `doctor`; this preserves the existing session-restoration contract
+rather than silently turning the URL fix into a second behavior change.
+Unknown, empty, or repeated query values do not become application state.
+
+Availability is evaluated for both query and persisted values. `urdf` is
+available only when `hasURDFSupport(robotType)` is true and
+`codebaseVersion >= "v3.0"`; otherwise it is ignored and resolution continues
+to the next source. This closes the existing stale-session edge case as well as
+preventing `?tab=urdf` from entering an unavailable, hidden state.
+
+This change is initial-load authority only: tab clicks retain the existing
+state and session persistence behavior, and no new router writes are
+introduced. The URL may therefore become stale after a click, and same-mount
+back/forward changes to `tab` are not applied. Those limitations are deliberate
+for this narrow Task 14 repair.
 
 The implementation will use a small pure resolver so precedence and invalid
 input behavior can be tested without mounting the full episode viewer.
@@ -36,10 +49,17 @@ input behavior can be tested without mounting the full episode viewer.
 
 ## Verification
 
-Test-first coverage will prove query precedence, session fallback, default
-fallback, and rejection of invalid query/session values. After the frontend
-suite passes, the live Task 14 browser gate must prove that the documented URL
-renders the task-index workspace, seven-phase timeline, metadata charts, and a
-seekable video. Browser-visible DOM, loaded scripts, and local-asset request
-headers must contain neither ephemeral runtime secret nor Cosmos endpoint
-configuration; local assets must continue to load directly from port 8000.
+Test-first resolver coverage will prove query precedence, the legacy persisted
+whitelist, default fallback, repeated-query rejection, and eligible/ineligible
+URDF behavior. A separate initialization-path component test will render the
+real episode viewer with controlled dataset metadata, URL, and session storage;
+it must prove the viewer actually uses the resolver and reaches Annotations for
+`?tab=annotations`. That wiring test also covers a repeated query and both
+eligible and ineligible URDF cases.
+
+After the frontend suite passes, the live Task 14 browser gate must prove that
+the documented URL renders the task-index workspace, seven-phase timeline,
+metadata charts, and a seekable video. Browser-visible DOM, loaded scripts, and
+local-asset request headers must contain neither ephemeral runtime secret nor
+Cosmos endpoint configuration; local assets must continue to load directly
+from port 8000.
