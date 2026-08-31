@@ -469,7 +469,10 @@ function episode(value: unknown): EpisodeCuration {
       turnDirection: direction,
       transitionFrames: transitions,
       rejectionReason,
-      promptTemplateSha256: sha256(decisionRecord.prompt_template_sha256),
+      promptTemplateSha256:
+        decisionRecord.prompt_template_sha256 === null
+          ? null
+          : sha256(decisionRecord.prompt_template_sha256),
     },
     activeProposal: proposal(record.active_proposal, sourceLength),
     promptPreview,

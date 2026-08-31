@@ -83,7 +83,7 @@ export interface CurationDecision {
   turnDirection: TurnDirection | null;
   transitionFrames: TransitionFrames;
   rejectionReason: string | null;
-  promptTemplateSha256: string;
+  promptTemplateSha256: string | null;
 }
 
 export interface EpisodeCuration {

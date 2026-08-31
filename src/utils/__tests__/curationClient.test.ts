@@ -99,7 +99,7 @@ function pendingEpisode(datasetAlias: string, sourceEpisodeIndex: number) {
       turn_direction: null,
       transition_frames: [null, null, null, null, null, null],
       rejection_reason: null,
-      prompt_template_sha256: SHA,
+      prompt_template_sha256: null,
     },
     active_proposal: null,
     prompt_preview: null,
@@ -407,6 +407,17 @@ describe("curation client runtime contracts", () => {
     expect(decoded.revision).toBe(3);
     expect(decoded.approvalRevision).toBe(2);
     expect(decoded.warnings).toContain("approval_revision_mismatch");
+  });
+
+  test("accepts the backend's null prompt hash for a pending decision", async () => {
+    globalThis.fetch = mock(async () =>
+      Response.json(pendingEpisode("local/pnp_trash", 0)),
+    ) as typeof fetch;
+
+    const decoded = await fetchEpisodeCuration("local/pnp_trash", 0);
+
+    expect(decoded.decision.reviewState).toBe("pending");
+    expect(decoded.decision.promptTemplateSha256).toBeNull();
   });
 
   test("rejects unsafe job identifiers across batch and cancellation contracts", async () => {
