@@ -87,10 +87,7 @@ mock.module("@/utils/versionUtils", () => ({
 
 const { default: EpisodeViewer } = await import("../episode-viewer");
 
-function episodeFixture(
-  robotType = "unitree_g1",
-  codebaseVersion = "v2.1",
-) {
+function episodeFixture(robotType = "unitree_g1", codebaseVersion = "v2.1") {
   return {
     datasetInfo: {
       repoId: "local/pnp_trash",
@@ -131,10 +128,7 @@ async function renderViewer(options: {
   if (options.persisted !== undefined && options.persisted !== null) {
     sessionStorage.setItem("activeTab", options.persisted);
   }
-  loadedFixture = episodeFixture(
-    options.robotType,
-    options.codebaseVersion,
-  );
+  loadedFixture = episodeFixture(options.robotType, options.codebaseVersion);
   let view!: RenderResult;
   await act(async () => {
     view = render(

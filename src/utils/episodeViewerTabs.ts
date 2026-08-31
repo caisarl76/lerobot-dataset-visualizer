@@ -35,8 +35,7 @@ function isAvailableTab(
   availability: EpisodeViewerTabAvailability,
 ): value is ActiveTab {
   return (
-    QUERY_TABS.has(value) &&
-    (value !== "urdf" || availability.urdfAvailable)
+    QUERY_TABS.has(value) && (value !== "urdf" || availability.urdfAvailable)
   );
 }
 
