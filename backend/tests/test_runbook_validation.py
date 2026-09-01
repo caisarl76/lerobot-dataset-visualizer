@@ -280,6 +280,41 @@ def test_smoke_authority_accepts_exact_initial_and_repair_response_evidence(tmp_
         assert authority["configuration"] == status["configuration"]
 
 
+def test_smoke_authority_normalizes_integral_source_fps_from_next_proxy(tmp_path: Path) -> None:
+    status, episode, workspace = _smoke_fixture(tmp_path)
+    status["configuration"]["source_fps"] = 50
+
+    authority = build_smoke_authority(
+        workspace=workspace,
+        status=status,
+        episode=episode,
+        expected_smoke_job_id="job-smoke",
+    )
+
+    assert authority["configuration"]["source_fps"] == 50.0
+    assert type(authority["configuration"]["source_fps"]) is float
+
+
+@pytest.mark.parametrize(
+    "source_fps",
+    [49, 10**400, True, "50", -50, 0],
+    ids=["wrong-integer", "oversized-integer", "boolean", "string", "negative", "zero"],
+)
+def test_smoke_authority_rejects_noncanonical_source_fps(
+    tmp_path: Path, source_fps: object
+) -> None:
+    status, episode, workspace = _smoke_fixture(tmp_path)
+    status["configuration"]["source_fps"] = source_fps
+
+    with pytest.raises(RunbookValidationError, match="smoke configuration is invalid"):
+        build_smoke_authority(
+            workspace=workspace,
+            status=status,
+            episode=episode,
+            expected_smoke_job_id="job-smoke",
+        )
+
+
 def test_smoke_authority_rejects_status_from_a_different_posted_job(tmp_path: Path) -> None:
     status, episode, workspace = _smoke_fixture(tmp_path)
     status["job_id"] = "stale-job"
@@ -389,6 +424,7 @@ def test_smoke_authority_rejects_hostile_evidence(
 
 def test_full_batch_authority_revalidates_smoke_and_exact_new_configuration(tmp_path: Path) -> None:
     status, episode, workspace = _smoke_fixture(tmp_path)
+    status["configuration"]["source_fps"] = 50
     authority = build_smoke_authority(
         workspace=workspace,
         status=status,
@@ -415,6 +451,7 @@ def test_full_batch_authority_revalidates_smoke_and_exact_new_configuration(tmp_
             for index in range(92)
         ],
     }
+    full_status["configuration"]["source_fps"] = 50
 
     validate_full_batch_authority(
         workspace=workspace,
@@ -451,6 +488,55 @@ def test_full_batch_authority_revalidates_smoke_and_exact_new_configuration(tmp_
             smoke_status=status,
             smoke_episode=episode,
             full_status=mismatched,
+            expected_full_job_id="job-full",
+            expected_smoke_job_id="job-smoke",
+        )
+
+
+@pytest.mark.parametrize(
+    "source_fps",
+    [49, 10**400, True, "50", -50, 0],
+    ids=["wrong-integer", "oversized-integer", "boolean", "string", "negative", "zero"],
+)
+def test_full_batch_authority_rejects_noncanonical_source_fps(
+    tmp_path: Path, source_fps: object
+) -> None:
+    status, episode, workspace = _smoke_fixture(tmp_path)
+    authority = build_smoke_authority(
+        workspace=workspace,
+        status=status,
+        episode=episode,
+        expected_smoke_job_id="job-smoke",
+    )
+    authority_bytes = json.dumps(authority, sort_keys=True, separators=(",", ":")).encode()
+    full_status = {
+        "job_id": "job-full",
+        "state": "queued",
+        "configuration": _configuration(
+            tmp_path,
+            list(range(92)),
+            manifest_sha256=status["configuration"]["source_manifest_sha256"],
+        ),
+        "episodes": [
+            {
+                "attempt_id": f"attempt-{index}",
+                "attempt_number": 0,
+                "source_episode_index": index,
+                "state": "queued",
+            }
+            for index in range(92)
+        ],
+    }
+    full_status["configuration"]["source_fps"] = source_fps
+
+    with pytest.raises(RunbookValidationError, match="full-batch configuration is invalid"):
+        validate_full_batch_authority(
+            workspace=workspace,
+            authority=authority,
+            authority_sha256=hashlib.sha256(authority_bytes).hexdigest(),
+            smoke_status=status,
+            smoke_episode=episode,
+            full_status=full_status,
             expected_full_job_id="job-full",
             expected_smoke_job_id="job-smoke",
         )
