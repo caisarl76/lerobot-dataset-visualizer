@@ -127,17 +127,17 @@ Every user-visible error has this shape:
 
 Location properties that do not apply are `null`. Stable stages are:
 
-| Stage | Responsibility | Examples |
-| --- | --- | --- |
-| `file_read` | Browser file access | unreadable file or failed `File.text()` |
-| `csv_parse` | CSV syntax and UTF-8 decoding | unterminated quote or inconsistent record width |
-| `csv_schema` | Header contract | missing, duplicate, or unknown header |
-| `row_validation` | Scalar row fields and uniqueness | empty prompt, invalid integer, non-finite timestamp, duplicate key |
-| `dataset_validation` | Source dataset compatibility | missing dataset, unsupported version, unknown episode, unreadable Parquet |
-| `timeline_validation` | Snapped interval rules | zero duration, chronological mismatch, gap, overlap, incomplete coverage |
-| `output_preflight` | Destination safety | source equals output, output already exists, parent is not writable |
-| `dataset_write` | Materialization and Parquet writing | copy, hard-link, or serialization failure |
-| `finalize` | Publishing completed temporary output | atomic rename failure |
+| Stage                 | Responsibility                        | Examples                                                                  |
+| --------------------- | ------------------------------------- | ------------------------------------------------------------------------- |
+| `file_read`           | Browser file access                   | unreadable file or failed `File.text()`                                   |
+| `csv_parse`           | CSV syntax and UTF-8 decoding         | unterminated quote or inconsistent record width                           |
+| `csv_schema`          | Header contract                       | missing, duplicate, or unknown header                                     |
+| `row_validation`      | Scalar row fields and uniqueness      | empty prompt, invalid integer, non-finite timestamp, duplicate key        |
+| `dataset_validation`  | Source dataset compatibility          | missing dataset, unsupported version, unknown episode, unreadable Parquet |
+| `timeline_validation` | Snapped interval rules                | zero duration, chronological mismatch, gap, overlap, incomplete coverage  |
+| `output_preflight`    | Destination safety                    | source equals output, output already exists, parent is not writable       |
+| `dataset_write`       | Materialization and Parquet writing   | copy, hard-link, or serialization failure                                 |
+| `finalize`            | Publishing completed temporary output | atomic rename failure                                                     |
 
 Preview errors use HTTP success with `valid: false` when the request itself is well-formed. Invalid JSON/request models use the normal FastAPI 422 response. Apply returns a structured error response with the same stage model and never reports success for partial output.
 
