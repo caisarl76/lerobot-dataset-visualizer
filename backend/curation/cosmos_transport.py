@@ -598,6 +598,7 @@ def build_initial_request_body(*, model: str, prompt: str, sample: Any) -> dict[
         "media_io_kwargs": {
             "video": {
                 "fps": sample.source_fps,
+                "num_frames": -1,
                 "frames_indices": list(sample.frame_indices),
                 "total_num_frames": sample.total_num_frames,
                 "duration": sample.duration_s,

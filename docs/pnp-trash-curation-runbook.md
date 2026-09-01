@@ -77,7 +77,10 @@ their values do not belong in the repository or this runbook:
   any `CURATION_*`/`NEXT_PUBLIC_*` name, or the named Cosmos/Isaac settings in
   the table.
 - `COSMOS_ENDPOINT_IDENTITY`: stable non-secret operator identity recorded in
-  provenance, supplied from the existing Cosmos runtime configuration.
+  provenance. For this approved run it is exactly
+  `h100-cosmos3-nano-vllm-0.23.0@sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`, combining the H100 service identity, installed vLLM
+  `0.23.0`, and immutable container image ID
+  `sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7`.
 
 `CURATION_BACKEND_HOST` is FastAPI-only, optional, and defaults to
 `127.0.0.1`; it may only be a loopback address. The backend owns dataset aliases, workspace/output paths,
@@ -716,24 +719,34 @@ through the Next.js JSON proxy.
 
 ## Cosmos capability and one-episode smoke
 
-Check `/v1/models` without putting the credential in a command line or output:
+Check `/v1/models` and `/version` without putting the credential in a command
+line or output:
 
 ```bash
 cd "$CURATION_REPO_ROOT"
 backend/.venv/bin/python - <<'PY'
 import os
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from backend.curation.config import CurationSettings
 
 settings = CurationSettings.from_env()
+approved_version = "0.23.0"
+approved_endpoint_identity = (
+    "h100-cosmos3-nano-vllm-0.23.0@sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7"
+)
+if settings.cosmos_endpoint_identity != approved_endpoint_identity:
+    raise SystemExit("FAIL: configured Cosmos endpoint identity does not match the approved build")
 key_name = settings.cosmos_api_key_env
 key = os.environ.get(key_name)
 if not key:
     raise SystemExit("FAIL: Cosmos credential variable is unavailable")
 model = settings.cosmos_model
 url = settings.cosmos_base_url.rstrip("/") + "/models"
+base = urlsplit(settings.cosmos_base_url)
+version_url = urlunsplit((base.scheme, base.netloc, "/version", "", ""))
 with httpx.Client(trust_env=False, follow_redirects=False) as client:
     response = client.get(
         url,
@@ -742,9 +755,18 @@ with httpx.Client(trust_env=False, follow_redirects=False) as client:
     )
     response.raise_for_status()
     document = response.json()
+    version_response = client.get(
+        version_url,
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=120.0,
+    )
+    version_response.raise_for_status()
+    version_document = version_response.json()
 if not any(item.get("id") == model for item in document.get("data", [])):
     raise SystemExit("FAIL: configured Cosmos model is absent from /v1/models")
-print(f"Cosmos model identity: PASS ({model})")
+if version_document.get("version") != approved_version:
+    raise SystemExit("FAIL: deployed vLLM version does not match the approved build")
+print(f"Cosmos model identity: PASS ({model}, vLLM {approved_version})")
 PY
 ```
 

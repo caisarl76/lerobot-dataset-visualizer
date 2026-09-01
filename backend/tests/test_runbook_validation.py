@@ -121,6 +121,7 @@ def _request(*, all_timestamps: list[float], source_video_sha256: str) -> dict[s
             "media_io_kwargs": {
                 "video": {
                     "fps": 50.0,
+                    "num_frames": -1,
                     "frames_indices": indices,
                     "total_num_frames": frame_count,
                     "duration": duration,

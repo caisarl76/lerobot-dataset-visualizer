@@ -543,7 +543,7 @@ def _validate_request(
     media = _exact_object(body["media_io_kwargs"], {"video"}, "request body schema is not closed")
     media_video = _exact_object(
         media["video"],
-        {"fps", "frames_indices", "total_num_frames", "duration", "do_sample_frames"},
+        {"fps", "num_frames", "frames_indices", "total_num_frames", "duration", "do_sample_frames"},
         "request body schema is not closed",
     )
     if (
@@ -562,6 +562,7 @@ def _validate_request(
         or media_video
         != {
             "fps": 50.0,
+            "num_frames": -1,
             "frames_indices": indices,
             "total_num_frames": frame_count,
             "duration": duration,
