@@ -34,7 +34,7 @@ export interface DatasetMetadata {
 export async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url, {
     cache: "no-store",
-    headers: authHeaders(),
+    headers: authHeaders(url),
   });
   if (!res.ok) {
     throw new Error(
@@ -62,7 +62,7 @@ export async function fetchParquetFile(url: string): Promise<ParquetFile> {
 
   const file = await asyncBufferFromUrl({
     url,
-    requestInit: { cache: "no-store", headers: authHeaders() },
+    requestInit: { cache: "no-store", headers: authHeaders(url) },
   });
   const wrapped = cachedAsyncBuffer(file);
   parquetFileCache.set(url, wrapped);

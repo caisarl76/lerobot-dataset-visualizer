@@ -17,7 +17,19 @@ export function getAuthToken(): string | null {
   }
 }
 
-export function authHeaders(): Record<string, string> {
+export function isAuthenticatedHfDestination(
+  destination: string | URL,
+): boolean {
+  try {
+    const url = destination instanceof URL ? destination : new URL(destination);
+    return url.protocol === "https:" && url.hostname === "huggingface.co";
+  } catch {
+    return false;
+  }
+}
+
+export function authHeaders(destination: string | URL): Record<string, string> {
+  if (!isAuthenticatedHfDestination(destination)) return {};
   const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
@@ -32,11 +44,7 @@ export const AUTH_STORAGE_KEY = STORAGE_KEY;
 export function proxyHfUrl(url: string): string {
   if (typeof window === "undefined") return url;
   if (!getAuthToken()) return url;
-  try {
-    const parsed = new URL(url);
-    if (parsed.hostname !== "huggingface.co") return url;
-    return `/api/proxy${parsed.pathname}${parsed.search}`;
-  } catch {
-    return url;
-  }
+  if (!isAuthenticatedHfDestination(url)) return url;
+  const parsed = new URL(url);
+  return `/api/proxy${parsed.pathname}${parsed.search}`;
 }

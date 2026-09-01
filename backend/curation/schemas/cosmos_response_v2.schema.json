@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pnp-trash-cosmos-v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "episode_complete",
+    "segments",
+    "missing_steps",
+    "uncertainties"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "episode_complete": { "type": "boolean" },
+    "segments": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 1 },
+                "phase": { "const": "approach_brown_table" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 2 },
+                "phase": { "const": "pick_up_object" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 3 },
+                "phase": { "const": "turn_to_find_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 4 },
+                "phase": { "const": "approach_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 5 },
+                "phase": { "const": "lean_down_to_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 6 },
+                "phase": { "const": "drop_object_into_black_trash_bin" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/segment" },
+            {
+              "properties": {
+                "step": { "const": 7 },
+                "phase": { "const": "stand_straight" }
+              }
+            }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "missing_steps": {
+      "type": "array",
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": { "type": "integer", "minimum": 1, "maximum": 7 }
+    },
+    "uncertainties": {
+      "type": "array",
+      "maxItems": 16,
+      "items": { "type": "string", "minLength": 1, "maxLength": 240 }
+    }
+  },
+  "$defs": {
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "phase",
+        "status",
+        "start_s",
+        "end_s",
+        "caption",
+        "confidence",
+        "evidence"
+      ],
+      "properties": {
+        "step": { "type": "integer" },
+        "phase": { "type": "string" },
+        "status": { "enum": ["completed", "partial", "not_observed"] },
+        "start_s": { "type": ["number", "null"] },
+        "end_s": { "type": ["number", "null"] },
+        "caption": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "confidence": { "type": ["number", "null"] },
+        "evidence": { "type": ["string", "null"] }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "not_observed" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "start_s": { "type": "null" },
+              "end_s": { "type": "null" },
+              "confidence": { "type": "null" },
+              "evidence": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "start_s": { "type": "number", "minimum": 0 },
+              "end_s": { "type": "number", "exclusiveMinimum": 0 },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+              "evidence": { "type": "string", "minLength": 1, "maxLength": 240 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -31,22 +31,41 @@ Then in another terminal:
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import logging
 import os
-import shutil
-from dataclasses import dataclass, field
 from pathlib import Path
+import shutil
 from typing import Any
 
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pydantic import BaseModel
+
+try:  # Supports both ``import backend.app`` and the legacy ``import app`` entrypoint.
+    from .curation.assets import LocalAssetService
+    from .curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
+    from .curation.db import CurationDatabase
+    from .curation.review import ReviewService
+    from .curation.router import build_curation_router
+    from .curation.security import CurationLoopbackGuard
+    from .curation.source import SourceRegistry
+    from .curation.worker import BatchService
+except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
+    from curation.assets import LocalAssetService
+    from curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
+    from curation.db import CurationDatabase
+    from curation.review import ReviewService
+    from curation.router import build_curation_router
+    from curation.security import CurationLoopbackGuard
+    from curation.source import SourceRegistry
+    from curation.worker import BatchService
 
 logger = logging.getLogger("lerobot-annotate")
 logging.basicConfig(level=logging.INFO)
@@ -709,12 +728,51 @@ def _do_export(state: DatasetState, output_dir: str | None, copy_videos: bool) -
 
 # --- FastAPI app --------------------------------------------------------------
 
+# Curation is opt-in so an unchanged visualizer installation keeps serving its
+# v3.1 annotation routes. Once any curation variable is provided, settings are
+# deliberately all-or-nothing and source registration happens before serving.
+_curation_settings: CurationSettings | None = None
+_local_asset_service: LocalAssetService | None = None
+_review_service: ReviewService | None = None
+_batch_service: BatchService | None = None
+if curation_is_configured():
+    _curation_settings = CurationSettings.from_env()
+    _source_registry = SourceRegistry.from_paths(
+        _curation_settings.dataset_aliases, workspace=_curation_settings.workspace
+    )
+    _local_asset_service = LocalAssetService(_source_registry)
+    _curation_database = CurationDatabase(_curation_settings.workspace / "curation.sqlite3")
+    _curation_database.initialize()
+    _review_service = ReviewService(database=_curation_database, source_registry=_source_registry)
+    _batch_service = BatchService(
+        database=_curation_database,
+        source_registry=_source_registry,
+        workspace=_curation_settings.workspace,
+        cosmos_base_url=_curation_settings.cosmos_base_url,
+        cosmos_model=_curation_settings.cosmos_model,
+        cosmos_api_key_env=_curation_settings.cosmos_api_key_env,
+        cosmos_endpoint_identity=_curation_settings.cosmos_endpoint_identity,
+    )
+
 app = FastAPI(title="LeRobot dataset visualizer — annotation backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Curation uses its explicit origin; legacy annotation keeps its documented
+    # loopback Next.js origin rather than silently disabling browser access.
+    allow_origins=[_curation_settings.browser_origin] if _curation_settings else [legacy_browser_origin()],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Accept-Ranges", "Content-Range", "Content-Length", "ETag"],
+)
+if _curation_settings:
+    app.add_middleware(CurationLoopbackGuard)
+app.include_router(
+    build_curation_router(
+        _local_asset_service,
+        review_service=_review_service,
+        batch_service=_batch_service,
+        bearer_token=_curation_settings.bearer_token if _curation_settings else None,
+    )
 )
 
 

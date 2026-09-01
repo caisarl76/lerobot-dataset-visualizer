@@ -10,6 +10,13 @@ import {
   FaArrowUp,
 } from "react-icons/fa";
 
+export function formatPlaybackSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "0.00";
+  }
+  return seconds.toFixed(2);
+}
+
 const PlaybackBar: React.FC = () => {
   const { duration, isPlaying, setIsPlaying, currentTime, seek } = useTime();
 
@@ -95,8 +102,8 @@ const PlaybackBar: React.FC = () => {
         className="flex-1 mx-1 h-1 accent-cyan-400 cursor-pointer focus:outline-none focus:ring-0"
         aria-label="Seek video"
       />
-      <span className="w-16 text-right tabular text-[11px] text-slate-400 shrink-0">
-        {Math.floor(sliderValue)} / {Math.floor(duration)}
+      <span className="w-28 shrink-0 whitespace-nowrap text-right tabular text-[11px] text-slate-400">
+        {formatPlaybackSeconds(sliderValue)} / {formatPlaybackSeconds(duration)}
       </span>
 
       <div className="hidden lg:flex flex-col gap-y-0.5 ml-4 text-[10px] text-slate-500 select-none">

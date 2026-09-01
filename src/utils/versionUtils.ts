@@ -5,7 +5,9 @@
 import { authHeaders } from "./auth";
 
 const DATASET_URL =
-  process.env.DATASET_URL || "https://huggingface.co/datasets";
+  process.env.NEXT_PUBLIC_DATASET_URL ||
+  process.env.DATASET_URL ||
+  "https://huggingface.co/datasets";
 
 /**
  * Dataset information structure from info.json
@@ -84,7 +86,7 @@ export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
       method: "GET",
       cache: "no-store",
       signal: controller.signal,
-      headers: authHeaders(),
+      headers: authHeaders(testUrl),
     });
 
     clearTimeout(timeoutId);
