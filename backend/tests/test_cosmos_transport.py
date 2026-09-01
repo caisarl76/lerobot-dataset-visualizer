@@ -193,6 +193,7 @@ def test_approved_abbreviated_plan_wire_fixture_remains_exact_at_formatter_bound
         "media_io_kwargs": {
             "video": {
                 "fps": 50.0,
+                "num_frames": -1,
                 "frames_indices": [0, 25, 50],
                 "total_num_frames": 2_060,
                 "duration": 41.2,
@@ -200,6 +201,16 @@ def test_approved_abbreviated_plan_wire_fixture_remains_exact_at_formatter_bound
             }
         },
     }
+
+
+def test_initial_request_explicitly_disables_vllm_video_frame_cap() -> None:
+    body = build_initial_request_body(
+        model="cosmos3-nano-test",
+        prompt=build_canonical_prompt(),
+        sample=_sample(),
+    )
+
+    assert body["media_io_kwargs"]["video"]["num_frames"] == -1
 
 
 def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
@@ -239,6 +250,7 @@ def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
         "media_io_kwargs": {
             "video": {
                 "fps": 50.0,
+                "num_frames": -1,
                 "frames_indices": list(_sample().frame_indices),
                 "total_num_frames": 2060,
                 "duration": 41.2,

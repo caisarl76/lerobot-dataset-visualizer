@@ -14,7 +14,7 @@ import pytest
 from test_runbook_validation import ATTEMPT_ID, PROPOSAL_ID, _configuration, _smoke_fixture
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-PARENT_REPOSITORY_ROOT = REPOSITORY_ROOT.parents[1]
+CONTROL_REPOSITORY_ROOT = Path("/home/jihun/work/GR00T-WholeBodyControl")
 CURATION_REPO_ROOT = "/home/jihun/work/GR00T-WholeBodyControl/worktrees/lerobot-dataset-visualizer-pnp-trash"
 OLD_REPOSITORY_ROOT = "/home/jihun/work/lerobot-dataset-visualizer"
 
@@ -50,6 +50,12 @@ APPROVED_SOURCE_MANIFEST_SHA256 = "5962d8630f06e6260adbae15a3d7ee5f0a1a745c3a124
 APPROVED_ANCILLARY_NAME = "pnp_trash.xlsx"
 APPROVED_ANCILLARY_SHA256 = "989f6968e5cf8ee0972b850199c948dd75ce140480c82cbe368053cde6ab34c9"
 APPROVED_ANCILLARY_SIZE = 13_644
+APPROVED_VLLM_VERSION = "0.23.0"
+APPROVED_VLLM_IMAGE_ID = "sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7"
+APPROVED_COSMOS_ENDPOINT_IDENTITY = (
+    "h100-cosmos3-nano-vllm-0.23.0@"
+    "sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7"
+)
 
 
 def _source_preflight(runbook: str) -> str:
@@ -86,15 +92,31 @@ def test_curation_docs_use_one_trusted_checkout_root_and_never_the_dirty_primary
         (REPOSITORY_ROOT / ".env.example").read_text(),
         (REPOSITORY_ROOT / "backend" / "README.md").read_text(),
         (REPOSITORY_ROOT / "docs" / "pnp-trash-curation-runbook.md").read_text(),
-        (PARENT_REPOSITORY_ROOT / "docs/superpowers/plans/2026-08-20-pnp-trash-cosmos-curation.md").read_text(),
+        (CONTROL_REPOSITORY_ROOT / "docs/superpowers/plans/2026-08-20-pnp-trash-cosmos-curation.md").read_text(),
         (
-            PARENT_REPOSITORY_ROOT / "docs/superpowers/specs/2026-08-18-pnp-trash-cosmos-curation-design.md"
+            CONTROL_REPOSITORY_ROOT / "docs/superpowers/specs/2026-08-18-pnp-trash-cosmos-curation-design.md"
         ).read_text(),
     )
 
     for document in documents:
         assert CURATION_REPO_ROOT in document
         assert OLD_REPOSITORY_ROOT not in document
+
+
+def test_curation_docs_freeze_deployed_vllm_build_in_endpoint_provenance() -> None:
+    documents = (
+        (REPOSITORY_ROOT / "docs" / "pnp-trash-curation-runbook.md").read_text(),
+        (CONTROL_REPOSITORY_ROOT / "docs/superpowers/plans/2026-08-20-pnp-trash-cosmos-curation.md").read_text(),
+        (
+            CONTROL_REPOSITORY_ROOT / "docs/superpowers/specs/2026-08-18-pnp-trash-cosmos-curation-design.md"
+        ).read_text(),
+    )
+
+    for document in documents:
+        assert APPROVED_VLLM_VERSION in document
+        assert APPROVED_VLLM_IMAGE_ID in document
+        assert APPROVED_COSMOS_ENDPOINT_IDENTITY in document
+    assert "pre-first-success transport correction" in documents[2]
 
 
 def _run_checkout_preflight(
@@ -783,6 +805,7 @@ def test_one_episode_smoke_freezes_status_sampling_evidence_and_operator_confirm
         "selected_frame_indices",
         "selected_parquet_timestamps_s",
         "media_io_kwargs",
+        "num_frames",
         "do_sample_frames",
         '"redacted"',
         '"sha256"',
