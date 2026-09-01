@@ -112,6 +112,20 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+REPAIR_PROMPT_PREFIX = (
+    "Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n"
+    "The segments array must contain exactly seven objects in steps 1 through 7, one for every "
+    "required phase. Never omit a phase. When a phase was not visibly attempted, emit it with "
+    "status not_observed and null start_s, end_s, confidence, and evidence; caption remains a "
+    "required nonempty string. Every segment object must contain all eight keys: step, phase, "
+    "status, start_s, end_s, caption, confidence, and evidence. Never omit a key whose value is "
+    "null.\n"
+    "The exact response schema is:\n"
+    + _canonical_json(COSMOS_RESPONSE_V2_SCHEMA)
+    + "\n"
+)
+
+
 def _strict_json_document(raw: bytes) -> Any:
     def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -710,9 +724,7 @@ def _build_repair_request_body(
         "messages": [
             {
                 "role": "user",
-                "content": (
-                    "Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n" + repair_payload
-                ),
+                "content": REPAIR_PROMPT_PREFIX + repair_payload,
             }
         ],
         "temperature": 0,

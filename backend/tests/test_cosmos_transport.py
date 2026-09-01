@@ -852,7 +852,24 @@ def test_invalid_contract_content_gets_one_text_only_repair_without_retry() -> N
     assert repair["max_completion_tokens"] == 2048
     assert "media_io_kwargs" not in repair
     repair_text = repair["messages"][0]["content"]
-    prefix = "Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n"
+    prefix = (
+        "Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n"
+        "The segments array must contain exactly seven objects in steps 1 through 7, one for every "
+        "required phase. Never omit a phase. When a phase was not visibly attempted, emit it with "
+        "status not_observed and null start_s, end_s, confidence, and evidence; caption remains a "
+        "required nonempty string. Every segment object must contain all eight keys: step, phase, "
+        "status, start_s, end_s, caption, confidence, and evidence. Never omit a key whose value is "
+        "null.\n"
+        "The exact response schema is:\n"
+        + json.dumps(
+            COSMOS_RESPONSE_V2_SCHEMA,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    )
     assert repair_text.startswith(prefix)
     repair_payload = json.loads(repair_text[len(prefix) :])
     assert repair_payload["invalid_response"] == "not json"
