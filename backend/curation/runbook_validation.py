@@ -141,6 +141,18 @@ def _canonical_bytes(document: Any) -> bytes:
     return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _normalize_proxy_job_configuration(value: Any) -> Any:
+    """Restore the canonical float lost by a JSON parse/stringify proxy round trip."""
+
+    if type(value) is not dict:
+        return value
+    normalized = dict(value)
+    source_fps = normalized.get("source_fps")
+    if type(source_fps) is int and source_fps == _SMOKE_SOURCE_FPS:
+        normalized["source_fps"] = _SMOKE_SOURCE_FPS
+    return normalized
+
+
 def _regular_file(workspace: Path, relative_path: str, label: str) -> tuple[Path, bytes]:
     root = workspace.resolve(strict=True)
     relative = Path(relative_path)
@@ -464,10 +476,12 @@ def _validate_smoke_status(
         or active.get("attempt_id") != attempt["attempt_id"]
     ):
         _fail("active proposal does not bind the exact smoke attempt")
-    configuration = status.get("configuration")
+    configuration = _normalize_proxy_job_configuration(status.get("configuration"))
     try:
         validated = validate_frozen_job_configuration(_canonical_bytes(configuration))
     except (InvalidPersistedConfiguration, TypeError, ValueError):
+        _fail("smoke configuration is invalid")
+    if validated.source_fps != _SMOKE_SOURCE_FPS:
         _fail("smoke configuration is invalid")
     if validated.episode_indices != (_SMOKE_SOURCE_EPISODE_INDEX,):
         _fail("smoke configuration does not select exactly the pinned representative episode 4")
@@ -759,10 +773,12 @@ def validate_full_batch_authority(
         or full_status.get("job_id") != expected_full_job_id
     ):
         _fail("full-batch status job identity does not match the newly created job")
-    full_configuration = full_status.get("configuration")
+    full_configuration = _normalize_proxy_job_configuration(full_status.get("configuration"))
     try:
         validated = validate_frozen_job_configuration(_canonical_bytes(full_configuration))
     except (InvalidPersistedConfiguration, TypeError, ValueError):
+        _fail("full-batch configuration is invalid")
+    if validated.source_fps != _SMOKE_SOURCE_FPS:
         _fail("full-batch configuration is invalid")
     if validated.episode_indices != tuple(range(92)):
         _fail("full-batch configuration does not select exactly episodes 0 through 91")
