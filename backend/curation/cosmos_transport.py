@@ -74,6 +74,14 @@ CANONICAL_PROMPT_PREFIX = "\n".join(
         "5 lean_down_to_black_trash_bin: lean down and position over the bin.",
         "6 drop_object_into_black_trash_bin: release the object into the bin.",
         "7 stand_straight: return to and hold a standing-straight pose.",
+        (
+            "For step 6, use completed when the object visibly leaves the gripper or is visibly "
+            "inside the bin in a later sampled frame; the exact release instant need not be sampled."
+        ),
+        (
+            "For step 7, use completed when the post-release view rises and ends upright with the "
+            "hands in a neutral pose; a short visible final hold counts."
+        ),
         "Use visible evidence only. Do not infer a completed phase when it is absent or ambiguous.",
         (
             "For each phase set status to completed, partial, or not_observed. Use completed only when "
@@ -114,16 +122,117 @@ def _canonical_json(value: Any) -> str:
 
 REPAIR_PROMPT_PREFIX = (
     "Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n"
+    "Preserve every valid segment status and visible-evidence field from the invalid response; "
+    "change only fields required by the listed validation errors. Never downgrade a completed "
+    "or partial segment to not_observed.\n"
     "The segments array must contain exactly seven objects in steps 1 through 7, one for every "
     "required phase. Never omit a phase. When a phase was not visibly attempted, emit it with "
     "status not_observed and null start_s, end_s, confidence, and evidence; caption remains a "
     "required nonempty string. Every segment object must contain all eight keys: step, phase, "
     "status, start_s, end_s, caption, confidence, and evidence. Never omit a key whose value is "
     "null.\n"
-    "The exact response schema is:\n"
-    + _canonical_json(COSMOS_RESPONSE_V2_SCHEMA)
-    + "\n"
+    "Set missing_steps to exactly the ascending step numbers whose status is partial or "
+    "not_observed. Set episode_complete true if and only if missing_steps is empty.\n"
+    "The exact response schema is:\n" + _canonical_json(COSMOS_RESPONSE_V2_SCHEMA) + "\n"
 )
+
+
+def build_structured_response_format() -> dict[str, Any]:
+    """Build the vLLM-compatible grammar that guarantees seven closed segment objects."""
+
+    phases = [
+        "approach_brown_table",
+        "pick_up_object",
+        "turn_to_find_black_trash_bin",
+        "approach_black_trash_bin",
+        "lean_down_to_black_trash_bin",
+        "drop_object_into_black_trash_bin",
+        "stand_straight",
+    ]
+    segment_required = [
+        "step",
+        "phase",
+        "status",
+        "start_s",
+        "end_s",
+        "caption",
+        "confidence",
+        "evidence",
+    ]
+    segment_common = {
+        "step": {"type": "integer", "minimum": 1, "maximum": 7},
+        "phase": {"type": "string", "enum": phases},
+        "caption": {"type": "string"},
+    }
+    segment_schema = {
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    **segment_common,
+                    "status": {"type": "string", "enum": ["completed", "partial"]},
+                    "start_s": {"type": "number"},
+                    "end_s": {"type": "number"},
+                    "confidence": {"type": "number"},
+                    "evidence": {"type": "string"},
+                },
+                "required": segment_required,
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    **segment_common,
+                    "status": {"type": "string", "enum": ["not_observed"]},
+                    "start_s": {"type": "null"},
+                    "end_s": {"type": "null"},
+                    "confidence": {"type": "null"},
+                    "evidence": {"type": "null"},
+                },
+                "required": segment_required,
+            },
+        ]
+    }
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "integer", "enum": [2]},
+            "episode_complete": {"type": "boolean"},
+            "segments": {
+                "type": "array",
+                "items": segment_schema,
+                "minItems": 7,
+                "maxItems": 7,
+            },
+            "missing_steps": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                "maxItems": 7,
+            },
+            "uncertainties": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 16,
+            },
+        },
+        "required": [
+            "schema_version",
+            "episode_complete",
+            "segments",
+            "missing_steps",
+            "uncertainties",
+        ],
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "pnp_trash_cosmos_v2",
+            "schema": schema,
+            "strict": True,
+        },
+    }
 
 
 def _strict_json_document(raw: bytes) -> Any:
@@ -609,6 +718,7 @@ def build_initial_request_body(*, model: str, prompt: str, sample: Any) -> dict[
         "seed": 0,
         "max_completion_tokens": 4096,
         "stream": False,
+        "response_format": build_structured_response_format(),
         "media_io_kwargs": {
             "video": {
                 "fps": sample.source_fps,
@@ -710,7 +820,7 @@ def prepare_initial_request(*, model: str, prompt: str, sample: PreparedSample) 
     )
 
 
-def _build_repair_request_body(
+def build_repair_request_body(
     *, model: str, invalid_response: str, validation_errors: Sequence[str]
 ) -> dict[str, Any]:
     repair_payload = _canonical_json(
@@ -731,6 +841,7 @@ def _build_repair_request_body(
         "seed": 0,
         "max_completion_tokens": 2048,
         "stream": False,
+        "response_format": build_structured_response_format(),
     }
 
 
@@ -921,7 +1032,7 @@ class CosmosTransport:
             raise ValueError("repair input exceeds the 64 KiB limit")
         if any(not _valid_utf8_string(error) for error in validation_errors):
             raise ValueError("repair validation errors must be valid UTF-8 text")
-        repair_body = _build_repair_request_body(
+        repair_body = build_repair_request_body(
             model=self.model,
             invalid_response=invalid_response,
             validation_errors=validation_errors,

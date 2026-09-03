@@ -5,11 +5,15 @@ import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
+import sqlite3
 
+from curation.cosmos_contract import CosmosContractError, build_cosmos_proposal
 from curation.cosmos_transport import (
     CONTRACT_VERSION,
     build_canonical_prompt,
     build_parsed_artifact,
+    build_repair_request_body,
+    build_structured_response_format,
     prove_alignment_and_select,
 )
 from curation.prompts import PROMPT_TEMPLATE_SHA256, PROMPT_TEMPLATE_VERSION
@@ -118,6 +122,7 @@ def _request(*, all_timestamps: list[float], source_video_sha256: str) -> dict[s
             "seed": 0,
             "max_completion_tokens": 4096,
             "stream": False,
+            "response_format": build_structured_response_format(),
             "media_io_kwargs": {
                 "video": {
                     "fps": 50.0,
@@ -181,6 +186,74 @@ def _smoke_fixture(tmp_path: Path, *, repair_authoritative: bool = False) -> tup
     (attempt_root / "response.txt").write_text(initial_raw, encoding="utf-8")
     if repair_authoritative:
         (attempt_root / "repair-response.txt").write_text(raw, encoding="utf-8")
+        try:
+            build_cosmos_proposal(
+                initial_raw,
+                duration_s=41.2,
+                parquet_timestamps=all_timestamps,
+            )
+        except CosmosContractError as error:
+            repair_body = build_repair_request_body(
+                model="cosmos3-nano",
+                invalid_response=initial_raw,
+                validation_errors=error.errors,
+            )
+        else:  # pragma: no cover - fixture invariant
+            raise AssertionError("repair fixture initial response must be invalid")
+        repair_body_sha256 = hashlib.sha256(
+            json.dumps(
+                repair_body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        initial_exchange = {
+            "phase": "initial",
+            "started_at": "2026-09-03T00:00:00Z",
+            "finished_at": "2026-09-03T00:00:01Z",
+            "request": {
+                "method": "POST",
+                "url": "http://127.0.0.1:8001/v1/chat/completions",
+                "body_sha256": "a" * 64,
+            },
+            "response": {
+                "status_code": 200,
+                "id": "initial-id",
+                "model": "cosmos3-nano",
+                "created": 1,
+                "usage": {},
+                "finish_reason": "stop",
+            },
+            "error": None,
+        }
+        repair_exchange = {
+            "phase": "repair",
+            "started_at": "2026-09-03T00:00:00Z",
+            "finished_at": "2026-09-03T00:00:01Z",
+            "request": {
+                "method": "POST",
+                "url": "http://127.0.0.1:8001/v1/chat/completions",
+                "body_sha256": repair_body_sha256,
+            },
+            "response": {
+                "status_code": 200,
+                "id": "repair-id",
+                "model": "cosmos3-nano",
+                "created": 1,
+                "usage": {},
+                "finish_reason": "stop",
+            },
+            "error": None,
+        }
+        with sqlite3.connect(workspace / "curation.sqlite3") as connection:
+            connection.execute(
+                "CREATE TABLE cosmos_attempts (id TEXT PRIMARY KEY, http_exchange_history_json TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO cosmos_attempts VALUES (?, ?)",
+                (ATTEMPT_ID, json.dumps([initial_exchange, repair_exchange])),
+            )
     parsed = build_parsed_artifact(
         raw_response=raw,
         duration_s=41.2,
@@ -277,7 +350,31 @@ def test_smoke_authority_accepts_exact_initial_and_repair_response_evidence(tmp_
         assert authority["attempt_id"] == ATTEMPT_ID
         expected_name = "repair-response.txt" if repair else "response.txt"
         assert authority["artifacts"]["authoritative_response"]["relative_path"].endswith(expected_name)
+        assert (authority["repair_exchange"] is not None) is repair
         assert authority["configuration"] == status["configuration"]
+
+
+def test_smoke_authority_rejects_repair_exchange_body_hash_tampering(tmp_path: Path) -> None:
+    status, episode, workspace = _smoke_fixture(tmp_path, repair_authoritative=True)
+    with sqlite3.connect(workspace / "curation.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT http_exchange_history_json FROM cosmos_attempts WHERE id=?",
+            (ATTEMPT_ID,),
+        ).fetchone()
+        history = json.loads(row[0])
+        history[-1]["request"]["body_sha256"] = "f" * 64
+        connection.execute(
+            "UPDATE cosmos_attempts SET http_exchange_history_json=? WHERE id=?",
+            (json.dumps(history), ATTEMPT_ID),
+        )
+
+    with pytest.raises(RunbookValidationError, match="repair request body"):
+        build_smoke_authority(
+            workspace=workspace,
+            status=status,
+            episode=episode,
+            expected_smoke_job_id="job-smoke",
+        )
 
 
 def test_smoke_authority_normalizes_integral_source_fps_from_next_proxy(tmp_path: Path) -> None:
@@ -300,9 +397,7 @@ def test_smoke_authority_normalizes_integral_source_fps_from_next_proxy(tmp_path
     [49, 10**400, True, "50", -50, 0],
     ids=["wrong-integer", "oversized-integer", "boolean", "string", "negative", "zero"],
 )
-def test_smoke_authority_rejects_noncanonical_source_fps(
-    tmp_path: Path, source_fps: object
-) -> None:
+def test_smoke_authority_rejects_noncanonical_source_fps(tmp_path: Path, source_fps: object) -> None:
     status, episode, workspace = _smoke_fixture(tmp_path)
     status["configuration"]["source_fps"] = source_fps
 
@@ -362,6 +457,7 @@ def test_smoke_authority_reparses_raw_response_against_actual_float_parquet_time
         ("sampling", "deterministic 50-to-2 sampling"),
         ("timestamp", "deterministic 50-to-2 sampling"),
         ("video_hash", "source video"),
+        ("response_format", "frozen Cosmos transport contract"),
         ("request_extra", "request artifact schema"),
         ("parsed_extra", "parsed artifact schema"),
         ("raw_hash", "authoritative raw response"),
@@ -383,7 +479,7 @@ def test_smoke_authority_rejects_hostile_evidence(
     receipt_path = next(workspace.glob("contact_sheets/**/receipts/proposals/*.json"))
     png_path = next(workspace.glob("contact_sheets/**/proposals/*.png"))
 
-    if mutation in {"sampling", "timestamp", "video_hash", "request_extra"}:
+    if mutation in {"sampling", "timestamp", "video_hash", "response_format", "request_extra"}:
         document = json.loads(request_path.read_text())
         if mutation == "sampling":
             document["sampling"]["selected_frame_indices"][1] = 24
@@ -391,6 +487,8 @@ def test_smoke_authority_rejects_hostile_evidence(
             document["sampling"]["selected_parquet_timestamps_s"][1] += 0.0001
         elif mutation == "video_hash":
             document["source_video_sha256"] = "d" * 64
+        elif mutation == "response_format":
+            document["request_body"]["response_format"]["json_schema"]["name"] = "hostile"
         else:
             document["unexpected"] = True
         request_path.write_text(json.dumps(document))
@@ -498,9 +596,7 @@ def test_full_batch_authority_revalidates_smoke_and_exact_new_configuration(tmp_
     [49, 10**400, True, "50", -50, 0],
     ids=["wrong-integer", "oversized-integer", "boolean", "string", "negative", "zero"],
 )
-def test_full_batch_authority_rejects_noncanonical_source_fps(
-    tmp_path: Path, source_fps: object
-) -> None:
+def test_full_batch_authority_rejects_noncanonical_source_fps(tmp_path: Path, source_fps: object) -> None:
     status, episode, workspace = _smoke_fixture(tmp_path)
     authority = build_smoke_authority(
         workspace=workspace,

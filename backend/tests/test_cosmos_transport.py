@@ -73,6 +73,79 @@ def _incomplete_response() -> dict[str, Any]:
     return response
 
 
+def _expected_response_format() -> dict[str, Any]:
+    phases = [segment["phase"] for segment in _complete_response()["segments"]]
+    required = ["step", "phase", "status", "start_s", "end_s", "caption", "confidence", "evidence"]
+    common = {
+        "step": {"type": "integer", "minimum": 1, "maximum": 7},
+        "phase": {"type": "string", "enum": phases},
+        "caption": {"type": "string"},
+    }
+    segment = {
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    **common,
+                    "status": {"type": "string", "enum": ["completed", "partial"]},
+                    "start_s": {"type": "number"},
+                    "end_s": {"type": "number"},
+                    "confidence": {"type": "number"},
+                    "evidence": {"type": "string"},
+                },
+                "required": required,
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    **common,
+                    "status": {"type": "string", "enum": ["not_observed"]},
+                    "start_s": {"type": "null"},
+                    "end_s": {"type": "null"},
+                    "confidence": {"type": "null"},
+                    "evidence": {"type": "null"},
+                },
+                "required": required,
+            },
+        ]
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "pnp_trash_cosmos_v2",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "schema_version": {"type": "integer", "enum": [2]},
+                    "episode_complete": {"type": "boolean"},
+                    "segments": {"type": "array", "items": segment, "minItems": 7, "maxItems": 7},
+                    "missing_steps": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                        "maxItems": 7,
+                    },
+                    "uncertainties": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 16,
+                    },
+                },
+                "required": [
+                    "schema_version",
+                    "episode_complete",
+                    "segments",
+                    "missing_steps",
+                    "uncertainties",
+                ],
+            },
+        },
+    }
+
+
 def _jpeg(red: int) -> bytes:
     output = BytesIO()
     Image.new("RGB", (2, 2), (red, 0, 0)).save(
@@ -138,7 +211,7 @@ def _transport(
 
 def test_canonical_prompt_freezes_prefix_sorted_minified_schema_and_32kib_limit() -> None:
     assert hashlib.sha256(CANONICAL_PROMPT_PREFIX.encode("utf-8")).hexdigest() == (
-        "cc7a3a174d09f28e96c7adb302bc6bbc2bca3c8ee1cd4f6faf5e1eec1dc31478"
+        "f59d7492c63b9408b16bb3fed4f7b956d8daa06c7bf6153b2654d0f01cc36049"
     )
     expected = (
         CANONICAL_PROMPT_PREFIX
@@ -155,6 +228,17 @@ def test_canonical_prompt_freezes_prefix_sorted_minified_schema_and_32kib_limit(
     assert len(expected.encode("utf-8")) <= PROMPT_MAX_BYTES
     with pytest.raises(ValueError, match="32 KiB"):
         build_initial_request_body(model="model", prompt="x" * (PROMPT_MAX_BYTES + 1), sample=_sample())
+
+
+def test_canonical_prompt_freezes_visible_drop_and_upright_success_criteria() -> None:
+    assert (
+        "For step 6, use completed when the object visibly leaves the gripper or is visibly inside "
+        "the bin in a later sampled frame; the exact release instant need not be sampled."
+    ) in CANONICAL_PROMPT_PREFIX
+    assert (
+        "For step 7, use completed when the post-release view rises and ends upright with the hands "
+        "in a neutral pose; a short visible final hold counts."
+    ) in CANONICAL_PROMPT_PREFIX
 
 
 def test_approved_abbreviated_plan_wire_fixture_remains_exact_at_formatter_boundary() -> None:
@@ -190,6 +274,7 @@ def test_approved_abbreviated_plan_wire_fixture_remains_exact_at_formatter_bound
         "seed": 0,
         "max_completion_tokens": 4096,
         "stream": False,
+        "response_format": _expected_response_format(),
         "media_io_kwargs": {
             "video": {
                 "fps": 50.0,
@@ -211,6 +296,26 @@ def test_initial_request_explicitly_disables_vllm_video_frame_cap() -> None:
     )
 
     assert body["media_io_kwargs"]["video"]["num_frames"] == -1
+
+
+def test_initial_request_uses_vllm_compatible_seven_segment_json_schema() -> None:
+    body = build_initial_request_body(
+        model="cosmos3-nano-test",
+        prompt=build_canonical_prompt(),
+        sample=_sample(),
+    )
+
+    assert body["response_format"] == _expected_response_format()
+    serialized = json.dumps(body["response_format"], sort_keys=True)
+    assert all(f'"{unsupported}"' not in serialized for unsupported in ("if", "then", "else", "prefixItems"))
+    contract_phases = [
+        item["allOf"][1]["properties"]["phase"]["const"]
+        for item in COSMOS_RESPONSE_V2_SCHEMA["properties"]["segments"]["prefixItems"]
+    ]
+    grammar_phases = body["response_format"]["json_schema"]["schema"]["properties"]["segments"]["items"]["anyOf"][
+        0
+    ]["properties"]["phase"]["enum"]
+    assert grammar_phases == contract_phases
 
 
 def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
@@ -247,6 +352,7 @@ def test_exact_initial_wire_body_headers_timeout_and_stop_success() -> None:
         "seed": 0,
         "max_completion_tokens": 4096,
         "stream": False,
+        "response_format": _expected_response_format(),
         "media_io_kwargs": {
             "video": {
                 "fps": 50.0,
@@ -724,7 +830,7 @@ def test_invalid_success_envelope_preserves_any_exact_content_for_evidence(
 
 
 @pytest.mark.parametrize("finish_reason", ["length", None, "content_filter"])
-def test_non_stop_initial_with_string_content_gets_exactly_one_text_only_repair(
+def test_non_stop_initial_with_string_content_gets_exactly_one_text_only_structured_repair(
     finish_reason: str | None,
 ) -> None:
     requests: list[dict[str, Any]] = []
@@ -751,6 +857,7 @@ def test_non_stop_initial_with_string_content_gets_exactly_one_text_only_repair(
     assert result.repair_content == json.dumps(_complete_response())
     assert len(requests) == 2
     assert requests[1]["max_completion_tokens"] == 2048
+    assert requests[1]["response_format"] == _expected_response_format()
     assert "media_io_kwargs" not in requests[1]
 
 
@@ -825,7 +932,7 @@ def test_surrogate_message_content_is_rejected_without_uncaught_encoding_or_repa
     _validate_http_exchange(result.exchanges[0])
 
 
-def test_invalid_contract_content_gets_one_text_only_repair_without_retry() -> None:
+def test_invalid_contract_content_gets_one_text_only_structured_repair_without_retry() -> None:
     requests: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -848,18 +955,25 @@ def test_invalid_contract_content_gets_one_text_only_repair_without_retry() -> N
         "seed",
         "max_completion_tokens",
         "stream",
+        "response_format",
     }
     assert repair["max_completion_tokens"] == 2048
+    assert repair["response_format"] == _expected_response_format()
     assert "media_io_kwargs" not in repair
     repair_text = repair["messages"][0]["content"]
     prefix = (
         "Return only one corrected JSON object matching pnp-trash-cosmos-v2.\n"
+        "Preserve every valid segment status and visible-evidence field from the invalid response; "
+        "change only fields required by the listed validation errors. Never downgrade a completed "
+        "or partial segment to not_observed.\n"
         "The segments array must contain exactly seven objects in steps 1 through 7, one for every "
         "required phase. Never omit a phase. When a phase was not visibly attempted, emit it with "
         "status not_observed and null start_s, end_s, confidence, and evidence; caption remains a "
         "required nonempty string. Every segment object must contain all eight keys: step, phase, "
         "status, start_s, end_s, caption, confidence, and evidence. Never omit a key whose value is "
         "null.\n"
+        "Set missing_steps to exactly the ascending step numbers whose status is partial or "
+        "not_observed. Set episode_complete true if and only if missing_steps is empty.\n"
         "The exact response schema is:\n"
         + json.dumps(
             COSMOS_RESPONSE_V2_SCHEMA,

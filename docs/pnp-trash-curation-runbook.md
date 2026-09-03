@@ -770,6 +770,23 @@ print(f"Cosmos model identity: PASS ({model}, vLLM {approved_version})")
 PY
 ```
 
+The pinned vLLM must accept the production request's JSON-schema
+`response_format`. The generation grammar closes the response and requires
+seven eight-key segment objects while avoiding vLLM-unsupported
+`prefixItems` and `if`/`then`/`else`; the full Cosmos v2 schema and dynamic
+validator remain authoritative. The smoke validator below rejects an omitted
+or modified `response_format`. The text-only repair call uses the same grammar
+but never resends video or `media_io_kwargs`. When repair is authoritative, the
+smoke validator reconstructs its exact body from the authenticated initial
+response and validation errors, then requires its SHA-256 to match the
+append-only repair exchange in `curation.sqlite3`; that binding is included in
+the frozen smoke authority.
+
+Earlier episode-4 attempts are diagnostic evidence only. They exposed the
+32-frame default, an incomplete repair shape, and a technically valid but
+semantically incomplete proposal. None is an operator-confirmed smoke, and
+none authorizes a full batch.
+
 Open the workspace, then create exactly one smoke attempt through the
 same-origin Next.js proxy:
 
@@ -879,6 +896,7 @@ fi
 SMOKE_ATTEMPT_ROOT="$CURATION_WORKSPACE/artifacts/cosmos/$SMOKE_ATTEMPT_ID"
 REQUEST_ARTIFACT="$SMOKE_ATTEMPT_ROOT/request.json"
 RESPONSE_ARTIFACT="$SMOKE_ATTEMPT_ROOT/response.txt"
+REPAIR_RESPONSE_ARTIFACT="$SMOKE_ATTEMPT_ROOT/repair-response.txt"
 PARSED_ARTIFACT="$SMOKE_ATTEMPT_ROOT/parsed.json"
 SMOKE_CONTACT_NAMESPACE="$CURATION_WORKSPACE/contact_sheets/datasets/dataset_${SMOKE_DATASET_ID}_${SMOKE_SOURCE_MANIFEST_SHA256}"
 PROPOSAL_CONTACT_SHEET="$SMOKE_CONTACT_NAMESPACE/proposals/proposal_${SMOKE_PROPOSAL_ID}.png"
@@ -892,6 +910,9 @@ require_smoke_regular_file() {
 }
 require_smoke_regular_file "$REQUEST_ARTIFACT" request
 require_smoke_regular_file "$RESPONSE_ARTIFACT" response
+if test -e "$REPAIR_RESPONSE_ARTIFACT"; then
+  require_smoke_regular_file "$REPAIR_RESPONSE_ARTIFACT" repair-response
+fi
 require_smoke_regular_file "$PARSED_ARTIFACT" parsed
 require_smoke_regular_file "$PROPOSAL_CONTACT_SHEET" contact-sheet
 require_smoke_regular_file "$PROPOSAL_CONTACT_RECEIPT" contact-sheet-receipt
@@ -913,11 +934,12 @@ AUTHORITATIVE_RESPONSE_RELATIVE_PATH=$(printf '%s' "$SMOKE_AUTHORITY_JSON" \
   | jq -er '.artifacts.authoritative_response.relative_path')
 AUTHORITATIVE_RESPONSE_ARTIFACT="$CURATION_WORKSPACE/$AUTHORITATIVE_RESPONSE_RELATIVE_PATH"
 
-printf 'Raw response: %s\nParsed proposal: %s\nSampling request: %s\nContact sheet: %s\n' \
-  "$AUTHORITATIVE_RESPONSE_ARTIFACT" "$PARSED_ARTIFACT" "$REQUEST_ARTIFACT" "$PROPOSAL_CONTACT_SHEET"
+printf 'Initial response: %s\nAuthoritative response: %s\nParsed proposal: %s\nSampling request: %s\nContact sheet: %s\n' \
+  "$RESPONSE_ARTIFACT" "$AUTHORITATIVE_RESPONSE_ARTIFACT" "$PARSED_ARTIFACT" \
+  "$REQUEST_ARTIFACT" "$PROPOSAL_CONTACT_SHEET"
 SMOKE_CONFIRMATION_EXPECTED="CONFIRM SMOKE EVIDENCE $SMOKE_JOB_ID $SMOKE_ATTEMPT_ID"
 printf 'Required confirmation: %s\n' "$SMOKE_CONFIRMATION_EXPECTED"
-if ! read -r -p 'After inspecting the raw response, parsed proposal, sampling evidence, contact sheet, and UI, type the exact confirmation: ' SMOKE_EVIDENCE_CONFIRMED; then
+if ! read -r -p 'After inspecting the initial/authoritative responses, parsed proposal, sampling evidence, contact sheet, and UI, type the exact confirmation: ' SMOKE_EVIDENCE_CONFIRMED; then
   printf '%s\n' 'FAIL: one-episode evidence and UI inspection were not explicitly confirmed' >&2
   exit 1
 fi
@@ -937,10 +959,12 @@ printf 'Preserve these shell variables before the full batch: %s\n' \
 
 Only exact terminal `completed` with one succeeded attempt, no
 `manual_only`/`retryable` attempt, and one active proposal is a valid smoke.
-The operator confirmation is mandatory after inspecting the raw response,
-parsed v2 status/times, strict 50-to-2 fps sampling proof, six-cell proposal
-contact sheet and receipt, and UI rendering. Null transitions must render
-`not observed` placeholders without fabricated images or deltas.
+The operator confirmation is mandatory after inspecting the initial response,
+the authoritative response (including `repair-response.txt` when present),
+parsed v2 status/times, strict 50-to-2 fps sampling proof and structured
+`response_format`, six-cell proposal contact sheet and receipt, and UI
+rendering. Null transitions must render `not observed` placeholders without
+fabricated images or deltas.
 
 ## Run and monitor the full Cosmos batch
 
