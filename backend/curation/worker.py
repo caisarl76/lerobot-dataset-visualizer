@@ -1977,6 +1977,7 @@ class CosmosAttemptProcessor:
                 repair = transport.observe_repair(
                     invalid_response=initial_raw,
                     validation_errors=invalid_errors,
+                    duration_s=sample.duration_s,
                 )
                 if _worker_stop_reason(self.stop_requested) in {"lease_lost", "heartbeat_failure"}:
                     return

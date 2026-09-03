@@ -197,6 +197,7 @@ def _smoke_fixture(tmp_path: Path, *, repair_authoritative: bool = False) -> tup
                 model="cosmos3-nano",
                 invalid_response=initial_raw,
                 validation_errors=error.errors,
+                duration_s=41.2,
             )
         else:  # pragma: no cover - fixture invariant
             raise AssertionError("repair fixture initial response must be invalid")

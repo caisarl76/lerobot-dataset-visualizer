@@ -31,6 +31,7 @@ from uuid import UUID
 
 import av
 import httpx
+from jsonschema import Draft202012Validator
 import numpy as np
 from PIL import Image
 import pyarrow as pa
@@ -820,8 +821,186 @@ def prepare_initial_request(*, model: str, prompt: str, sample: PreparedSample) 
     )
 
 
+def _repair_candidate(invalid_response: str) -> dict[str, Any] | None:
+    candidate = invalid_response.strip()
+    if candidate.startswith("<think>"):
+        think_end = candidate.find("</think>", len("<think>"))
+        if think_end < 0:
+            return None
+        candidate = candidate[think_end + len("</think>") :].strip()
+    try:
+        document = _strict_json_document(candidate.encode("utf-8"))
+    except (TypeError, UnicodeError, ValueError):
+        return None
+    if (
+        type(document) is not dict
+        or not _json_tree_is_utf8(document)
+        or any(Draft202012Validator(COSMOS_RESPONSE_V2_SCHEMA).iter_errors(document))
+    ):
+        return None
+    return document
+
+
+def _json_tree_is_utf8(document: Any) -> bool:
+    pending = [document]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+    return True
+
+
+def _is_finite_number(value: Any) -> bool:
+    if type(value) not in {int, float}:
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _repair_time_fields(
+    response: Mapping[str, Any], validation_errors: Sequence[str], duration_s: float
+) -> tuple[set[int], set[int]]:
+    mutable_starts: set[int] = set()
+    mutable_ends: set[int] = set()
+    segments = response["segments"]
+    for error in validation_errors:
+        match = re.fullmatch(r"step (\d+) must satisfy 0 <= start_s < end_s <= duration_s .+", error)
+        if match is not None:
+            step = int(match.group(1))
+            segment = segments[step - 1]
+            start = segment["start_s"]
+            end = segment["end_s"]
+            start_valid = _is_finite_number(start) and 0 <= start < duration_s
+            end_valid = _is_finite_number(end) and 0 < end <= duration_s
+            if start_valid and (not end_valid or end <= start):
+                mutable_ends.add(step)
+            elif end_valid and (not start_valid or start >= end):
+                mutable_starts.add(step)
+            else:
+                mutable_starts.add(step)
+                mutable_ends.add(step)
+            continue
+        match = re.fullmatch(r"complete steps (\d+) and (\d+) must be adjacent within 0.5 seconds", error)
+        if match is not None:
+            mutable_ends.add(int(match.group(1)))
+            mutable_starts.add(int(match.group(2)))
+        elif error == "a complete response must start at 0 within 0.25 seconds":
+            mutable_starts.add(1)
+        elif error == "a complete response must end at duration within 0.5 seconds":
+            mutable_ends.add(7)
+        elif error == "non-null timed segments must have strictly increasing starts":
+            mutable_starts.update(range(1, 8))
+        elif error == "a complete response must yield six strictly increasing transition frames":
+            mutable_starts.update(range(2, 8))
+    return mutable_starts, mutable_ends
+
+
+def build_repair_response_format(
+    *, invalid_response: str, validation_errors: Sequence[str], duration_s: float | None
+) -> dict[str, Any]:
+    """Freeze valid model observations while opening only invalid repair fields."""
+
+    if duration_s is None or not _is_finite_number(duration_s) or duration_s <= 0:
+        return build_structured_response_format()
+    duration = float(duration_s)
+    response = _repair_candidate(invalid_response)
+    if response is None:
+        return build_structured_response_format()
+    mutable_starts, mutable_ends = _repair_time_fields(response, validation_errors, duration)
+    required = ["step", "phase", "status", "start_s", "end_s", "caption", "confidence", "evidence"]
+    variants: list[dict[str, Any]] = []
+    for segment in response["segments"]:
+        step = segment["step"]
+        properties: dict[str, Any] = {
+            "step": {"type": "integer", "const": step},
+            "phase": {"type": "string", "const": segment["phase"]},
+            "status": {"type": "string", "const": segment["status"]},
+            "caption": {"type": "string", "const": segment["caption"]},
+            "confidence": {"type": "null"}
+            if segment["confidence"] is None
+            else {"type": "number", "const": segment["confidence"]},
+            "evidence": {"type": "null"}
+            if segment["evidence"] is None
+            else {"type": "string", "const": segment["evidence"]},
+        }
+        start = segment["start_s"]
+        end = segment["end_s"]
+        if step in mutable_starts:
+            start_schema: dict[str, Any] = {"type": "number", "minimum": 0}
+            if _is_finite_number(end) and 0 < end <= duration:
+                start_schema["exclusiveMaximum"] = end
+            else:
+                start_schema["maximum"] = duration
+            properties["start_s"] = start_schema
+        else:
+            properties["start_s"] = {"type": "null"} if start is None else {"type": "number", "const": start}
+        if step in mutable_ends:
+            end_schema: dict[str, Any] = {"type": "number", "maximum": duration}
+            if _is_finite_number(start) and 0 <= start < duration:
+                end_schema["exclusiveMinimum"] = start
+            else:
+                end_schema["exclusiveMinimum"] = 0
+            properties["end_s"] = end_schema
+        else:
+            properties["end_s"] = {"type": "null"} if end is None else {"type": "number", "const": end}
+        variants.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": properties,
+                "required": required,
+            }
+        )
+    expected_missing = [segment["step"] for segment in response["segments"] if segment["status"] != "completed"]
+    missing_items: dict[str, Any] = {"type": "integer"}
+    if expected_missing:
+        missing_items["enum"] = expected_missing
+    expected_complete = not expected_missing
+    uncertainties: dict[str, Any] = {"type": "array", "items": {"type": "string"}, "maxItems": 16}
+    if expected_complete:
+        uncertainties["minItems"] = 0
+        uncertainties["maxItems"] = 0
+    else:
+        uncertainties["minItems"] = 1
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "integer", "const": 2},
+            "episode_complete": {"type": "boolean", "const": expected_complete},
+            "segments": {"type": "array", "items": {"anyOf": variants}, "minItems": 7, "maxItems": 7},
+            "missing_steps": {
+                "type": "array",
+                "items": missing_items,
+                "minItems": len(expected_missing),
+                "maxItems": len(expected_missing),
+            },
+            "uncertainties": uncertainties,
+        },
+        "required": ["schema_version", "episode_complete", "segments", "missing_steps", "uncertainties"],
+    }
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "pnp_trash_cosmos_v2_repair", "schema": schema, "strict": True},
+    }
+
+
 def build_repair_request_body(
-    *, model: str, invalid_response: str, validation_errors: Sequence[str]
+    *,
+    model: str,
+    invalid_response: str,
+    validation_errors: Sequence[str],
+    duration_s: float | None = None,
 ) -> dict[str, Any]:
     repair_payload = _canonical_json(
         {
@@ -841,7 +1020,11 @@ def build_repair_request_body(
         "seed": 0,
         "max_completion_tokens": 2048,
         "stream": False,
-        "response_format": build_structured_response_format(),
+        "response_format": build_repair_response_format(
+            invalid_response=invalid_response,
+            validation_errors=validation_errors,
+            duration_s=duration_s,
+        ),
     }
 
 
@@ -1023,7 +1206,13 @@ class CosmosTransport:
         )
         return CosmosCallObservation._from_call("initial", result)
 
-    def observe_repair(self, *, invalid_response: str, validation_errors: Sequence[str]) -> CosmosCallObservation:
+    def observe_repair(
+        self,
+        *,
+        invalid_response: str,
+        validation_errors: Sequence[str],
+        duration_s: float | None = None,
+    ) -> CosmosCallObservation:
         """Perform exactly one bounded text-only repair call for durable orchestration."""
 
         if not _valid_utf8_string(invalid_response):
@@ -1036,6 +1225,7 @@ class CosmosTransport:
             model=self.model,
             invalid_response=invalid_response,
             validation_errors=validation_errors,
+            duration_s=duration_s,
         )
         repair_wire = _canonical_json(repair_body).encode("utf-8")
         result = self._call(
@@ -1122,6 +1312,7 @@ class CosmosTransport:
         repair = self.observe_repair(
             invalid_response=invalid_content,
             validation_errors=validation_errors,
+            duration_s=sample.duration_s,
         )
         self.persist_observation(repair)
         exchanges.append(repair.exchange)

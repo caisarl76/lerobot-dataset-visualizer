@@ -8,7 +8,11 @@ from types import SimpleNamespace
 from typing import Any
 
 from curation import cosmos_transport
-from curation.cosmos_contract import COSMOS_RESPONSE_V2_SCHEMA
+from curation.cosmos_contract import (
+    COSMOS_RESPONSE_V2_SCHEMA,
+    CosmosContractError,
+    build_cosmos_proposal,
+)
 from curation.cosmos_transport import (
     CANONICAL_PROMPT_PREFIX,
     PROMPT_MAX_BYTES,
@@ -19,6 +23,7 @@ from curation.cosmos_transport import (
     SamplingOutcome,
     build_canonical_prompt,
     build_initial_request_body,
+    build_repair_request_body,
     build_request_artifact,
     prepare_initial_request,
 )
@@ -991,6 +996,101 @@ def test_invalid_contract_content_gets_one_text_only_structured_repair_without_r
     assert result.exchanges[-1]["phase"] == "repair"
 
 
+def test_repair_grammar_freezes_valid_observations_and_only_opens_invalid_final_end() -> None:
+    invalid = _complete_response()
+    invalid["segments"][-1]["end_s"] = invalid["segments"][-1]["start_s"]
+    invalid["missing_steps"] = [3, 4, 5, 6, 7]
+    invalid["episode_complete"] = False
+
+    body = build_repair_request_body(
+        model="cosmos3-nano-test",
+        invalid_response=json.dumps(invalid),
+        validation_errors=(
+            "step 7 must satisfy 0 <= start_s < end_s <= duration_s 41.2",
+            "missing_steps must exactly match partial and not_observed steps in ascending order",
+            "episode_complete must be true if and only if missing_steps is empty",
+        ),
+        duration_s=41.2,
+    )
+
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert schema["properties"]["episode_complete"] == {"type": "boolean", "const": True}
+    assert schema["properties"]["missing_steps"] == {
+        "type": "array",
+        "items": {"type": "integer"},
+        "minItems": 0,
+        "maxItems": 0,
+    }
+    variants = schema["properties"]["segments"]["items"]["anyOf"]
+    step_three = next(item for item in variants if item["properties"]["step"]["const"] == 3)
+    assert step_three["properties"]["status"] == {"type": "string", "const": "completed"}
+    assert step_three["properties"]["start_s"] == {"type": "number", "const": 10.0}
+    assert step_three["properties"]["evidence"] == {"type": "string", "const": "visible"}
+    step_seven = next(item for item in variants if item["properties"]["step"]["const"] == 7)
+    assert step_seven["properties"]["status"] == {"type": "string", "const": "completed"}
+    assert step_seven["properties"]["start_s"] == {"type": "number", "const": 35.0}
+    assert step_seven["properties"]["end_s"] == {
+        "type": "number",
+        "exclusiveMinimum": 35.0,
+        "maximum": 41.2,
+    }
+    assert "media_io_kwargs" not in body
+
+
+def test_repair_grammar_maps_every_canonical_dynamic_time_error_to_mutable_fields() -> None:
+    cases: list[tuple[str, dict[str, Any], list[float], set[int], set[int]]] = []
+
+    out_of_range = _complete_response()
+    out_of_range["segments"][-1]["end_s"] = out_of_range["segments"][-1]["start_s"]
+    cases.append(("step 7 must satisfy", out_of_range, [index / 50 for index in range(2060)], set(), {7}))
+
+    adjacent = _complete_response()
+    adjacent["segments"][1]["end_s"] = 8.0
+    cases.append(("must be adjacent", adjacent, [index / 50 for index in range(2060)], {3}, {2}))
+
+    late_start = _complete_response()
+    late_start["segments"][0]["start_s"] = 0.4
+    cases.append(("must start at 0", late_start, [index / 50 for index in range(2060)], {1}, set()))
+
+    early_end = _complete_response()
+    early_end["segments"][-1]["end_s"] = 40.0
+    cases.append(("must end at duration", early_end, [index / 50 for index in range(2060)], set(), {7}))
+
+    unordered = _complete_response()
+    unordered["segments"][2]["start_s"] = unordered["segments"][1]["start_s"]
+    cases.append(
+        ("strictly increasing starts", unordered, [index / 50 for index in range(2060)], set(range(1, 8)), {2})
+    )
+
+    duplicate_snaps = _complete_response()
+    cases.append(
+        ("six strictly increasing transition frames", duplicate_snaps, [0.0, 100.0], set(range(2, 8)), set())
+    )
+
+    for message, invalid, timestamps, expected_starts, expected_ends in cases:
+        raw = json.dumps(invalid)
+        with pytest.raises(CosmosContractError) as captured:
+            build_cosmos_proposal(raw, duration_s=41.2, parquet_timestamps=timestamps)
+        assert any(message in error for error in captured.value.errors)
+        body = build_repair_request_body(
+            model="cosmos3-nano-test",
+            invalid_response=raw,
+            validation_errors=captured.value.errors,
+            duration_s=41.2,
+        )
+        variants = body["response_format"]["json_schema"]["schema"]["properties"]["segments"]["items"]["anyOf"]
+        mutable_starts = {
+            item["properties"]["step"]["const"]
+            for item in variants
+            if "const" not in item["properties"]["start_s"]
+        }
+        mutable_ends = {
+            item["properties"]["step"]["const"] for item in variants if "const" not in item["properties"]["end_s"]
+        }
+        assert mutable_starts == expected_starts
+        assert mutable_ends == expected_ends
+
+
 def test_inner_json_surrogate_validation_error_is_safely_escaped_in_repair_request() -> None:
     requests: list[bytes] = []
 
@@ -1005,6 +1105,25 @@ def test_inner_json_surrogate_validation_error_is_safely_escaped_in_repair_reque
     assert result.status == "succeeded"
     assert len(requests) == 2
     requests[1].decode("utf-8")
+
+
+@pytest.mark.parametrize("field", ["caption", "evidence"])
+def test_schema_valid_surrogate_observation_falls_back_to_generic_repair_grammar(field: str) -> None:
+    invalid = _complete_response()
+    invalid["segments"][2][field] = "\ud800"
+    raw = json.dumps(invalid)
+    with pytest.raises(CosmosContractError) as captured:
+        build_cosmos_proposal(raw, duration_s=41.2, parquet_timestamps=[index / 50 for index in range(2060)])
+
+    body = build_repair_request_body(
+        model="cosmos3-nano-test",
+        invalid_response=raw,
+        validation_errors=captured.value.errors,
+        duration_s=41.2,
+    )
+
+    assert body["response_format"] == _expected_response_format()
+    canonical_json(body).encode("utf-8")
 
 
 def test_semantically_incomplete_valid_content_is_accepted_without_repair() -> None:
