@@ -176,7 +176,7 @@ def _validate_dynamic_contract(response: dict[str, Any], *, duration_s: float) -
             errors.append(f"step {segment['step']} times and confidence must be finite")
             continue
         if not 0 <= start_s < end_s <= duration:
-            errors.append(f"step {segment['step']} must satisfy 0 <= start_s < end_s <= duration")
+            errors.append(f"step {segment['step']} must satisfy 0 <= start_s < end_s <= duration_s {duration!r}")
         timed_segments.append((segment, start_s, end_s))
 
     if any(not _is_valid_utf8(uncertainty) for uncertainty in response["uncertainties"]):

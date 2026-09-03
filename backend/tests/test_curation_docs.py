@@ -53,8 +53,7 @@ APPROVED_ANCILLARY_SIZE = 13_644
 APPROVED_VLLM_VERSION = "0.23.0"
 APPROVED_VLLM_IMAGE_ID = "sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7"
 APPROVED_COSMOS_ENDPOINT_IDENTITY = (
-    "h100-cosmos3-nano-vllm-0.23.0@"
-    "sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7"
+    "h100-cosmos3-nano-vllm-0.23.0@sha256:f37691f675bb82f734f606de8af90e777d3f80a20b120e699fd43fd10e60b8d7"
 )
 
 
@@ -116,7 +115,8 @@ def test_curation_docs_freeze_deployed_vllm_build_in_endpoint_provenance() -> No
         assert APPROVED_VLLM_VERSION in document
         assert APPROVED_VLLM_IMAGE_ID in document
         assert APPROVED_COSMOS_ENDPOINT_IDENTITY in document
-    assert "pre-first-success transport correction" in documents[2]
+        assert "response_format" in document
+    assert "pre-first-operator-approved-smoke compatibility correction" in documents[2]
 
 
 def _run_checkout_preflight(

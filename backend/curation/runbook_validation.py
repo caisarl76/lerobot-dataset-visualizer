@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
 from types import MappingProxyType
 from typing import Any
@@ -26,6 +27,8 @@ from .cosmos_transport import (
     JPEG_QUALITY,
     RESIZE_MAX_LONG_EDGE,
     build_canonical_prompt,
+    build_repair_request_body,
+    build_structured_response_format,
     prove_alignment_and_select,
 )
 from .security import OpenedAsset, SourceFileIdentity
@@ -89,6 +92,7 @@ _AUTHORITY_KEYS = {
     "attempt_id",
     "proposal_id",
     "configuration",
+    "repair_exchange",
     "artifacts",
 }
 _SMOKE_SOURCE_EPISODE_INDEX = 4
@@ -538,7 +542,16 @@ def _validate_request(
 
     body = _exact_object(
         request["request_body"],
-        {"model", "messages", "temperature", "seed", "max_completion_tokens", "stream", "media_io_kwargs"},
+        {
+            "model",
+            "messages",
+            "temperature",
+            "seed",
+            "max_completion_tokens",
+            "stream",
+            "response_format",
+            "media_io_kwargs",
+        },
         "request body schema is not closed",
     )
     messages = body["messages"]
@@ -569,6 +582,7 @@ def _validate_request(
         or body["seed"] != 0
         or body["max_completion_tokens"] != 4096
         or body["stream"] is not False
+        or body["response_format"] != build_structured_response_format()
         or descriptor.get("redacted") != "base64"
         or descriptor.get("sha256") != request["sampled_payload_sha256"]
         or type(descriptor.get("bytes")) is not int
@@ -643,6 +657,107 @@ def _validate_parsed_and_raw(
     )
 
 
+def _validate_repair_exchange(
+    workspace: Path,
+    *,
+    attempt_id: str,
+    model: str,
+    endpoint: str,
+    initial_response: bytes,
+    timeline: _RegisteredTimeline,
+    repair_record: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if repair_record is None:
+        return None
+    root = workspace.resolve(strict=True)
+    database_path = root / "curation.sqlite3"
+    connection: sqlite3.Connection | None = None
+    try:
+        if stat.S_ISLNK(database_path.lstat().st_mode) or not stat.S_ISREG(database_path.lstat().st_mode):
+            _fail("repair exchange database is unavailable")
+        if database_path.resolve(strict=True) != database_path:
+            _fail("repair exchange database is unavailable")
+        connection = sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        connection.execute("PRAGMA query_only=ON")
+        row = connection.execute(
+            "SELECT http_exchange_history_json FROM cosmos_attempts WHERE id=?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None or len(row) != 1 or not isinstance(row[0], str):
+            _fail("repair exchange history is unavailable")
+        history = _strict_json_bytes(row[0].encode("utf-8"), "repair exchange history is invalid")
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        _fail("repair exchange database is unavailable")
+    finally:
+        if connection is not None:
+            connection.close()
+    if type(history) is not list or any(type(exchange) is not dict for exchange in history):
+        _fail("repair exchange history is invalid")
+    indexed_repairs = [
+        (index, exchange) for index, exchange in enumerate(history) if exchange.get("phase") == "repair"
+    ]
+    initial_exchanges = [exchange for exchange in history if exchange.get("phase") == "initial"]
+    if len(indexed_repairs) != 1 or not initial_exchanges:
+        _fail("repair exchange history is invalid")
+    exchange_index, repair_exchange = indexed_repairs[0]
+    if set(repair_exchange) != {"phase", "started_at", "finished_at", "request", "response", "error"}:
+        _fail("repair exchange history is invalid")
+    request = _exact_object(
+        repair_exchange["request"],
+        {"method", "url", "body_sha256"},
+        "repair exchange request is invalid",
+    )
+    response = _exact_object(
+        repair_exchange["response"],
+        {"status_code", "id", "model", "created", "usage", "finish_reason"},
+        "repair exchange response is invalid",
+    )
+    if (
+        not isinstance(repair_exchange["started_at"], str)
+        or not repair_exchange["started_at"]
+        or not isinstance(repair_exchange["finished_at"], str)
+        or not repair_exchange["finished_at"]
+        or repair_exchange["error"] is not None
+        or request["method"] != "POST"
+        or request["url"] != endpoint.rstrip("/") + "/chat/completions"
+        or not _SHA256.fullmatch(str(request["body_sha256"]))
+        or response["status_code"] != 200
+        or response["finish_reason"] != "stop"
+    ):
+        _fail("repair exchange history is invalid")
+    latest_initial = initial_exchanges[-1]
+    initial_envelope = latest_initial.get("response")
+    try:
+        initial_text = initial_response.decode("utf-8")
+    except UnicodeDecodeError:
+        _fail("initial response is not valid UTF-8")
+    if type(initial_envelope) is dict and initial_envelope.get("finish_reason") != "stop":
+        validation_errors = ("choices[0].finish_reason must be exactly stop",)
+    else:
+        try:
+            build_cosmos_proposal(
+                initial_text,
+                duration_s=timeline.duration_s,
+                parquet_timestamps=timeline.timestamps,
+            )
+        except CosmosContractError as error:
+            validation_errors = error.errors
+        else:
+            _fail("repair exchange has no invalid initial response")
+    expected_body = build_repair_request_body(
+        model=model,
+        invalid_response=initial_text,
+        validation_errors=validation_errors,
+    )
+    expected_sha256 = hashlib.sha256(_canonical_bytes(expected_body)).hexdigest()
+    if request["body_sha256"] != expected_sha256:
+        _fail("repair request body does not match the authoritative repair exchange")
+    return {
+        "history_index": exchange_index,
+        "request_body_sha256": expected_sha256,
+    }
+
+
 def build_smoke_authority(
     *,
     workspace: Path,
@@ -681,6 +796,15 @@ def build_smoke_authority(
         attempt_root,
         parsed_bytes,
         timeline=timeline,
+    )
+    repair_exchange = _validate_repair_exchange(
+        workspace,
+        attempt_id=attempt_id,
+        model=configuration["cosmos"]["model"],
+        endpoint=configuration["cosmos"]["base_url"],
+        initial_response=_regular_file(workspace, f"{attempt_root}/response.txt", "response")[1],
+        timeline=timeline,
+        repair_record=repair_record,
     )
 
     namespace = (
@@ -726,6 +850,7 @@ def build_smoke_authority(
         "attempt_id": attempt_id,
         "proposal_id": proposal_id,
         "configuration": configuration,
+        "repair_exchange": repair_exchange,
         "artifacts": {
             "request": _record(request_relative, request_bytes),
             "initial_response": response_record,

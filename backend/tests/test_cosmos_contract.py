@@ -314,6 +314,16 @@ def test_times_must_be_in_range_and_nonempty(field: str, value: float) -> None:
         _parse(response)
 
 
+def test_time_validation_error_reports_the_exact_duration_to_repair() -> None:
+    response = deepcopy(COMPLETE_RESPONSE)
+    response["segments"][-1]["end_s"] = 41.3
+
+    with pytest.raises(_contract().CosmosContractError) as captured:
+        _parse(response, duration_s=41.2)
+
+    assert "step 7 must satisfy 0 <= start_s < end_s <= duration_s 41.2" in captured.value.errors
+
+
 @pytest.mark.parametrize(
     "content",
     [
