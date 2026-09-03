@@ -775,17 +775,22 @@ The pinned vLLM must accept the production request's JSON-schema
 seven eight-key segment objects while avoiding vLLM-unsupported
 `prefixItems` and `if`/`then`/`else`; the full Cosmos v2 schema and dynamic
 validator remain authoritative. The smoke validator below rejects an omitted
-or modified `response_format`. The text-only repair call uses the same grammar
-but never resends video or `media_io_kwargs`. When repair is authoritative, the
+or modified `response_format`. The text-only repair call derives a stricter
+grammar from a statically valid initial response: valid status, phase,
+caption, confidence, and evidence fields are constants, completion metadata is
+derived from the frozen statuses, and only invalid time fields remain open
+within the exact episode duration. It never resends video or
+`media_io_kwargs`. When repair is authoritative, the
 smoke validator reconstructs its exact body from the authenticated initial
 response and validation errors, then requires its SHA-256 to match the
 append-only repair exchange in `curation.sqlite3`; that binding is included in
 the frozen smoke authority.
 
 Earlier episode-4 attempts are diagnostic evidence only. They exposed the
-32-frame default, an incomplete repair shape, and a technically valid but
-semantically incomplete proposal. None is an operator-confirmed smoke, and
-none authorizes a full batch.
+32-frame default, an incomplete repair shape, a technically valid but
+semantically incomplete proposal, and the nondeterminism of prompt-only repair
+preservation. None is an operator-confirmed smoke, and none authorizes a full
+batch.
 
 Open the workspace, then create exactly one smoke attempt through the
 same-origin Next.js proxy:

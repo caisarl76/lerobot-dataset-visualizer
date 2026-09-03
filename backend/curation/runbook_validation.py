@@ -748,6 +748,7 @@ def _validate_repair_exchange(
         model=model,
         invalid_response=initial_text,
         validation_errors=validation_errors,
+        duration_s=timeline.duration_s,
     )
     expected_sha256 = hashlib.sha256(_canonical_bytes(expected_body)).hexdigest()
     if request["body_sha256"] != expected_sha256:
