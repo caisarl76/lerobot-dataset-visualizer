@@ -1,5 +1,6 @@
 ---
-title: Visualize Dataset (v2.0+ latest dataset format)
+title: G1 Dataset Annotation
+short_description: Review and annotate LeRobot episodes with a VLM
 emoji: 💻
 colorFrom: blue
 colorTo: green

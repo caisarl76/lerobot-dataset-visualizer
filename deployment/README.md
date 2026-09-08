@@ -74,3 +74,40 @@ model/endpoint defaults if the annotation backend should use Cosmos.
 
 Validation checks structure and timing. Generated semantic labels still need
 human review in the visualizer before training export.
+
+## Combined private Space with hosted Qwen
+
+The root Dockerfile now runs the existing Next UI on port 7860 and the official
+annotation backend on container loopback port 7861. It calls the external
+`qwen/qwen3.5-397b-a17b-fp8` model through an OpenAI-compatible Genon endpoint.
+It does not load model weights or require an H100 endpoint. The local H100 launch
+scripts above remain available for the existing local service.
+
+Create a **private Docker Space** in an account/organization that supports Docker
+hosting. The default dataset is `mncai/G1_Dex3_PickAndPlaceTrash`; the Space and
+dataset are different repository types even if they share that ID.
+
+Configure these Space secrets:
+
+- `GENON_API_KEY`: the existing provider key; never upload the `.env` file.
+- `HF_TOKEN`: a Hub token authorized to read the input and write the publication
+  allowlist. Only the backend process receives either credential.
+
+Configure these runtime variables:
+
+- `ANNOTATION_VLM_API_BASE`: the confirmed Genon OpenAI-compatible HTTPS base URL.
+- `ANNOTATION_WORKSPACE`: a writable **persistent mounted filesystem**. Configure
+  storage before use; temporary container disk is not durable annotation storage.
+- `ANNOTATION_HOSTED_PRIVATE_SPACE=1`: set only after verifying Space visibility.
+- `ANNOTATION_HUB_REPOS=mncai/G1_Dex3_PickAndPlaceTrash`: allowed publication targets.
+
+`SPACE_HOST` normally supplies the exact browser origin; an explicit
+`ANNOTATION_BROWSER_ORIGIN` can override it. The launcher generates a shared
+internal service credential for its two processes at each boot. Do not configure
+an external backend URL or send model credentials to browser code. If either
+process exits, the launcher stops the other so Space health cannot mask failure.
+
+The deployment is not complete until the provider URL and image runtime are
+verified, durable storage is configured, and an external-browser review/export
+smoke test passes. The initial mncai creation attempt returned HTTP 402 requiring
+an organization hosting plan; no subscription was purchased or Space created.

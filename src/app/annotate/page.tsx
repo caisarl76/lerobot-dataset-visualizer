@@ -5,7 +5,7 @@ import {
   prepareAnnotationDataset,
 } from "../../utils/annotationsClient";
 export default function AnnotatePage() {
-  const [source, setSource] = useState("mncai/G1_Dex3_Trash_LocoManipulation");
+  const [source, setSource] = useState("mncai/G1_Dex3_PickAndPlaceTrash");
   const [revision, setRevision] = useState("main");
   const [kind, setKind] = useState<"repo_id" | "local_path">("repo_id");
   const [status, setStatus] = useState("");
