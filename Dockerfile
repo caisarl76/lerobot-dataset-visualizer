@@ -1,25 +1,18 @@
-FROM oven/bun:1 AS base
-
-# Set working directory
+FROM oven/bun:1.3.14 AS build
 WORKDIR /app
-
-# Copy package files
-COPY package.json bun.lock* ./
-
-# Install dependencies
+COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
-
-# Copy the rest of the application
 COPY . .
+ARG NEXT_PUBLIC_ANNOTATE_BACKEND_URL=/api/annotation
+ENV NEXT_PUBLIC_ANNOTATE_BACKEND_URL=$NEXT_PUBLIC_ANNOTATE_BACKEND_URL
+RUN bun run type-check && bun run build
 
-# Build the application
-RUN bun run build
-
-# Expose port 7860
-EXPOSE 7860
-
-# Set environment variable for port
+FROM oven/bun:1.3.14-slim
+WORKDIR /app
+COPY --from=build --chown=bun:bun /app/.next ./.next
+COPY --from=build --chown=bun:bun /app/node_modules ./node_modules
+COPY --from=build --chown=bun:bun /app/package.json /app/next.config.ts ./
+USER bun
 ENV PORT=7860
-
-# Start the application
-CMD ["bun", "start"]
+EXPOSE 7860
+CMD ["bun", "run", "start", "--hostname", "0.0.0.0", "--port", "7860"]

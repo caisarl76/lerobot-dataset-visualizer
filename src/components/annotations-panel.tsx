@@ -32,6 +32,9 @@ import {
   exportDataset as apiExport,
   isAnnotateBackendEnabled,
 } from "../utils/annotationsClient";
+import { OfficialAnnotationControls } from "./official-annotation-controls";
+import { AnnotationWorkflowControls } from "./annotation-workflow-controls";
+import { AnnotationReviewControl } from "./annotation-review-control";
 
 interface Props {
   cameraKeys: string[];
@@ -423,6 +426,22 @@ const RAIL_GROUPS: RailGroupDef[] = [
       return `${role}: ${t.slice(0, 60)}${t.length > 60 ? "…" : ""}${cameraSuffix}`;
     },
   },
+  {
+    key: "motion",
+    title: "motion",
+    dotClass: "dot-subtask",
+    column: "persistent",
+    match: (a) => a.style === "motion",
+    label: (a) => a.content || "(empty)",
+  },
+  {
+    key: "trace",
+    title: "trace",
+    dotClass: "dot-vqa",
+    column: "events",
+    match: (a, otherCamera) => a.style === "trace" && !otherCamera(a),
+    label: (a) => a.content || "(empty)",
+  },
 ];
 
 function useJump(): (ts: number) => void {
@@ -539,6 +558,15 @@ export const AnnotationsPanel: React.FC<Props> = ({ cameraKeys }) => {
     }
     setExportStatus("Saving dataset…");
     try {
+      if (dirty) {
+        const saved = await save();
+        if (!saved.ok) {
+          setExportStatus(
+            `Save episode failed: ${saved.error || "unknown error"}`,
+          );
+          return;
+        }
+      }
       const r = await apiExport(ident);
       setExportStatus(
         `Saved dataset to ${r.output_dir} (persistent: ${r.persistent_rows}, events: ${r.event_rows}).`,
@@ -582,17 +610,22 @@ export const AnnotationsPanel: React.FC<Props> = ({ cameraKeys }) => {
           >
             {saving ? "Saving…" : "Save episode"}
           </button>
-          <button
-            disabled={!backendEnabled}
-            onClick={handleSaveDataset}
-            className="text-xs h-7 px-3 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-40"
-          >
-            Save dataset
-          </button>
+          <AnnotationReviewControl />
+          {!process.env.NEXT_PUBLIC_ANNOTATE_BACKEND_URL?.startsWith("/") && (
+            <button
+              disabled={!backendEnabled || saving}
+              onClick={handleSaveDataset}
+              className="text-xs h-7 px-3 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-40"
+            >
+              Save dataset
+            </button>
+          )}
         </div>
       </div>
 
       {exportStatus && <div className="save-status">{exportStatus}</div>}
+      <OfficialAnnotationControls />
+      <AnnotationWorkflowControls />
 
       <section className="annotation-composer">
         <div className="composer-copy">
@@ -864,6 +897,25 @@ const AtomEditor: React.FC<{
         </div>
       </div>
 
+      {(atom.style === "motion" || atom.style === "trace") && (
+        <div className="field">
+          <label className="field-label">
+            {atom.style === "motion" ? "Motion" : "Trace"}
+          </label>
+          <textarea
+            rows={4}
+            value={atom.content || ""}
+            onChange={(e) => onChange({ content: e.target.value })}
+          />
+          {atom.style === "trace" && (
+            <CameraField
+              atom={atom}
+              cameraKeys={cameraKeys}
+              onChange={onChange}
+            />
+          )}
+        </div>
+      )}
       {/* Content / role-specific fields */}
       {(atom.style === "task_aug" ||
         atom.style === "subtask" ||

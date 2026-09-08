@@ -1,291 +1,133 @@
+"""Editor drafts remain editable; publication now uses the official contract."""
+
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 import app as backend_app
-from fastapi.testclient import TestClient
-import jsonschema
+import httpx
 import pyarrow.parquet as pq
 
-LOAD_KEYS = {
-    "repo_id",
-    "local_path",
-    "revision",
-    "root",
-    "fps",
-    "num_episodes",
-    "persistent_styles",
-    "event_styles",
-}
-GET_ATOMS_KEYS = {"episode_index", "atoms"}
-SET_ATOMS_KEYS = {"ok", "saved", "path"}
-TIMESTAMPS_KEYS = {"episode_index", "timestamps"}
-EXPORT_KEYS = {"output_dir", "persistent_rows", "event_rows"}
-EXPECTED_SAY_TOOL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "say",
-        "description": "Speak a short utterance to the user via the TTS executor.",
-        "parameters": {
-            "type": "object",
-            "properties": {"text": {"type": "string", "description": "The verbatim text to speak."}},
-            "required": ["text"],
-        },
-    },
-}
 
-
-def _legacy_atoms() -> list[dict[str, object]]:
-    return [
+def test_editor_drafts_and_official_export(clear_dataset_state, legacy_v31_dataset: Path, tmp_path: Path):
+    root = legacy_v31_dataset
+    data_path = root / "data/chunk-000/file-000.parquet"
+    original_bytes = data_path.read_bytes()
+    original_table = pq.read_table(data_path)
+    atoms = [
         {"role": "user", "content": "Sort the table", "style": "task_aug", "timestamp": 0.0},
-        {"role": "assistant", "content": "Reach for the can", "style": "subtask", "timestamp": 0.01},
-        {"role": "assistant", "content": "Then place it in the bin", "style": "plan", "timestamp": 0.02},
-        {"role": "assistant", "content": "The bin is on the right", "style": "memory", "timestamp": 0.03},
+        {"role": "assistant", "content": "Reach for the can", "style": "subtask", "timestamp": 0.0},
+        {"role": "assistant", "content": "Place it in the bin", "style": "plan", "timestamp": 0.0},
+        {"role": "assistant", "content": "The bin is on the right", "style": "memory", "timestamp": 0.0},
         {"role": "user", "content": "Be careful", "style": "interjection", "timestamp": 0.04},
-        {
-            "role": "user",
-            "content": "Where is the can?",
-            "style": "vqa",
-            "timestamp": 0.14,
-            "camera": "observation.images.front",
-        },
-        {
-            "role": "assistant",
-            "content": None,
-            "style": None,
-            "timestamp": 0.18,
-            "tool_calls": [
+    ]
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=backend_app.app), base_url="http://test"
+        ) as client:
+            identity = {"local_path": str(root)}
+            loaded = await client.post("/api/dataset/load", json=identity)
+            assert loaded.status_code == 200
+            assert loaded.json()["num_episodes"] == 1
+            payload = {**identity, "episode_index": 0, "atoms": atoms}
+            saved = await client.post("/api/episodes/0/atoms", json=payload)
+            assert saved.json() == {"ok": True, "saved": 5, "path": str(root / "meta/lerobot_annotations.json")}
+            backend_app._states.clear()
+            reread = await client.get("/api/episodes/0/atoms", params=identity)
+            assert reread.json()["atoms"][-1]["timestamp"] == 0.0
+            # The editor can persist an incomplete draft; official export rejects it.
+            invalid = await client.post("/api/export", json={**identity, "output_dir": str(tmp_path / "invalid")})
+            assert invalid.status_code == 422
+            assert "speech" in invalid.json()["detail"]
+            atoms.append(
                 {
-                    "type": "function",
-                    "function": {"name": "say", "arguments": {"text": "I found it."}},
+                    "role": "assistant",
+                    "content": None,
+                    "style": None,
+                    "timestamp": 0.04,
+                    "tool_calls": [
+                        {"type": "function", "function": {"name": "say", "arguments": {"text": "I will."}}}
+                    ],
                 }
-            ],
-        },
-    ]
-
-
-def test_legacy_v31_atoms_routes_and_export_contract(
-    clear_dataset_state: None, legacy_v31_dataset: Path, tmp_path: Path
-) -> None:
-    source_path = legacy_v31_dataset / "data" / "chunk-000" / "file-000.parquet"
-    source_table = pq.read_table(source_path)
-    client = TestClient(backend_app.app)
-    local_path = str(legacy_v31_dataset)
-
-    load = client.post("/api/dataset/load", json={"local_path": local_path})
-    assert load.status_code == 200
-    assert set(load.json()) == LOAD_KEYS
-    assert load.json() | {"root": "ignored"} == {
-        "repo_id": None,
-        "local_path": local_path,
-        "revision": None,
-        "root": "ignored",
-        "fps": 10.0,
-        "num_episodes": 1,
-        "persistent_styles": ["memory", "plan", "subtask", "task_aug"],
-        "event_styles": ["interjection", "vqa"],
-    }
-
-    empty_atoms = client.get(f"/api/episodes/0/atoms?local_path={local_path}")
-    assert empty_atoms.status_code == 200
-    assert set(empty_atoms.json()) == GET_ATOMS_KEYS
-    assert empty_atoms.json() == {"episode_index": 0, "atoms": []}
-
-    saved = client.post(
-        "/api/episodes/0/atoms",
-        json={"local_path": local_path, "episode_index": 0, "atoms": _legacy_atoms()},
-    )
-    assert saved.status_code == 200
-    assert set(saved.json()) == SET_ATOMS_KEYS
-    assert saved.json()["ok"] is True
-    assert saved.json()["saved"] == 7
-    assert saved.json()["path"] == str(legacy_v31_dataset / "meta" / "lerobot_annotations.json")
-
-    annotation_payload = json.loads((legacy_v31_dataset / "meta" / "lerobot_annotations.json").read_text())
-    assert annotation_payload["version"] == 2
-    assert [atom["style"] for atom in annotation_payload["episodes"]["0"]["atoms"]] == [
-        "task_aug",
-        "subtask",
-        "plan",
-        "memory",
-        "interjection",
-        "vqa",
-        None,
-    ]
-    backend_app._states.clear()
-
-    atoms = client.get(f"/api/episodes/0/atoms?local_path={local_path}")
-    assert atoms.status_code == 200
-    assert set(atoms.json()) == GET_ATOMS_KEYS
-    assert atoms.json()["episode_index"] == 0
-    assert all(
-        set(atom) == {"role", "content", "style", "timestamp", "camera", "tool_calls"}
-        for atom in atoms.json()["atoms"]
-    )
-    assert [atom["style"] for atom in atoms.json()["atoms"]] == [
-        "task_aug",
-        "subtask",
-        "plan",
-        "memory",
-        "interjection",
-        "vqa",
-        None,
-    ]
-    assert [atom["timestamp"] for atom in atoms.json()["atoms"]] == [
-        0.0,
-        0.01,
-        0.02,
-        0.03,
-        0.0,
-        0.1,
-        0.2,
-    ]
-    assert [atom["role"] for atom in atoms.json()["atoms"]] == [
-        "user",
-        "assistant",
-        "assistant",
-        "assistant",
-        "user",
-        "user",
-        "assistant",
-    ]
-    assert [atom["content"] for atom in atoms.json()["atoms"]] == [
-        "Sort the table",
-        "Reach for the can",
-        "Then place it in the bin",
-        "The bin is on the right",
-        "Be careful",
-        "Where is the can?",
-        None,
-    ]
-    assert atoms.json()["atoms"][5]["camera"] == "observation.images.front"
-    assert atoms.json()["atoms"][6]["tool_calls"] == [
-        {
-            "type": "function",
-            "function": {"name": "say", "arguments": {"text": "I found it."}},
-        }
-    ]
-
-    timestamps = client.get(f"/api/episodes/0/frame_timestamps?local_path={local_path}")
-    assert timestamps.status_code == 200
-    assert set(timestamps.json()) == TIMESTAMPS_KEYS
-    assert timestamps.json() == {"episode_index": 0, "timestamps": [0.0, 0.1, 0.2]}
-
-    output_dir = tmp_path / "exported-legacy-v31"
-    backend_app._states.clear()
-    exported = client.post("/api/export", json={"local_path": local_path, "output_dir": str(output_dir)})
-    assert exported.status_code == 200
-    assert set(exported.json()) == EXPORT_KEYS
-    assert exported.json() == {
-        "output_dir": str(output_dir),
-        "persistent_rows": 4,
-        "event_rows": 3,
-    }
-
-    export_table = pq.read_table(output_dir / "data" / "chunk-000" / "file-000.parquet")
-    assert export_table.column_names == [
-        *source_table.column_names,
-        "language_persistent",
-        "language_events",
-    ]
-    for name in source_table.column_names:
-        assert export_table.schema.field(name).type == source_table.schema.field(name).type
-        assert export_table.column(name).to_pylist() == source_table.column(name).to_pylist()
-
-    persistent = export_table.column("language_persistent").to_pylist()
-    events = export_table.column("language_events").to_pylist()
-    assert persistent[0] == [
-        {
-            "role": "user",
-            "content": "Sort the table",
-            "style": "task_aug",
-            "timestamp": 0.0,
-            "camera": None,
-            "tool_calls": None,
-        },
-        {
-            "role": "assistant",
-            "content": "Reach for the can",
-            "style": "subtask",
-            "timestamp": 0.01,
-            "camera": None,
-            "tool_calls": None,
-        },
-        {
-            "role": "assistant",
-            "content": "Then place it in the bin",
-            "style": "plan",
-            "timestamp": 0.02,
-            "camera": None,
-            "tool_calls": None,
-        },
-        {
-            "role": "assistant",
-            "content": "The bin is on the right",
-            "style": "memory",
-            "timestamp": 0.03,
-            "camera": None,
-            "tool_calls": None,
-        },
-    ]
-    assert all(rows == persistent[0] for rows in persistent[1:])
-    assert events == [
-        [
-            {
-                "role": "user",
-                "content": "Be careful",
-                "style": "interjection",
-                "camera": None,
-                "tool_calls": None,
+            )
+            payload["atoms"] = atoms
+            assert (await client.post("/api/episodes/0/atoms", json=payload)).status_code == 200
+            report = await client.post(
+                "/api/annotation/validate",
+                json={
+                    **payload,
+                    "atoms": (await client.get("/api/episodes/0/atoms", params=identity)).json()["atoms"],
+                },
+            )
+            assert report.json()["ok"]
+            exported = await client.post("/api/export", json={**identity, "output_dir": str(tmp_path / "valid")})
+            assert exported.status_code == 200, exported.text
+            assert exported.json() == {
+                "output_dir": str(tmp_path / "valid"),
+                "persistent_rows": 4,
+                "event_rows": 2,
             }
-        ],
-        [
-            {
-                "role": "user",
-                "content": "Where is the can?",
-                "style": "vqa",
-                "camera": "observation.images.front",
-                "tool_calls": None,
-            }
-        ],
-        [
-            {
-                "role": "assistant",
-                "content": None,
-                "style": None,
-                "camera": None,
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "function": {"name": "say", "arguments": {"text": "I found it."}},
-                    }
-                ],
-            }
-        ],
-    ]
-    assert set(persistent[0][0]) == {"role", "content", "style", "timestamp", "camera", "tool_calls"}
-    assert set(events[0][0]) == {"role", "content", "style", "camera", "tool_calls"}
+            assert (
+                await client.post("/api/export", json={**identity, "output_dir": str(root)})
+            ).status_code == 422
+            assert (
+                await client.post("/api/episodes/99/atoms", json={**identity, "episode_index": 99, "atoms": []})
+            ).status_code == 404
 
-    exported_info = json.loads((output_dir / "meta" / "info.json").read_text())
-    assert set(exported_info) == {
-        "codebase_version",
-        "fps",
-        "total_episodes",
-        "total_frames",
-        "data_path",
-        "features",
-        "tools",
-    }
-    assert set(exported_info["features"]) == {
-        "episode_index",
-        "frame_index",
-        "timestamp",
-        "observation.state",
-        "language_persistent",
-        "language_events",
-    }
-    assert "task_index" not in exported_info["features"]
-    assert "tools" not in exported_info["features"]
-    assert exported_info["tools"] == [EXPECTED_SAY_TOOL_SCHEMA]
-    jsonschema.Draft202012Validator.check_schema(exported_info["tools"][0]["function"]["parameters"])
+    asyncio.run(scenario())
+    assert data_path.read_bytes() == original_bytes
+    exported = pq.read_table(tmp_path / "valid/data/chunk-000/file-000.parquet")
+    for name in original_table.column_names:
+        assert exported[name].equals(original_table[name])
+    assert len(exported["language_persistent"][0].as_py()) == 4
+    events = exported["language_events"].to_pylist()
+    assert len(events[0]) == 2 and events[1:] == [[], []]
+    assert all("timestamp" not in atom for atom in events[0])
+    info = json.loads((tmp_path / "valid/meta/info.json").read_text())
+    assert info["tools"][0]["function"]["name"] == "say"
+    assert "tools" not in info["features"]
+
+
+def test_preparation_job_and_local_assets(
+    clear_dataset_state, legacy_v31_dataset: Path, tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(backend_app, "EXPORT_ROOT", tmp_path / "workspace")
+
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=backend_app.app), base_url="http://test"
+        ) as client:
+            defaults = await client.get("/api/annotation/config")
+            assert defaults.json()["config"]["plan"]["enabled"] is True
+            assert "api_key" not in defaults.json()["config"]["vlm"]
+            bad = await client.post(
+                "/api/annotation/jobs",
+                json={"local_path": str(legacy_v31_dataset), "config": {"plan": {"bogus": True}}},
+            )
+            assert bad.status_code == 422
+            response = await client.post("/api/annotation/prepare", json={"local_path": str(legacy_v31_dataset)})
+            job_id = response.json()["job_id"]
+            for _ in range(200):
+                job = (await client.get(f"/api/annotation/jobs/{job_id}")).json()
+                if job["status"] not in {"queued", "running"}:
+                    break
+                await asyncio.sleep(0.01)
+            assert job["status"] == "completed", job
+            alias = job["result"]["repo_id"]
+            assert alias.startswith("local/annotation-")
+            loaded = await client.post("/api/dataset/load", json={"repo_id": alias})
+            assert loaded.status_code == 200
+            assert Path(loaded.json()["root"]) != legacy_v31_dataset
+            asset = f"/datasets/{alias}/resolve/main/meta/info.json"
+            ranged = await client.get(asset, headers={"Range": "bytes=0-9"})
+            assert ranged.status_code == 206 and len(ranged.content) == 10
+            assert (await client.head(asset)).status_code == 200
+            assert (
+                await client.get(f"/datasets/{alias}/resolve/main/meta/%2E%2E/%2E%2E/jobs/{job_id}.json")
+            ).status_code == 404
+            assert (await client.get(f"/datasets/{alias}/resolve/main/.env")).status_code == 404
+
+    asyncio.run(scenario())

@@ -28,7 +28,38 @@ export function isAuthenticatedHfDestination(
   }
 }
 
+// Keep public media URLs same-origin, resolving them only for server-side reads.
+// The backend credential is attached to an outbound server request, never to
+// serialized episode data or a browser request.
+export function resolveDatasetFetchUrl(destination: string): string {
+  if (typeof window !== "undefined") return destination;
+  const prefix = process.env.NEXT_PUBLIC_ANNOTATE_BACKEND_URL?.replace(
+    /\/$/,
+    "",
+  );
+  if (
+    !prefix?.startsWith("/") ||
+    !destination.startsWith(`${prefix}/datasets/local/`)
+  )
+    return destination;
+  const backend = process.env.ANNOTATION_BACKEND_URL;
+  if (!backend)
+    throw new Error("Annotation backend unavailable for dataset reads");
+  return `${backend.replace(/\/$/, "")}${destination.slice(prefix.length)}`;
+}
+
 export function authHeaders(destination: string | URL): Record<string, string> {
+  if (
+    typeof window === "undefined" &&
+    process.env.ANNOTATION_BACKEND_URL &&
+    process.env.ANNOTATION_BACKEND_TOKEN
+  ) {
+    const allowed = `${process.env.ANNOTATION_BACKEND_URL.replace(/\/$/, "")}/datasets/local/`;
+    if (String(destination).startsWith(allowed))
+      return {
+        Authorization: `Bearer ${process.env.ANNOTATION_BACKEND_TOKEN}`,
+      };
+  }
   if (!isAuthenticatedHfDestination(destination)) return {};
   const token = getAuthToken();
   return token ? { Authorization: `Bearer ${token}` } : {};

@@ -5,7 +5,7 @@ import {
   parquetReadObjects,
   type AsyncBuffer,
 } from "hyparquet";
-import { authHeaders } from "./auth";
+import { authHeaders, resolveDatasetFetchUrl } from "./auth";
 
 export interface DatasetMetadata {
   codebase_version: string;
@@ -32,6 +32,7 @@ export interface DatasetMetadata {
 }
 
 export async function fetchJson<T>(url: string): Promise<T> {
+  url = resolveDatasetFetchUrl(url);
   const res = await fetch(url, {
     cache: "no-store",
     headers: authHeaders(url),
@@ -57,7 +58,9 @@ type ParquetFile = ArrayBuffer | AsyncBuffer;
 const parquetFileCache = new Map<string, AsyncBuffer>();
 
 export async function fetchParquetFile(url: string): Promise<ParquetFile> {
-  const cached = parquetFileCache.get(url);
+  url = resolveDatasetFetchUrl(url);
+  const mutableDraft = /\/datasets\/local\/annotation-[^/]+\//.test(url);
+  const cached = mutableDraft ? undefined : parquetFileCache.get(url);
   if (cached) return cached;
 
   const file = await asyncBufferFromUrl({
@@ -65,7 +68,7 @@ export async function fetchParquetFile(url: string): Promise<ParquetFile> {
     requestInit: { cache: "no-store", headers: authHeaders(url) },
   });
   const wrapped = cachedAsyncBuffer(file);
-  parquetFileCache.set(url, wrapped);
+  if (!mutableDraft) parquetFileCache.set(url, wrapped);
   return wrapped;
 }
 

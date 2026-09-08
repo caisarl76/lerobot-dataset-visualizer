@@ -1,3 +1,4 @@
+import { authHeaders, resolveDatasetFetchUrl } from "@/utils/auth";
 import {
   DatasetMetadata,
   fetchParquetFile,
@@ -337,7 +338,7 @@ export async function getEpisodeData(
     // Vercel rule: async-parallel.
     console.time(`[perf] getEpisodeData (${version})`);
     const [result, progressBuilder] = await Promise.all([
-      version === "v3.0"
+      version === "v3.0" || version === "v3.1"
         ? getEpisodeDataV3(repoId, version, info, episodeId)
         : getEpisodeDataV2(repoId, version, info, episodeId),
       loadEpisodeProgressGroup(repoId, version, episodeId),
@@ -400,7 +401,7 @@ export async function getAdjacentEpisodesVideoInfo(
         try {
           let videosInfo: VideoInfo[] = [];
 
-          if (version === "v3.0") {
+          if (version === "v3.0" || version === "v3.1") {
             const episodeMetadata = await loadEpisodeMetadataV3Simple(
               repoId,
               version,
@@ -594,8 +595,13 @@ async function getEpisodeDataV2(
 
   if (!task && allData.length > 0) {
     try {
-      const tasksUrl = buildVersionedUrl(repoId, version, "meta/tasks.jsonl");
-      const tasksResponse = await fetch(tasksUrl, { cache: "no-store" });
+      const tasksUrl = resolveDatasetFetchUrl(
+        buildVersionedUrl(repoId, version, "meta/tasks.jsonl"),
+      );
+      const tasksResponse = await fetch(tasksUrl, {
+        cache: "no-store",
+        headers: authHeaders(tasksUrl),
+      });
 
       if (tasksResponse.ok) {
         const tasksText = await tasksResponse.text();
@@ -1680,7 +1686,7 @@ export async function loadAllEpisodeFrameInfo(
     MAX_FRAMES_OVERVIEW_EPISODES,
   );
 
-  if (version === "v3.0") {
+  if (version === "v3.0" || version === "v3.1") {
     for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
       for (const row of rows) {
         const epIdx = Number(row["episode_index"] ?? 0);
@@ -1850,7 +1856,7 @@ export async function loadCrossEpisodeActionVariance(
   };
   const allEps: EpMeta[] = [];
 
-  if (version === "v3.0") {
+  if (version === "v3.0" || version === "v3.1") {
     for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
       for (const row of rows) {
         const parsed = parseEpisodeRowSimple(row);
@@ -1895,7 +1901,7 @@ export async function loadCrossEpisodeActionVariance(
   const episodeActions: { index: number; actions: number[][] }[] = [];
   const episodeStates: (number[][] | null)[] = [];
 
-  if (version === "v3.0") {
+  if (version === "v3.0" || version === "v3.1") {
     const byFile = new Map<string, EpMeta[]>();
     for (const ep of sampled) {
       const key = `${ep.chunkIdx}-${ep.fileIdx}`;

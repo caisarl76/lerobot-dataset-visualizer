@@ -2,12 +2,19 @@
  * Utility functions for checking dataset version compatibility
  */
 
-import { authHeaders } from "./auth";
+import { authHeaders, resolveDatasetFetchUrl } from "./auth";
 
 const DATASET_URL =
   process.env.NEXT_PUBLIC_DATASET_URL ||
   process.env.DATASET_URL ||
   "https://huggingface.co/datasets";
+const ANNOTATE_URL = process.env.NEXT_PUBLIC_ANNOTATE_BACKEND_URL?.trim();
+
+function datasetBase(repoId: string): string {
+  return ANNOTATE_URL && repoId.startsWith("local/annotation-")
+    ? `${ANNOTATE_URL.replace(/\/$/, "")}/datasets`
+    : DATASET_URL;
+}
 
 /**
  * Dataset information structure from info.json
@@ -66,7 +73,9 @@ export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
   const now = Date.now();
   pruneDatasetInfoCache(now);
 
-  const cached = datasetInfoCache.get(repoId);
+  const cached = repoId.startsWith("local/annotation-")
+    ? undefined
+    : datasetInfoCache.get(repoId);
   if (cached && now < cached.expiry) {
     // Keep insertion order fresh so the cache behaves closer to LRU.
     datasetInfoCache.delete(repoId);
@@ -77,7 +86,9 @@ export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
   console.log(`[perf] getDatasetInfo cache MISS for ${repoId} — fetching`);
 
   try {
-    const testUrl = `${DATASET_URL}/${repoId}/resolve/main/meta/info.json`;
+    const testUrl = resolveDatasetFetchUrl(
+      `${datasetBase(repoId)}/${repoId}/resolve/main/meta/info.json`,
+    );
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
@@ -120,7 +131,7 @@ export async function getDatasetInfo(repoId: string): Promise<DatasetInfo> {
   }
 }
 
-const SUPPORTED_VERSIONS = ["v3.0", "v2.1", "v2.0"];
+const SUPPORTED_VERSIONS = ["v3.1", "v3.0", "v2.1", "v2.0"];
 
 /**
  * Returns both the validated version string and the dataset info in one call,
@@ -137,7 +148,7 @@ export async function getDatasetVersionAndInfo(
   if (!SUPPORTED_VERSIONS.includes(version)) {
     throw new Error(
       `Dataset ${repoId} has codebase version ${version}, which is not supported. ` +
-        "This tool only works with dataset versions 3.0, 2.1, or 2.0. " +
+        "This tool only works with dataset versions 3.1, 3.0, 2.1, or 2.0. " +
         "Please use a compatible dataset version.",
     );
   }
@@ -154,5 +165,5 @@ export function buildVersionedUrl(
   version: string,
   path: string,
 ): string {
-  return `${DATASET_URL}/${repoId}/resolve/main/${path}`;
+  return `${datasetBase(repoId)}/${repoId}/resolve/main/${path}`;
 }

@@ -7,6 +7,7 @@
     "incremental": false
   },
   "files": [
+    "src/components/__tests__/annotation-review-control.test.tsx",
     "src/app/[org]/[dataset]/[episode]/__tests__/episode-viewer-tabs.test.tsx",
     "src/app/api/curation/[...path]/__tests__/route.test.ts",
     "src/components/__tests__/playback-bar.test.tsx",
@@ -15,7 +16,10 @@
     "src/context/__tests__/curation-context.test.tsx",
     "src/utils/__tests__/curationClient.test.ts",
     "src/utils/__tests__/curationTimeline.test.ts",
-    "src/utils/__tests__/episodeViewerTabs.test.ts"
+    "src/utils/__tests__/episodeViewerTabs.test.ts",
+    "src/components/__tests__/official-annotation-controls.test.tsx",
+    "src/utils/__tests__/annotationsClient.test.ts",
+    "src/context/__tests__/annotations-context.test.tsx"
   ],
   "include": ["src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["node_modules", "src/**/__tests__/**"]

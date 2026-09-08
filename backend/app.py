@@ -1,54 +1,35 @@
-"""LeRobot dataset visualizer — annotation backend.
+"""LeRobot visualizer: review drafts, generate with official modules, validate/export.
 
-A small FastAPI service that lets the Next.js visualizer write the v3.1
-language schema introduced in lerobot#3467 (PR1) and used by the steerable
-annotation pipeline in lerobot#3471 (PR2). Specifically it owns:
-
-- per-episode annotation state, persisted to ``meta/lerobot_annotations.json``
-- snapping event-style atom timestamps to exact source-frame timestamps
-  (the writer in lerobot#3471 enforces exact match)
-- exporting the annotated dataset by rewriting ``data/chunk-*/file-*.parquet``
-  with two new columns:
-    * ``language_persistent`` — broadcast per-episode (subtask/plan/memory)
-    * ``language_events``     — per-frame (interjection/vqa, plus speech
-      tool-call atoms with style=None)
-  and a dataset-level ``tools`` column carrying the JSON schema for ``say``.
-- pushing the result back to the Hugging Face Hub.
-
-The frontend can run without this backend (read-only browsing). Annotation
-write paths only light up when ``NEXT_PUBLIC_ANNOTATE_BACKEND_URL`` points to
-an instance of this service.
-
-Run locally:
-
-    cd backend && pip install -r requirements.txt
-    uvicorn app:app --port 7861 --reload
-
-Then in another terminal:
-
-    NEXT_PUBLIC_ANNOTATE_BACKEND_URL=http://127.0.0.1:7861 bun run dev
+Run the isolated annotation runtime with:
+    backend/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 7861
+See backend/README.md for pinned dependencies and VLM endpoint configuration.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from hashlib import sha256
 import json
 import logging
 import os
 from pathlib import Path
-import shutil
+from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:  # Supports both ``import backend.app`` and the legacy ``import app`` entrypoint.
+    from . import annotation_history, annotation_runs
+    from .annotation_access import AnnotationAccess, validate_dataset_paths
     from .curation.assets import LocalAssetService
     from .curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
     from .curation.db import CurationDatabase
@@ -58,6 +39,9 @@ try:  # Supports both ``import backend.app`` and the legacy ``import app`` entry
     from .curation.source import SourceRegistry
     from .curation.worker import BatchService
 except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
+    from annotation_access import AnnotationAccess, validate_dataset_paths
+    import annotation_history
+    import annotation_runs
     from curation.assets import LocalAssetService
     from curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
     from curation.db import CurationDatabase
@@ -72,29 +56,46 @@ logging.basicConfig(level=logging.INFO)
 
 CACHE_ROOT = Path(os.environ.get("LEROBOT_ANNOTATE_CACHE", "/tmp/lerobot_visualizer_annotate_cache"))
 EXPORT_ROOT = Path(os.environ.get("LEROBOT_ANNOTATE_EXPORT", "/tmp/lerobot_visualizer_annotate_exports"))
+os.environ.setdefault("HF_DATASETS_CACHE", str(CACHE_ROOT / "datasets-cache"))
+
+_alias_lock = Lock()
+
+
+def _local_aliases() -> dict[str, str]:
+    path = EXPORT_ROOT / "local_datasets.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _register_local_dataset(root: Path) -> str:
+    root = root.resolve()
+    alias = "local/annotation-" + sha256(str(root).encode()).hexdigest()[:16]
+    with _alias_lock:
+        aliases = _local_aliases()
+        aliases[alias] = str(root)
+        EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+        path = EXPORT_ROOT / "local_datasets.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(aliases, indent=2))
+        temporary.replace(path)
+    return alias
+
+
+def _resolve_local_ref(req):
+    if not req.local_path and req.repo_id and req.repo_id.startswith("local/"):
+        root = _local_aliases().get(req.repo_id)
+        if root is None:
+            raise HTTPException(status_code=404, detail="Unknown local dataset; prepare it at /annotate")
+        return req.model_copy(update={"repo_id": None, "local_path": root})
+    return req
+
 
 # --- Schema mirrors src/lerobot/datasets/language.py --------------------------
 
-PERSISTENT_STYLES = {"task_aug", "subtask", "plan", "memory"}
-EVENT_ONLY_STYLES = {"interjection", "vqa"}
+PERSISTENT_STYLES = {"task_aug", "subtask", "plan", "memory", "motion"}
+EVENT_ONLY_STYLES = {"interjection", "vqa", "trace"}
 KNOWN_STYLES = PERSISTENT_STYLES | EVENT_ONLY_STYLES
 LANGUAGE_PERSISTENT = "language_persistent"
 LANGUAGE_EVENTS = "language_events"
-
-SAY_TOOL_SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "say",
-        "description": "Speak a short utterance to the user via the TTS executor.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "The verbatim text to speak."},
-            },
-            "required": ["text"],
-        },
-    },
-}
 
 
 def column_for_style(style: str | None) -> str:
@@ -124,7 +125,7 @@ class LanguageAtom(BaseModel):
     role: str
     content: str | None = None
     style: str | None = None
-    timestamp: float
+    timestamp: float = Field(allow_inf_nan=False)
     # ``observation.images.*`` feature key for view-dependent atoms
     # (vqa / trace). ``None`` for camera-agnostic atoms. Mirrors the
     # row-level ``camera`` field added in lerobot PR 3467.
@@ -132,11 +133,16 @@ class LanguageAtom(BaseModel):
     tool_calls: list[dict[str, Any]] | None = None
 
 
-class EpisodeAtomsPayload(BaseModel):
-    repo_id: str | None = None
-    local_path: str | None = None
+class EpisodeAtomsPayload(DatasetRef):
     episode_index: int
     atoms: list[LanguageAtom] = []
+    expected_annotation_sha256: str | None = None
+
+
+class EpisodeReviewPayload(DatasetRef):
+    episode_index: int
+    reviewed: bool
+    annotation_sha256: str
 
 
 class ExportRequest(DatasetRef):
@@ -177,6 +183,7 @@ class DatasetState:
 
 
 _states: dict[str, DatasetState] = {}
+_annotation_edit_lock = annotation_runs.LOCK
 
 
 def _state_key(req: DatasetRef) -> str:
@@ -188,10 +195,14 @@ def _state_key(req: DatasetRef) -> str:
 
 
 def _ensure_state(req: DatasetRef) -> DatasetState:
-    key = _state_key(req)
-    if key in _states:
-        return _states[key]
-    return _load_state(req, key)
+    with _annotation_edit_lock:
+        if os.environ.get("ANNOTATION_BACKEND_TOKEN") and req.repo_id and not req.repo_id.startswith("local/"):
+            raise HTTPException(403, "Prepare a pinned dataset and use its registered local alias")
+        req = _resolve_local_ref(req)
+        key = _state_key(req)
+        if key in _states:
+            return _states[key]
+        return _load_state(req, key)
 
 
 def _load_state(req: DatasetRef, key: str) -> DatasetState:
@@ -201,7 +212,7 @@ def _load_state(req: DatasetRef, key: str) -> DatasetState:
             raise HTTPException(status_code=404, detail=f"Dataset path not found: {root}")
     elif req.repo_id:
         CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-        slug = req.repo_id.replace("/", "__") + (f"@{req.revision}" if req.revision else "")
+        slug = sha256(f"{req.repo_id}@{req.revision or 'main'}".encode()).hexdigest()
         root = CACHE_ROOT / slug
         root.mkdir(parents=True, exist_ok=True)
         snapshot_download(
@@ -219,17 +230,15 @@ def _load_state(req: DatasetRef, key: str) -> DatasetState:
         raise HTTPException(status_code=404, detail=f"Missing meta/info.json at {root}")
     info = json.loads(info_path.read_text())
 
-    episodes_root = root / "meta" / "episodes"
-    if not episodes_root.exists():
-        raise HTTPException(status_code=404, detail="Missing meta/episodes/ directory")
-    files = sorted(episodes_root.rglob("*.parquet"))
-    if not files:
-        raise HTTPException(status_code=404, detail="No episodes parquet files found")
-    episodes_df = (
-        pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
-        .sort_values("episode_index")
-        .reset_index(drop=True)
-    )
+    if info.get("codebase_version") == "v2.1":
+        episodes_df = pd.DataFrame(_official_engine().source_episode_rows(root))
+    else:
+        episodes_root = root / "meta" / "episodes"
+        files = sorted(episodes_root.rglob("*.parquet"))
+        if not files:
+            raise HTTPException(status_code=404, detail="No episodes parquet files found")
+        episodes_df = pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
+    episodes_df = episodes_df.sort_values("episode_index").reset_index(drop=True)
 
     state = DatasetState(
         repo_id=req.repo_id,
@@ -310,7 +319,9 @@ def _save_annotations(state: DatasetState) -> None:
         },
         "episodes": {str(ep): {"atoms": ann.atoms} for ep, ann in state.annotations.items()},
     }
-    path.write_text(json.dumps(payload, indent=2))
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2))
+    temporary.replace(path)
 
 
 # --- Frame-timestamp helpers --------------------------------------------------
@@ -323,13 +334,19 @@ def _episode_data_path(state: DatasetState, episode_index: int) -> Path | None:
     row = rows.iloc[0]
     chunk_col = "data/chunk_index"
     file_col = "data/file_index"
-    if chunk_col not in row or file_col not in row:
+    legacy = state.info.get("codebase_version") == "v2.1"
+    if not legacy and (chunk_col not in row or file_col not in row):
         return None
-    chunk_index = int(row[chunk_col])
-    file_index = int(row[file_col])
     rel = state.info.get("data_path") or "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
-    rel = rel.format(chunk_index=chunk_index, file_index=file_index)
+    rel = rel.format(
+        chunk_index=int(row.get(chunk_col, 0)),
+        file_index=int(row.get(file_col, 0)),
+        episode_index=episode_index,
+        episode_chunk=episode_index // int(state.info.get("chunks_size", 1000)),
+    )
     full = (state.root / rel).resolve()
+    if not full.is_relative_to(state.root.resolve()):
+        raise HTTPException(422, "Dataset data path escapes its root")
     if full.exists():
         return full
     if state.repo_id:
@@ -364,9 +381,7 @@ def _frame_timestamps(state: DatasetState, episode_index: int) -> list[float]:
     return ts
 
 
-def _coerce_existing_atom(
-    raw: Any, fallback_ts: float | None = None
-) -> dict[str, Any] | None:
+def _coerce_existing_atom(raw: Any, fallback_ts: float | None = None) -> dict[str, Any] | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -408,25 +423,15 @@ def _extract_existing_atoms_from_table(table: pa.Table, episode_index: int) -> l
 
     episode_col = table.column("episode_index").to_pylist()
     persistent_col = (
-        table.column(LANGUAGE_PERSISTENT).to_pylist()
-        if LANGUAGE_PERSISTENT in table.column_names
-        else None
+        table.column(LANGUAGE_PERSISTENT).to_pylist() if LANGUAGE_PERSISTENT in table.column_names else None
     )
-    events_col = (
-        table.column(LANGUAGE_EVENTS).to_pylist()
-        if LANGUAGE_EVENTS in table.column_names
-        else None
-    )
+    events_col = table.column(LANGUAGE_EVENTS).to_pylist() if LANGUAGE_EVENTS in table.column_names else None
     # Event rows don't carry their own ``timestamp`` in the v3.1 struct;
     # the parquet row's frame timestamp IS the event's firing time. Read
     # the timestamp column so we can pass it as a fallback to
     # ``_coerce_existing_atom`` — without this, every event row defaults
     # to timestamp=0.0 and dedup collapses them all into one.
-    ts_col = (
-        table.column("timestamp").to_pylist()
-        if "timestamp" in table.column_names
-        else None
-    )
+    ts_col = table.column("timestamp").to_pylist() if "timestamp" in table.column_names else None
 
     atoms: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -487,243 +492,53 @@ def _validate_atom(atom: dict[str, Any]) -> None:
     # camera yet — the writer (or the next save round-trip) will surface
     # the missing tag. We DO reject camera-on-non-view-dependent so the
     # field can't drift onto task_aug/subtask/plan/memory rows.
-    if (
-        camera is not None
-        and style is not None
-        and style not in VIEW_DEPENDENT_STYLES
-    ):
+    if camera is not None and style is not None and style not in VIEW_DEPENDENT_STYLES:
         raise HTTPException(
             status_code=400,
             detail=f"camera must be null for style={style!r} (only vqa/trace are view-dependent)",
         )
 
 
-def _normalize_atom(atom: dict[str, Any], *, with_timestamp: bool) -> dict[str, Any]:
-    """Coerce an atom into a language-column struct row.
-
-    Field order matches the canonical schema in ``lerobot.datasets.language``
-    (``PERSISTENT_ROW_FIELDS`` / ``EVENT_ROW_FIELDS``); pyarrow infers the
-    struct schema from insertion order. Persistent rows carry their own
-    ``timestamp`` (the moment the state became active); event rows do NOT —
-    the parquet frame's ``timestamp`` column IS the event's firing time, so a
-    per-row ``timestamp`` field would be redundant (matches lerobot#3471's
-    ``language_event_row_arrow_type``, which omits it).
-    """
-    camera = atom.get("camera")
-    if isinstance(camera, str) and not camera:
-        camera = None
-    row: dict[str, Any] = {
-        "role": str(atom["role"]),
-        "content": None if atom.get("content") is None else str(atom["content"]),
-        "style": atom.get("style"),
-    }
-    if with_timestamp:
-        row["timestamp"] = float(atom.get("timestamp", 0.0))
-    row["camera"] = camera if isinstance(camera, str) else None
-    row["tool_calls"] = list(atom["tool_calls"]) if atom.get("tool_calls") else None
-    return row
-
-
-# --- Export -------------------------------------------------------------------
-
-
-def _materialize_table(table: pa.Table, atoms_by_ep: dict[int, list[dict[str, Any]]]) -> tuple[pa.Table, int, int]:
-    if "episode_index" not in table.column_names or "timestamp" not in table.column_names:
+def _official_engine():
+    try:
+        if __package__:
+            from . import official_annotations
+        else:
+            import official_annotations
+        return official_annotations
+    except ImportError as exc:
         raise HTTPException(
-            status_code=400,
-            detail="data parquet missing 'episode_index' or 'timestamp' columns",
-        )
-
-    episode_col = table.column("episode_index").to_pylist()
-    ts_col = [float(x) for x in table.column("timestamp").to_pylist()]
-    n_rows = table.num_rows
-
-    persistent_by_ep: dict[int, list[dict[str, Any]]] = {}
-    events_by_ep_ts: dict[int, dict[float, list[dict[str, Any]]]] = {}
-
-    n_persistent_total = 0
-    n_event_total = 0
-
-    unique_eps = sorted(set(episode_col))
-    for ep_idx in unique_eps:
-        atoms = atoms_by_ep.get(int(ep_idx))
-        if atoms is None:
-            atoms = _extract_existing_atoms_from_table(table, int(ep_idx))
-        persistent_rows: list[dict[str, Any]] = []
-        frame_ts = sorted({ts_col[i] for i in range(n_rows) if episode_col[i] == ep_idx})
-
-        buckets: dict[float, list[dict[str, Any]]] = {}
-        for atom in atoms:
-            col = column_for_style(atom.get("style"))
-            if col == LANGUAGE_PERSISTENT:
-                persistent_rows.append(_normalize_atom(atom, with_timestamp=True))
-            else:
-                # The event row's firing time lives in the parquet frame's
-                # ``timestamp`` column, so we bucket by the snapped timestamp
-                # but do NOT store it inside the event struct (matches the
-                # lerobot#3471 writer / canonical schema).
-                ts = float(atom.get("timestamp", 0.0))
-                if frame_ts:
-                    ts = _snap(ts, frame_ts)
-                buckets.setdefault(ts, []).append(_normalize_atom(atom, with_timestamp=False))
-
-        persistent_rows.sort(
-            key=lambda r: (r["timestamp"], r.get("style") or "", r.get("role") or "")
-        )
-        persistent_by_ep[ep_idx] = persistent_rows
-
-        for ts in buckets:
-            buckets[ts].sort(key=lambda r: (r.get("style") or "", r.get("role") or ""))
-        events_by_ep_ts[ep_idx] = buckets
-
-        n_persistent_total += len(persistent_rows)
-        n_event_total += sum(len(v) for v in buckets.values())
-
-    per_row_persistent = [persistent_by_ep.get(episode_col[i], []) for i in range(n_rows)]
-    per_row_events = [
-        events_by_ep_ts.get(episode_col[i], {}).get(ts_col[i], []) for i in range(n_rows)
-    ]
-
-    keep_names: list[str] = []
-    keep_cols: list[Any] = []
-    for name in table.column_names:
-        if name == "subtask_index":
-            continue
-        if name in {LANGUAGE_PERSISTENT, LANGUAGE_EVENTS, "tools"}:
-            continue
-        keep_names.append(name)
-        keep_cols.append(table.column(name))
-
-    persistent_arr = pa.array(per_row_persistent)
-    events_arr = pa.array(per_row_events)
-
-    # NOTE: we deliberately do NOT add a per-row ``tools`` column. The ``say``
-    # tool *schema* is dataset-level metadata and lives in
-    # ``meta/info.json["tools"]`` (written in ``_do_export``), exactly as the
-    # lerobot#3471 pipeline does. Tool *calls* travel per-row inside the
-    # ``tool_calls`` field of the language structs. Any pre-existing ``tools``
-    # column is stripped in the keep-loop above.
-    new_names = keep_names + [LANGUAGE_PERSISTENT, LANGUAGE_EVENTS]
-    new_cols = keep_cols + [persistent_arr, events_arr]
-    return pa.Table.from_arrays(new_cols, names=new_names), n_persistent_total, n_event_total
+            status_code=503,
+            detail="Official LeRobot runtime unavailable. Use Python >=3.12 and install "
+            "backend/requirements-annotations.txt: " + str(exc),
+        ) from exc
 
 
-def _materialize_tree(src: Path, dst: Path, *, force_copy: bool) -> None:
-    """Recreate ``src`` under ``dst`` as real files (no symlinks).
-
-    Hardlinks each file when ``force_copy`` is False and the source/target sit
-    on the same filesystem (cheap, self-contained, uploadable); otherwise
-    falls back to a byte copy. The result is always a standalone tree that
-    survives being moved and is uploaded verbatim by ``upload_folder``.
-    """
-
-    def _copy_file(s: str, d: str) -> None:
-        if not force_copy:
-            try:
-                os.link(s, d)
-                return
-            except OSError:
-                pass
-        shutil.copy2(s, d)
-
-    shutil.copytree(src, dst, copy_function=_copy_file)
-
-
-def _do_export(state: DatasetState, output_dir: str | None, copy_videos: bool) -> dict[str, Any]:
-    if output_dir:
-        out_root = Path(output_dir).expanduser().resolve()
-    else:
-        EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
-        name = (state.repo_id or Path(state.root).name or "dataset").replace("/", "__")
-        out_root = EXPORT_ROOT / f"{name}_annotated"
-
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    # Copy meta/
-    src_meta = state.root / "meta"
-    dst_meta = out_root / "meta"
-    if dst_meta.exists():
-        shutil.rmtree(dst_meta)
-    shutil.copytree(src_meta, dst_meta)
-
-    info_path = dst_meta / "info.json"
-    info = json.loads(info_path.read_text())
-    info.setdefault("features", {})
-    info["features"].pop("subtask_index", None)
-    info["features"][LANGUAGE_PERSISTENT] = {"dtype": "language", "shape": [1], "names": None}
-    info["features"][LANGUAGE_EVENTS] = {"dtype": "language", "shape": [1], "names": None}
-    # The ``say`` tool schema is dataset-level metadata, stored at the top of
-    # info.json under "tools" (NOT as a per-frame feature). Mirrors the
-    # lerobot#3471 pipeline's ``_ensure_annotation_metadata_in_info``: merge
-    # additively so any user-declared tools are preserved, and stop emitting
-    # the stray ``tools`` feature older exports added.
-    info["features"].pop("tools", None)
-    existing_tools = info.get("tools") or []
-    tool_names = {
-        (t.get("function") or {}).get("name") for t in existing_tools if isinstance(t, dict)
-    }
-    if SAY_TOOL_SCHEMA["function"]["name"] not in tool_names:
-        info["tools"] = [*existing_tools, SAY_TOOL_SCHEMA]
-    info_path.write_text(json.dumps(info, indent=2))
-
-    # Drop legacy meta files if present
-    for legacy in ("subtasks.parquet", "tasks_high_level.parquet"):
-        p = dst_meta / legacy
-        if p.exists():
-            p.unlink()
-
-    # Make sure data AND videos are downloaded for HF datasets. The export
-    # must be a self-contained, loadable dataset (the writer only rewrites
-    # the parquet shards; videos are carried over untouched), so we pull the
-    # video shards too — otherwise the exported folder is missing the
-    # observation videos and won't load. Mirrors the lerobot#3471 pipeline,
-    # which annotates a full local snapshot in place.
-    data_dir = state.root / "data"
-    data_files = sorted(data_dir.rglob("*.parquet"))
-    if not data_files and state.repo_id:
+def _download_full_dataset(state: DatasetState) -> None:
+    if state.repo_id:
         snapshot_download(
             state.repo_id,
             repo_type="dataset",
             revision=state.revision,
             local_dir=state.root,
-            allow_patterns=["data/**/*.parquet", "videos/**"],
+            allow_patterns=["meta/**", "data/**", "videos/**"],
         )
-        data_files = sorted(data_dir.rglob("*.parquet"))
-    if not data_files:
-        raise HTTPException(status_code=404, detail="No data parquet files found")
 
-    atoms_by_ep = {ep: ann.atoms for ep, ann in state.annotations.items()}
 
-    n_persistent = 0
-    n_events = 0
-    for src_path in data_files:
-        rel_path = src_path.relative_to(state.root)
-        dst_path = out_root / rel_path
-        dst_path.parent.mkdir(parents=True, exist_ok=True)
-        table = pq.read_table(src_path)
-        new_table, np_n, ne_n = _materialize_table(table, atoms_by_ep)
-        n_persistent += np_n
-        n_events += ne_n
-        pq.write_table(new_table, dst_path)
-
-    # Carry over the video shards so the export is self-contained. We
-    # materialize *real* files (hardlink where the filesystem allows it, else
-    # copy) rather than symlinking the source tree: a symlinked ``videos/``
-    # breaks as soon as the folder is moved and is not uploaded by
-    # ``HfApi.upload_folder``, which is exactly the "downloaded dataset isn't
-    # usable" problem. ``copy_videos=True`` forces a full byte copy (used by
-    # the push-to-hub path, where the upload reads the bytes anyway).
-    src_videos = state.root / "videos"
-    dst_videos = out_root / "videos"
-    if src_videos.exists():
-        if dst_videos.exists() or dst_videos.is_symlink():
-            if dst_videos.is_symlink():
-                dst_videos.unlink()
-            else:
-                shutil.rmtree(dst_videos)
-        _materialize_tree(src_videos, dst_videos, force_copy=copy_videos)
-
-    return {"output_dir": str(out_root), "persistent_rows": n_persistent, "event_rows": n_events}
+def _do_export(state: DatasetState, output_dir: str | None, copy_videos: bool) -> dict[str, Any]:
+    engine = _official_engine()
+    _download_full_dataset(state)
+    out_root = Path(output_dir).expanduser().resolve() if output_dir else EXPORT_ROOT / f"annotated-{uuid4().hex}"
+    try:
+        result = engine.export_dataset(
+            state.root,
+            out_root,
+            {ep: ann.atoms for ep, ann in state.annotations.items()},
+            copy_videos=copy_videos,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {k: result[k] for k in ("output_dir", "persistent_rows", "event_rows")}
 
 
 # --- FastAPI app --------------------------------------------------------------
@@ -755,6 +570,7 @@ if curation_is_configured():
     )
 
 app = FastAPI(title="LeRobot dataset visualizer — annotation backend")
+app.add_middleware(AnnotationAccess)
 app.add_middleware(
     CORSMiddleware,
     # Curation uses its explicit origin; legacy annotation keeps its documented
@@ -829,10 +645,7 @@ def get_episode_atoms(
                     columns.append(LANGUAGE_PERSISTENT)
                 if LANGUAGE_EVENTS in schema.names:
                     columns.append(LANGUAGE_EVENTS)
-                if (
-                    LANGUAGE_PERSISTENT in columns
-                    or LANGUAGE_EVENTS in columns
-                ):
+                if LANGUAGE_PERSISTENT in columns or LANGUAGE_EVENTS in columns:
                     atoms = _extract_existing_atoms_from_table(
                         pq.read_table(path, columns=columns),
                         episode_index,
@@ -842,15 +655,25 @@ def get_episode_atoms(
         ann = EpisodeAnnotations(atoms=atoms)
         if atoms:
             state.annotations[episode_index] = ann
-    return JSONResponse({"episode_index": episode_index, "atoms": ann.atoms})
+    return JSONResponse(
+        {
+            "episode_index": episode_index,
+            "atoms": ann.atoms,
+            "annotation_sha256": annotation_history.annotation_hash(ann.atoms),
+        }
+    )
 
 
 @app.post("/api/episodes/{episode_index}/atoms")
 def set_episode_atoms(episode_index: int, payload: EpisodeAtomsPayload) -> JSONResponse:
     if episode_index != payload.episode_index:
         raise HTTPException(status_code=400, detail="episode index mismatch")
-    state = _ensure_state(DatasetRef(repo_id=payload.repo_id, local_path=payload.local_path))
-    atoms = [a.dict() for a in payload.atoms]
+    state = _ensure_state(
+        DatasetRef(repo_id=payload.repo_id, revision=payload.revision, local_path=payload.local_path)
+    )
+    if episode_index not in state.episodes_df["episode_index"].values:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    atoms = [a.model_dump() for a in payload.atoms]
     for atom in atoms:
         _validate_atom(atom)
     # Snap event timestamps to exact frame timestamps (matches lerobot#3471).
@@ -858,11 +681,70 @@ def set_episode_atoms(episode_index: int, payload: EpisodeAtomsPayload) -> JSONR
     for atom in atoms:
         if column_for_style(atom.get("style")) == LANGUAGE_EVENTS and frame_ts:
             atom["timestamp"] = _snap(float(atom["timestamp"]), frame_ts)
-    state.annotations[episode_index] = EpisodeAnnotations(atoms=atoms)
-    _save_annotations(state)
-    return JSONResponse(
-        {"ok": True, "saved": len(atoms), "path": str(state.annotations_path)}
-    )
+    with _annotation_edit_lock:
+        _require_editable(state.root)
+        if (
+            annotation_runs.RunStore(EXPORT_ROOT).for_root(state.root)
+            and payload.expected_annotation_sha256 is None
+        ):
+            raise HTTPException(409, "Reload saved annotations before editing this workflow")
+        if payload.expected_annotation_sha256 is not None:
+            current = json.loads(
+                get_episode_atoms(episode_index, payload.repo_id, payload.revision, payload.local_path).body
+            )["atoms"]
+            if annotation_history.annotation_hash(current) != payload.expected_annotation_sha256:
+                raise HTTPException(409, "Annotations changed; reload before saving")
+        reviews = annotation_history.read_reviews(state.root)
+        review = reviews.get(str(episode_index))
+        if review and review.get("annotation_sha256") != annotation_history.annotation_hash(atoms):
+            reviews.pop(str(episode_index))
+            annotation_history.write_reviews(state.root, reviews)
+        state.annotations[episode_index] = EpisodeAnnotations(atoms=atoms)
+        _save_annotations(state)
+        annotation_runs.RunStore(EXPORT_ROOT).edited(state.root)
+    result = {"ok": True, "saved": len(atoms), "path": str(state.annotations_path)}
+    if payload.expected_annotation_sha256 is not None:
+        result["annotation_sha256"] = annotation_history.annotation_hash(atoms)
+    return JSONResponse(result)
+
+
+def _review_atoms(episode_index: int, ref: DatasetRef) -> tuple[DatasetState, list[dict]]:
+    state = _ensure_state(ref)
+    if episode_index not in state.episodes_df["episode_index"].values:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    response = get_episode_atoms(episode_index, ref.repo_id, ref.revision, ref.local_path)
+    return state, json.loads(response.body)["atoms"]
+
+
+@app.get("/api/episodes/{episode_index}/review")
+def get_episode_review(
+    episode_index: int,
+    repo_id: str | None = None,
+    revision: str | None = None,
+    local_path: str | None = None,
+) -> dict:
+    with _annotation_edit_lock:
+        state, atoms = _review_atoms(
+            episode_index, DatasetRef(repo_id=repo_id, revision=revision, local_path=local_path)
+        )
+        return annotation_history.review_status(state.root, episode_index, atoms)
+
+
+@app.post("/api/episodes/{episode_index}/review")
+def set_episode_review(episode_index: int, payload: EpisodeReviewPayload) -> dict:
+    if episode_index != payload.episode_index:
+        raise HTTPException(status_code=400, detail="episode index mismatch")
+    with _annotation_edit_lock:
+        state, atoms = _review_atoms(episode_index, payload)
+        try:
+            _require_editable(state.root)
+            result = annotation_history.save_review(
+                state.root, episode_index, atoms, payload.reviewed, payload.annotation_sha256
+            )
+            annotation_runs.RunStore(EXPORT_ROOT).edited(state.root)
+            return result
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/episodes/{episode_index}/frame_timestamps")
@@ -927,3 +809,565 @@ def push_to_hub(req: PushToHubRequest) -> JSONResponse:
             "message": f"Pushed annotated dataset to {target_repo}",
         }
     )
+
+
+# ponytail: one process owns this queue; use a durable worker if multi-process serving is needed.
+# The official executor controls episode/VLM parallelism within each job.
+_annotation_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lerobot-annotation")
+_annotation_jobs: dict[str, dict] = {}
+
+
+class GenerationRequest(DatasetRef):
+    episode_indices: list[int] | None = None
+    example_episode_indices: list[int] = Field(default_factory=list, max_length=5)
+    config: dict[str, Any] = {}
+    task_prompt: str = ""
+    subtask_prompts: list[str] | None = None
+    assess_quality: bool = False
+    resume_unfinished: bool = False
+
+
+class DeleteEpisodesRequest(DatasetRef):
+    episode_indices: list[int] = Field(min_length=1)
+
+
+def _start_annotation_job(operation, on_queued=None) -> dict:
+    job_id = uuid4().hex
+    job = {"job_id": job_id, "status": "queued"}
+    jobs_root = EXPORT_ROOT / "jobs"
+    jobs_root.mkdir(parents=True, exist_ok=True)
+    path = jobs_root / f"{job_id}.json"
+
+    def persist() -> None:
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(job, indent=2))
+        temporary.replace(path)
+
+    def run() -> None:
+        job["status"] = "running"
+        persist()
+        try:
+            result = operation(EXPORT_ROOT / "drafts" / job_id)
+            if "output_dir" in result:
+                result["repo_id"] = _register_local_dataset(Path(result["output_dir"]))
+            job.update(status="completed", result=result)
+        except Exception as exc:
+            logger.exception("Official annotation job %s failed", job_id)
+            job.update(status="failed", error=str(exc))
+        finally:
+            persist()
+            _annotation_jobs.pop(job_id, None)
+
+    with _annotation_edit_lock:
+        if on_queued:
+            on_queued(job_id)
+        persist()
+        _annotation_jobs[job_id] = job
+        _annotation_pool.submit(run)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/api/annotation/config")
+def annotation_config() -> dict:
+    engine = _official_engine()
+    config = engine.default_config()
+    if os.environ.get("ANNOTATION_BACKEND_TOKEN"):
+        config.pop("vlm", None)
+    return {"revision": engine.REVISION, "config": config}
+
+
+@app.post("/api/annotation/prepare")
+def prepare_annotation_dataset(req: DatasetRef) -> dict:
+    engine = _official_engine()
+    req = _resolve_local_ref(req)
+    if not req.local_path and not req.repo_id:
+        raise HTTPException(status_code=400, detail="Provide local_path or repo_id")
+
+    def prepare(output: Path) -> dict:
+        source_commit = None
+        if req.local_path:
+            source = Path(req.local_path).expanduser().resolve()
+        else:
+            source_commit = HfApi().dataset_info(req.repo_id, revision=req.revision or "main").sha
+            source = CACHE_ROOT / sha256(f"{req.repo_id}@{source_commit}".encode()).hexdigest()
+            snapshot_download(
+                req.repo_id,
+                repo_type="dataset",
+                revision=source_commit,
+                local_dir=source,
+                allow_patterns=["meta/**", "data/**", "videos/**"],
+            )
+        validate_dataset_paths(source)
+        source_hashes = annotation_runs.source_inventory(source)
+        result = engine.prepare_dataset(source, output)
+        indices = result.get("episode_indices")
+        if indices is None:
+            indices = [r.episode_index for r in engine.iter_episodes(output)]
+        if not indices:
+            raise ValueError("Dataset contains no episodes")
+        if result.get("preparation_mode") == "source_review":
+            result["validation"] = result["source_validation"]
+        else:
+            result["validation"] = engine.validate_atoms(output, list(engine.iter_episodes(output)), {})
+        episode_results = result.get("episode_results", {})
+        usable = [ep for ep in indices if episode_results.get(str(ep), {}).get("generation_status") != "failed"]
+        result["first_episode_index"] = min(usable or indices)
+        run = annotation_runs.RunStore(EXPORT_ROOT).create(
+            output,
+            source,
+            req.repo_id,
+            source_commit,
+            json.loads((source / "meta/info.json").read_text())["codebase_version"],
+            indices,
+        )
+        if run["source_file_hashes"] != source_hashes:
+            raise ValueError("Source dataset changed during preparation; prepare it again")
+        run["preparation_mode"] = result.get("preparation_mode", "ready")
+        for ep, record in episode_results.items():
+            run["episodes"][ep].update(record)
+        run = annotation_runs.RunStore(EXPORT_ROOT).save(run, run["revision"])
+        result["run_id"] = run["run_id"]
+        return result
+
+    return _start_annotation_job(prepare)
+
+
+@app.post("/api/annotation/jobs")
+def create_annotation_job(req: GenerationRequest) -> dict:
+    engine = _official_engine()
+    try:
+        config = engine.parse_config(req.config)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    state = _ensure_state(req)
+    if req.resume_unfinished:
+        prior = annotation_runs.RunStore(EXPORT_ROOT).for_root(state.root)
+        if prior:
+            state = _ensure_state(DatasetRef(local_path=prior["root"]))
+            req.task_prompt = prior.get("task_prompt", "")
+            req.subtask_prompts = prior.get("subtask_prompts", [])
+            req.example_episode_indices = prior.get("example_episode_indices", [])
+            req.assess_quality = prior.get("assess_quality", False)
+            if not req.config:
+                req.config = prior.get("generation_config", {})
+                config = engine.parse_config(req.config)
+    if len(set(req.example_episode_indices)) != len(req.example_episode_indices) or set(
+        req.example_episode_indices
+    ) - set(state.episodes_df["episode_index"]):
+        raise HTTPException(status_code=422, detail="Select up to five distinct existing example episodes")
+    if req.episode_indices is not None and (
+        not req.episode_indices or set(req.episode_indices) - set(state.episodes_df["episode_index"])
+    ):
+        raise HTTPException(status_code=422, detail="Select existing episode indices")
+    with _annotation_edit_lock:
+        _require_editable(state.root)
+        store = annotation_runs.RunStore(EXPORT_ROOT)
+        run = store.for_root(state.root)
+        if run is None:
+            run = store.create(
+                state.root,
+                state.root,
+                None,
+                None,
+                state.info.get("codebase_version", "v3.1"),
+                [int(ep) for ep in state.episodes_df["episode_index"]],
+            )
+        for ep in req.example_episode_indices:
+            atoms = json.loads(get_episode_atoms(ep, local_path=str(state.root)).body)["atoms"]
+            if annotation_history.review_status(state.root, ep, atoms)["status"] != "reviewed":
+                raise HTTPException(422, "Few-shot examples must be explicitly marked reviewed")
+        annotations = {ep: ann.atoms for ep, ann in state.annotations.items()}
+        annotations = {int(ep): atoms for ep, atoms in json.loads(json.dumps(annotations)).items()}
+        selected = set(req.episode_indices if req.episode_indices is not None else map(int, run["episodes"]))
+        selected -= set(req.example_episode_indices)
+        selected = {ep for ep in selected if run["episodes"][str(ep)].get("decision") != "delete"}
+        if req.resume_unfinished:
+            selected = {ep for ep in selected if run["episodes"][str(ep)]["generation_status"] != "generated"}
+        if not selected:
+            raise HTTPException(422, "No unfinished target episodes remain")
+        selected = sorted(selected)
+
+    def queued(job_id):
+        with _annotation_edit_lock:
+            _require_editable(state.root)
+            current = store.read(run["run_id"])
+            if current["revision"] != run["revision"]:
+                raise HTTPException(409, "Annotations changed before generation was queued; retry")
+            current.update(
+                current_job_id=job_id,
+                task_prompt=req.task_prompt,
+                subtask_prompts=req.subtask_prompts or [],
+                example_episode_indices=req.example_episode_indices,
+                publication_state="draft",
+                generation_config=req.config,
+                assess_quality=req.assess_quality,
+            )
+            current.pop("export", None)
+            for ep in selected:
+                current["episodes"][str(ep)].update(
+                    generation_status="pending", decision="pending", decision_reason=None
+                )
+            reviews = annotation_history.read_reviews(state.root)
+            for ep in selected:
+                reviews.pop(str(ep), None)
+            annotation_history.write_reviews(state.root, reviews)
+            store.save(current, run["revision"])
+
+    def generate(output: Path) -> dict:
+        # Each finished episode is a recoverable official-writer checkpoint.
+        # ponytail: full shards are copied per episode; optimize checkpoint IO if it dominates VLM time.
+        from dataclasses import asdict
+
+        _download_full_dataset(state)
+        validate_dataset_paths(state.root)
+        source = state.root
+        labels = annotations
+        result = {
+            "output_dir": str(source),
+            "validation": {"ok": True, "errors": [], "warnings": []},
+            "first_generated_episode_index": selected[0],
+        }
+        first_success = None
+        for ep in selected:
+            checkpoint = output / f"episode_{ep:06d}"
+            with _annotation_edit_lock:
+                current = store.read(run["run_id"])
+                current["episodes"][str(ep)]["generation_status"] = "running"
+                store.save(current, current["revision"])
+            try:
+                generated = engine.generate_dataset(
+                    source,
+                    checkpoint,
+                    labels,
+                    config,
+                    [ep],
+                    example_episode_indices=req.example_episode_indices,
+                    task_prompt=req.task_prompt,
+                    subtask_prompts=req.subtask_prompts,
+                    assess_quality=req.assess_quality,
+                )
+                record = generated.get("episode_results", {}).get(
+                    str(ep), {"generation_status": "generated", "issues": []}
+                )
+                source = Path(generated["output_dir"])
+                labels = {
+                    int(k): v["atoms"]
+                    for k, v in json.loads((source / "meta/lerobot_annotations.json").read_text())[
+                        "episodes"
+                    ].items()
+                }
+                result = generated
+                if record["generation_status"] == "generated" and first_success is None:
+                    first_success = ep
+            except Exception as exc:
+                logger.exception("Generation failed for episode %s", ep)
+                record = {
+                    "generation_status": "failed",
+                    "issues": [
+                        {
+                            "code": "generation_failed",
+                            "source": "deterministic",
+                            "severity": "error",
+                            "message": str(exc),
+                            "start": None,
+                            "end": None,
+                        }
+                    ],
+                }
+                # Preserve failed attempts as failures; never freeze old labels as a prediction.
+                annotation_history.snapshot_predictions(
+                    source,
+                    source,
+                    set(),
+                    {},
+                    asdict(config),
+                    engine.REVISION,
+                    task_prompt=req.task_prompt,
+                    subtask_prompts=req.subtask_prompts,
+                    episode_results={str(ep): record},
+                )
+            with _annotation_edit_lock:
+                current = store.read(run["run_id"])
+                current["root"] = str(source.resolve())
+                current["episodes"][str(ep)].update(record, decision="pending", decision_reason=None)
+                store.attach(source, current)
+                _register_local_dataset(source)
+                store.save(current, current["revision"])
+        result["output_dir"] = str(source)
+        if first_success is None:
+            result["validation"] = {
+                "ok": False,
+                "errors": ["No target episodes were generated; inspect the findings"],
+                "warnings": [],
+            }
+        result["first_generated_episode_index"] = first_success if first_success is not None else selected[0]
+        return result
+
+    return _start_annotation_job(generate, queued)
+
+
+@app.post("/api/annotation/delete-episodes")
+def delete_annotation_episodes(req: DeleteEpisodesRequest) -> dict:
+    engine = _official_engine()
+    state = _ensure_state(req)
+    indices = set(state.episodes_df["episode_index"])
+    selected = set(req.episode_indices)
+    if len(selected) != len(req.episode_indices) or selected - indices or selected == indices:
+        raise HTTPException(
+            status_code=422, detail="Select distinct existing episodes and keep at least one episode"
+        )
+    annotations = json.loads(json.dumps({str(ep): ann.atoms for ep, ann in state.annotations.items()}))
+    annotations = {int(ep): atoms for ep, atoms in annotations.items()}
+
+    def delete(output: Path) -> dict:
+        _download_full_dataset(state)
+        return engine.delete_dataset_episodes(state.root, output, annotations, req.episode_indices)
+
+    return _start_annotation_job(delete)
+
+
+@app.get("/api/annotation/jobs/{job_id}")
+def get_annotation_job(job_id: str) -> dict:
+    if len(job_id) != 32 or any(c not in "0123456789abcdef" for c in job_id):
+        raise HTTPException(status_code=404, detail="Unknown job")
+    if job_id in _annotation_jobs:
+        return dict(_annotation_jobs[job_id])
+    path = EXPORT_ROOT / "jobs" / f"{job_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Unknown job")
+    job = json.loads(path.read_text())
+    if job["status"] in {"running", "queued"}:
+        job.update(status="interrupted", error="Worker restarted; explicitly resume unfinished episodes")
+        annotation_runs.atomic_json(path, job)
+    return job
+
+
+@app.post("/api/annotation/validate")
+def validate_annotation(payload: EpisodeAtomsPayload) -> dict:
+    engine = _official_engine()
+    state = _ensure_state(payload)
+    if _episode_data_path(state, payload.episode_index) is None:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    records = list(engine.iter_episodes(state.root, only_episodes=(payload.episode_index,)))
+    if not records:
+        raise HTTPException(status_code=404, detail="Episode frames not found")
+    return engine.validate_atoms(
+        state.root, records, {payload.episode_index: [a.model_dump() for a in payload.atoms]}
+    )
+
+
+@app.api_route("/datasets/local/{dataset}/resolve/{revision}/{asset_path:path}", methods=["GET", "HEAD"])
+def annotation_dataset_asset(dataset: str, revision: str, asset_path: str):
+    root_text = _local_aliases().get(f"local/{dataset}")
+    relative = Path(asset_path)
+    if (
+        not root_text
+        or revision != "main"
+        or not relative.parts
+        or relative.parts[0] not in {"meta", "data", "videos"}
+    ):
+        raise HTTPException(status_code=404, detail="Unknown dataset asset")
+    root = Path(root_text).resolve()
+    path = (root / relative).resolve()
+    if (
+        root not in path.parents
+        or path.suffix not in {".json", ".jsonl", ".parquet", ".mp4"}
+        or not path.is_file()
+    ):
+        raise HTTPException(status_code=404, detail="Unknown dataset asset")
+    return FileResponse(path, headers={"Cache-Control": "no-store"})
+
+
+def _require_editable(root: Path):
+    run = annotation_runs.RunStore(EXPORT_ROOT).for_root(root)
+    if run:
+        if Path(run["root"]).resolve() != root.resolve():
+            raise HTTPException(409, "This draft is superseded; open the generated dataset")
+        job = _annotation_jobs.get(run.get("current_job_id"))
+        if job and job["status"] in {"queued", "running"}:
+            raise HTTPException(409, "Wait for the active annotation job before editing")
+
+
+def _workflow(alias: str):
+    root = _local_aliases().get("local/" + alias)
+    if not root:
+        raise HTTPException(404, "Unknown workflow dataset")
+    store = annotation_runs.RunStore(EXPORT_ROOT)
+    run = store.for_root(Path(root))
+    if not run:
+        raise HTTPException(404, "Prepare a dataset to start a workflow")
+    return store, run
+
+
+def _workflow_payload(run: dict) -> dict:
+    from copy import deepcopy
+
+    result = deepcopy(run)
+    root = Path(result.pop("root"))
+    result.pop("source_root", None)
+    result.pop("source_file_hashes", None)
+    result["current_repo_id"] = _register_local_dataset(root)
+    sidecar = root / "meta/lerobot_annotations.json"
+    episodes = json.loads(sidecar.read_text()).get("episodes", {}) if sidecar.exists() else {}
+    snapshots = [json.loads(p.read_text()) for p in sorted((root / "meta/annotation_predictions").glob("*.json"))]
+    for ep, data in result["episodes"].items():
+        atoms = episodes.get(ep, {}).get("atoms")
+        if atoms is None:
+            try:
+                atoms = json.loads(get_episode_atoms(int(ep), local_path=str(root)).body)["atoms"]
+            except Exception as exc:
+                atoms = []
+                data.setdefault("issues", []).append(
+                    {
+                        "code": "unreadable_episode",
+                        "source": "deterministic",
+                        "severity": "error",
+                        "message": str(exc),
+                        "start": None,
+                        "end": None,
+                    }
+                )
+        data["atoms"] = atoms
+        data["review"] = annotation_history.review_status(root, int(ep), atoms)
+        data["predictions"] = [
+            {"atoms": snap.get("episodes", {}).get(ep, {}).get("atoms"), "created_at": snap["created_at"]}
+            for snap in snapshots
+            if ep in snap.get("episodes", {}) or ep in snap.get("episode_results", {})
+        ]
+    try:
+        from .annotation_metrics import summarize
+    except ImportError:
+        from annotation_metrics import summarize
+    examples = set(result.get("example_episode_indices", []))
+    for snap in snapshots:
+        examples.update(snap.get("example_episode_indices", []))
+    result["metrics"] = summarize(result["episodes"], list(examples))
+    if result.get("export"):
+        result["export"] = {
+            k: v
+            for k, v in result["export"].items()
+            if k
+            in {
+                "manifest_sha256",
+                "retained_episodes",
+                "deleted_episodes",
+                "old_to_new",
+                "run_revision",
+                "validation",
+                "managed_changes",
+                "main_files",
+                "rich_files",
+            }
+        }
+    return result
+
+
+@app.get("/api/workflow/{alias}")
+def get_workflow(alias: str):
+    with _annotation_edit_lock:
+        _, run = _workflow(alias)
+        return _workflow_payload(run)
+
+
+class WorkflowDecision(BaseModel):
+    episode_index: int
+    decision: str
+    reason: str = ""
+    expected_revision: int
+
+
+@app.post("/api/workflow/{alias}/decision")
+def set_workflow_decision(alias: str, payload: WorkflowDecision):
+    with _annotation_edit_lock:
+        store, run = _workflow(alias)
+        _require_editable(Path(run["root"]))
+        if (
+            payload.decision not in {"pending", "keep", "delete"}
+            or str(payload.episode_index) not in run["episodes"]
+        ):
+            raise HTTPException(422, "Select an existing episode and keep/delete/pending decision")
+        if payload.decision == "delete" and not payload.reason.strip():
+            raise HTTPException(422, "A deletion reason is required")
+        run["episodes"][str(payload.episode_index)].update(
+            decision=payload.decision, decision_reason=payload.reason
+        )
+        run["publication_state"] = "draft"
+        run.pop("export", None)
+        try:
+            run = store.save(run, payload.expected_revision)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _workflow_payload(run)
+
+
+class WorkflowExport(BaseModel):
+    expected_revision: int
+
+
+class WorkflowPublish(WorkflowExport):
+    manifest_sha256: str
+
+
+def _publication_engine():
+    try:
+        from . import annotation_publish
+    except ImportError:
+        import annotation_publish
+    return annotation_publish
+
+
+def _queue_workflow_operation(alias, expected_revision, operation):
+    with _annotation_edit_lock:
+        store, run = _workflow(alias)
+        _require_editable(Path(run["root"]))
+        if run["revision"] != expected_revision:
+            raise HTTPException(409, "Workflow changed; refresh before exporting/publishing")
+
+        def queued(job_id):
+            run["current_job_id"] = job_id
+            store.save(run, expected_revision)
+
+        def execute(output):
+            result = operation(run, output)
+            with _annotation_edit_lock:
+                current = store.read(run["run_id"])
+                if "manifest_sha256" in result:
+                    current["export"] = result
+                    current["publication_state"] = "exported"
+                else:
+                    current["publication"] = result
+                    current["publication_state"] = "published"
+                store.save(current, current["revision"])
+            return {
+                k: v for k, v in result.items() if k not in {"root", "rich_root", "export_root", "manifest_path"}
+            }
+
+        return _start_annotation_job(execute, queued)
+
+
+@app.post("/api/workflow/{alias}/export")
+def export_workflow(alias: str, payload: WorkflowExport):
+    return _queue_workflow_operation(
+        alias, payload.expected_revision, lambda run, output: _publication_engine().prepare_export(run, output)
+    )
+
+
+@app.post("/api/workflow/{alias}/publish")
+def publish_workflow(alias: str, payload: WorkflowPublish):
+    with _annotation_edit_lock:
+        _, run = _workflow(alias)
+        if (
+            run["publication_state"] != "exported"
+            or run.get("export", {}).get("manifest_sha256") != payload.manifest_sha256
+        ):
+            raise HTTPException(409, "Prepare and review a current frozen export before publishing")
+    return _queue_workflow_operation(
+        alias,
+        payload.expected_revision,
+        lambda run, output: _publication_engine().publish_export(run, payload.manifest_sha256),
+    )
+
+
+@app.on_event("startup")
+def recover_annotation_jobs():
+    annotation_runs.recover_jobs(EXPORT_ROOT)

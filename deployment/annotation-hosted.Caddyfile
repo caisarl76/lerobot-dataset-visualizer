@@ -1,0 +1,9 @@
+{$ANNOTATION_HOSTNAME} {
+    @annotation path /api/* /datasets/local/*
+    handle @annotation {
+        reverse_proxy 127.0.0.1:7861
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

@@ -8,3 +8,10 @@ README.md
 .DS_Store
 .vscode
 .idea
+backend/.venv
+**/__pycache__
+.pytest_cache
+.env
+.env.*
+.superpowers
+*.tsbuildinfo

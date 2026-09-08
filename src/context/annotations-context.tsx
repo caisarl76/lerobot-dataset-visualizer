@@ -26,7 +26,7 @@ import React, {
 import type { LanguageAtom } from "../types/language.types";
 import { snapToFrame } from "../types/language.types";
 import {
-  fetchEpisodeAtoms,
+  fetchEpisodeAtomsWithHash,
   saveEpisodeAtoms,
   fetchFrameTimestamps,
   isAnnotateBackendEnabled,
@@ -97,6 +97,7 @@ interface AnnotationsContextType {
   backendEnabled: boolean;
   dirty: boolean;
   saving: boolean;
+  annotationSha256?: string;
 
   setEpisode: (
     episodeId: number,
@@ -135,7 +136,10 @@ export function useAnnotations(): AnnotationsContextType {
 }
 
 function identKey(ident: DatasetIdent): string {
-  return ident.localPath || ident.repoId || "unknown";
+  return (
+    ident.localPath ||
+    `${ident.repoId || "unknown"}${ident.revision ? `@${ident.revision}` : ""}`
+  );
 }
 
 export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
@@ -154,10 +158,19 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
   const [selectedIdx, setSelectedIdxState] = useState<number | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [annotationSha256, setAnnotationSha256] = useState<
+    string | undefined
+  >();
   const backendEnabled = isAnnotateBackendEnabled();
 
   // Track the last saved snapshot to detect dirtiness honestly.
   const savedSnapshotRef = useRef<string>("[]");
+  const hydrationRef = useRef(0);
+  const annotationHashRef = useRef<string | undefined>(undefined);
+  const hydratedRef = useRef(false);
+  const editVersionRef = useRef(0);
+  const currentAtomsRef = useRef(atoms);
+  currentAtomsRef.current = atoms;
 
   // Hydrate from sessionStorage when episode/ident changes; if the backend
   // is enabled, also fetch authoritative atoms + frame timestamps.
@@ -168,51 +181,85 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
       initialAtoms?: LanguageAtom[],
       initialFrameTimestamps?: number[],
     ) => {
+      const hydration = ++hydrationRef.current;
+      annotationHashRef.current = undefined;
+      setAnnotationSha256(undefined);
+      hydratedRef.current = false;
       setEpisodeId(newEpisodeId);
       setIdent(newIdent);
       setPendingDrawState(null);
       setSelectedIdxState(null);
 
-      // Hydrate from session first (so user edits survive episode toggles).
-      // If session is empty, fall back to initialAtoms (parquet-extracted).
-      let initial: LanguageAtom[] = [];
+      setSaving(false);
+      const editVersion = editVersionRef.current;
+      let initial = initialAtoms ?? [];
+      let baseline = JSON.stringify(initial);
+      let cachedHash: string | undefined;
       try {
         const raw = sessionStorage.getItem(
           storageKey(identKey(newIdent), newEpisodeId),
         );
-        if (raw) initial = JSON.parse(raw) as LanguageAtom[];
+        if (raw !== null) {
+          const cached = JSON.parse(raw);
+          // Retain older array-only caches as drafts, including an empty draft.
+          if (Array.isArray(cached)) initial = cached;
+          else if (
+            Array.isArray(cached.atoms) &&
+            typeof cached.savedSnapshot === "string"
+          ) {
+            initial = cached.atoms;
+            baseline = cached.savedSnapshot;
+            cachedHash =
+              typeof cached.annotationSha256 === "string"
+                ? cached.annotationSha256
+                : undefined;
+          }
+        }
       } catch {
-        /* ignore */
+        /* storage may be unavailable */
       }
-      if (initial.length === 0 && initialAtoms && initialAtoms.length > 0) {
-        initial = initialAtoms;
-      }
+      const hasDraft = JSON.stringify(initial) !== baseline;
+      annotationHashRef.current = hasDraft ? cachedHash : undefined;
       setAtoms(initial);
-      savedSnapshotRef.current = JSON.stringify(initial);
-      setDirty(false);
-      // Seed frame timestamps from the parquet (no backend dependency); the
-      // backend will optionally overwrite this below.
+      currentAtomsRef.current = initial;
+      savedSnapshotRef.current = baseline;
+      setDirty(hasDraft);
       setFrameTimestamps(initialFrameTimestamps ?? []);
 
-      // Fetch from backend if available.
       if (isAnnotateBackendEnabled()) {
-        fetchEpisodeAtoms(newEpisodeId, newIdent)
-          .then((remoteAtoms) => {
-            // Prefer backend if it has anything; otherwise keep session-cached
-            // edits the user made before the backend came online.
-            if (remoteAtoms && remoteAtoms.length > 0) {
+        fetchEpisodeAtomsWithHash(newEpisodeId, newIdent)
+          .then(({ atoms: remoteAtoms, annotation_sha256 }) => {
+            if (hydration !== hydrationRef.current || remoteAtoms === null)
+              return;
+            annotationHashRef.current =
+              hasDraft && cachedHash ? cachedHash : annotation_sha256;
+            setAnnotationSha256(annotationHashRef.current);
+            hydratedRef.current = true;
+            // A saved empty episode is authoritative. Keep only actual unsaved
+            // edits, not every session snapshot or stale parquet seed.
+            savedSnapshotRef.current = JSON.stringify(remoteAtoms);
+            if (!hasDraft && editVersion === editVersionRef.current) {
+              currentAtomsRef.current = remoteAtoms;
               setAtoms(remoteAtoms);
-              savedSnapshotRef.current = JSON.stringify(remoteAtoms);
               setDirty(false);
+            } else {
+              setDirty(
+                JSON.stringify(currentAtomsRef.current) !==
+                  savedSnapshotRef.current,
+              );
             }
           })
           .catch(() => {
-            /* backend offline — silent fallback to sessionStorage */
+            /* retain local draft while offline */
           });
-
         fetchFrameTimestamps(newEpisodeId, newIdent)
-          .then(setFrameTimestamps)
-          .catch(() => setFrameTimestamps([]));
+          .then((timestamps) => {
+            if (hydration === hydrationRef.current && timestamps.length > 0)
+              setFrameTimestamps(timestamps);
+          })
+          .catch(() => {
+            /* retain parquet timestamps while offline */
+          });
       }
     },
     [],
@@ -224,13 +271,17 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
     try {
       sessionStorage.setItem(
         storageKey(identKey(ident), episodeId),
-        JSON.stringify(atoms),
+        JSON.stringify({
+          atoms,
+          savedSnapshot: savedSnapshotRef.current,
+          annotationSha256: annotationHashRef.current,
+        }),
       );
     } catch {
       /* ignore */
     }
     setDirty(JSON.stringify(atoms) !== savedSnapshotRef.current);
-  }, [atoms, episodeId, ident]);
+  }, [atoms, episodeId, ident, dirty]);
 
   const snap = useCallback(
     (ts: number) =>
@@ -239,15 +290,18 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
   );
 
   const addAtom = useCallback((atom: LanguageAtom) => {
+    editVersionRef.current += 1;
     setAtoms((prev) => [...prev, atom]);
   }, []);
 
   const addAtoms = useCallback((newAtoms: LanguageAtom[]) => {
+    editVersionRef.current += 1;
     setAtoms((prev) => [...prev, ...newAtoms]);
   }, []);
 
   const updateAtom = useCallback(
     (index: number, updates: Partial<LanguageAtom>) => {
+      editVersionRef.current += 1;
       setAtoms((prev) => {
         if (index < 0 || index >= prev.length) return prev;
         const next = prev.slice();
@@ -259,6 +313,7 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
   );
 
   const deleteAtom = useCallback((atom: LanguageAtom) => {
+    editVersionRef.current += 1;
     setAtoms((prev) => {
       const next = prev.filter((a) => a !== atom);
       // If the deleted index was selected (or the selected index was after the
@@ -277,6 +332,7 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
   }, []);
 
   const resetAtoms = useCallback(() => {
+    editVersionRef.current += 1;
     setAtoms([]);
     setSelectedIdxState(null);
   }, []);
@@ -320,16 +376,48 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
         path: `sessionStorage://${storageKey(identKey(ident), episodeId)}`,
       };
     }
+    if (!hydratedRef.current)
+      return {
+        ok: false,
+        error: "Wait for the saved episode to load before saving.",
+      };
+    const hydration = ++hydrationRef.current;
     setSaving(true);
     try {
-      const { path } = await saveEpisodeAtoms(episodeId, ident, atoms);
+      const saved = annotationHashRef.current
+        ? await saveEpisodeAtoms(
+            episodeId,
+            ident,
+            atoms,
+            annotationHashRef.current,
+          )
+        : await saveEpisodeAtoms(episodeId, ident, atoms);
+      const { path } = saved;
+      if (hydration !== hydrationRef.current)
+        return { ok: false, error: "Episode changed during save" };
+      annotationHashRef.current = saved.annotation_sha256;
+      setAnnotationSha256(saved.annotation_sha256);
       savedSnapshotRef.current = JSON.stringify(atoms);
-      setDirty(false);
+      setDirty(
+        JSON.stringify(currentAtomsRef.current) !== savedSnapshotRef.current,
+      );
+      try {
+        sessionStorage.setItem(
+          storageKey(identKey(ident), episodeId),
+          JSON.stringify({
+            atoms: currentAtomsRef.current,
+            savedSnapshot: savedSnapshotRef.current,
+            annotationSha256: annotationHashRef.current,
+          }),
+        );
+      } catch {
+        /* retain in-memory state if storage is unavailable */
+      }
       return { ok: true, path };
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) };
     } finally {
-      setSaving(false);
+      if (hydration === hydrationRef.current) setSaving(false);
     }
   }, [atoms, episodeId, ident]);
 
@@ -350,6 +438,7 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
       backendEnabled,
       dirty,
       saving,
+      annotationSha256,
       setEpisode,
       setActiveCamera,
       setDrawMode,
@@ -380,6 +469,7 @@ export const AnnotationsProvider: React.FC<{ children: React.ReactNode }> = ({
       backendEnabled,
       dirty,
       saving,
+      annotationSha256,
       setEpisode,
       setActiveCamera,
       setDrawMode,

@@ -11,3 +11,6 @@ backend/**/*.pyc
 # Lockfiles
 bun.lock
 package-lock.json
+
+# Generated Python test state
+.pytest_cache/

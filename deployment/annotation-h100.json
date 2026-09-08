@@ -1,0 +1,12 @@
+{
+  "vlm": {
+    "model_id": "Qwen/Qwen3.6-27B",
+    "api_base": "http://127.0.0.1:34002/v1",
+    "auto_serve": false,
+    "client_concurrency": 4,
+    "max_new_tokens": 2048,
+    "chat_template_kwargs": { "enable_thinking": false }
+  },
+  "executor": { "episode_parallelism": 1 },
+  "video_backend": "pyav"
+}

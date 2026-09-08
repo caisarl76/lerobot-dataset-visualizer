@@ -1,0 +1,5 @@
+-r requirements.txt
+# Range responses for local parquet/video assets.
+starlette>=0.39
+# Python >=3.12. Keep this runtime separate from robot collection/training.
+lerobot[annotations] @ https://github.com/huggingface/lerobot/archive/3f2c29ef7e44b1ddccbcda3b6a63939e53639e9e.tar.gz

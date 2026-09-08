@@ -428,7 +428,7 @@ function EpisodeViewerInner({
       const repoId = `${org}/${dataset}`;
       getDatasetVersionAndInfo(repoId)
         .then(({ version, info }) => {
-          if (version !== "v3.0") return null;
+          if (version !== "v3.0" && version !== "v3.1") return null;
           return loadAllEpisodeLengthsV3(repoId, version, info.fps);
         })
         .then((result) => {

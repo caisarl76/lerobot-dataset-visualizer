@@ -24,7 +24,9 @@ export type LanguageStyle =
   | "plan"
   | "memory"
   | "interjection"
-  | "vqa";
+  | "vqa"
+  | "motion"
+  | "trace";
 
 export interface ToolCallFn {
   name: string;
@@ -56,10 +58,12 @@ export const PERSISTENT_STYLES: ReadonlySet<LanguageStyle> = new Set([
   "subtask",
   "plan",
   "memory",
+  "motion",
 ]);
 export const EVENT_STYLES: ReadonlySet<LanguageStyle> = new Set([
   "interjection",
   "vqa",
+  "trace",
 ]);
 
 export function columnForStyle(

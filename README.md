@@ -17,6 +17,9 @@ hf_oauth_expiration_minutes: 480
 
 LeRobot Dataset Tool and Visualizer is a web application for interactive exploration and visualization of robotics datasets, particularly those in the LeRobot format. It enables users to browse, view, and analyze episodes from large-scale robotics datasets, combining synchronized video playback with rich, interactive data graphs.
 
+Generate annotations with the official LeRobot modules and review them in this
+UI at `/annotate`. See [setup, review workflow and GR00T export](backend/README.md#official-annotation-pipeline).
+
 ## Project Overview
 
 This tool is designed to help robotics researchers and practitioners quickly inspect and understand large, complex datasets. It fetches dataset metadata and episode data (including video and sensor/telemetry data), and provides a unified interface for:
