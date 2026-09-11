@@ -18,6 +18,10 @@ def annotation_hash(atoms: list[dict]) -> str:
     ).hexdigest()
 
 
+def exclusions_hash(intervals: list[dict] | None = None) -> str:
+    return sha256(json.dumps(intervals or [], sort_keys=True).encode()).hexdigest()
+
+
 def read_reviews(root: Path) -> dict:
     path = root / "meta/annotation_reviews.json"
     return json.loads(path.read_text()) if path.exists() else {}
@@ -31,10 +35,15 @@ def write_reviews(root: Path, reviews: dict) -> None:
     temporary.replace(path)
 
 
-def review_status(root: Path, episode: int, atoms: list[dict]) -> dict:
+def review_status(root: Path, episode: int, atoms: list[dict], excluded_intervals=None) -> dict:
     digest = annotation_hash(atoms)
     review = read_reviews(root).get(str(episode), {})
-    reviewed = bool(review.get("reviewed_at")) and review.get("annotation_sha256") == digest
+    clip_digest = exclusions_hash(excluded_intervals)
+    reviewed = (
+        bool(review.get("reviewed_at"))
+        and review.get("annotation_sha256") == digest
+        and review.get("exclusions_sha256", exclusions_hash()) == clip_digest
+    )
     available = any(
         str(episode) in json.loads(path.read_text())["episodes"]
         for path in (root / "meta/annotation_predictions").glob("*.json")
@@ -42,21 +51,25 @@ def review_status(root: Path, episode: int, atoms: list[dict]) -> dict:
     return {
         "status": "reviewed" if reviewed else "unreviewed",
         "annotation_sha256": digest,
+        "exclusions_sha256": clip_digest,
         "reviewed_at": review.get("reviewed_at") if reviewed else None,
         "prediction_available": available,
     }
 
 
-def save_review(root: Path, episode: int, atoms: list[dict], reviewed: bool, expected_hash: str) -> dict:
+def save_review(
+    root: Path, episode: int, atoms: list[dict], reviewed: bool, expected_hash: str, *, excluded_intervals=None
+) -> dict:
     if annotation_hash(atoms) != expected_hash:
         raise ValueError("Annotations changed. Reload the episode before marking it reviewed.")
     reviews = read_reviews(root)
     reviews[str(episode)] = {
         "annotation_sha256": expected_hash,
+        "exclusions_sha256": exclusions_hash(excluded_intervals),
         "reviewed_at": datetime.now(timezone.utc).isoformat() if reviewed else None,
     }
     write_reviews(root, reviews)
-    return review_status(root, episode, atoms)
+    return review_status(root, episode, atoms, excluded_intervals)
 
 
 def snapshot_predictions(

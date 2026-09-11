@@ -146,8 +146,15 @@ class AnnotationAccess:
             )
             or (method in {"GET", "POST"} and re.fullmatch(r"/api/episodes/\d+/(atoms|review)", path))
             or (method == "GET" and re.fullmatch(r"/api/episodes/\d+/frame_timestamps", path))
+            or (method == "GET" and re.fullmatch(r"/api/episodes/\d+/robot-motion", path))
             or (method == "GET" and re.fullmatch(r"/api/workflow/[A-Za-z0-9_-]+", path))
-            or (method == "POST" and re.fullmatch(r"/api/workflow/[A-Za-z0-9_-]+/(decision|export|publish)", path))
+            or (
+                method == "POST"
+                and re.fullmatch(
+                    r"/api/workflow/[A-Za-z0-9_-]+/(decision|exclusions|keep-remaining|review-retained|export|publish)",
+                    path,
+                )
+            )
         )
         if not allowed:
             return await JSONResponse({"detail": "Route unavailable in hosted mode"}, 403)(scope, receive, send)

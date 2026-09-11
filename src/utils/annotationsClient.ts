@@ -36,6 +36,7 @@ export interface EpisodeReview {
   annotation_sha256: string;
   reviewed_at: string | null;
   prediction_available: boolean;
+  exclusions_sha256?: string;
 }
 
 export class AnnotationRequestError extends Error {
@@ -171,6 +172,7 @@ export type WorkflowEpisode = {
   review?: { status: string };
   predictions?: { atoms: LanguageAtom[]; created_at: string }[];
   deltas?: number[];
+  excluded_intervals?: { start_frame: number; end_frame: number }[];
 };
 export type WorkflowRun = {
   repo_id?: string | null;
@@ -179,6 +181,7 @@ export type WorkflowRun = {
   example_episode_indices?: number[];
   run_id: string;
   revision: number;
+  review_snapshot_sha256?: string;
   publication_state: string;
   current_job_id: string | null;
   task_prompt: string;
@@ -200,12 +203,42 @@ export type WorkflowRun = {
     deleted_episodes: number | number[];
     managed_changes?: { added_or_updated: string[]; deleted: string[] };
     validation?: AnnotationValidation;
+    format?: "groot_v21" | "rich";
+    instruction_mode?: "task" | "subtask";
+    dataset_name?: string;
+    retained_frames?: number;
+    local_path?: string;
+    output_repo_id?: string;
+    destination?: {
+      repo_id: string;
+      revision: string;
+      exists: boolean;
+      revision_exists?: boolean;
+      expected_commit?: string | null;
+      private?: boolean;
+    } | null;
   };
 };
 
 export async function fetchWorkflow(alias: string): Promise<WorkflowRun> {
   return annotationRequest(
     `/api/workflow/${encodeURIComponent(alias)}`,
+  ) as Promise<WorkflowRun>;
+}
+export async function postWorkflowExclusions(
+  alias: string,
+  body: {
+    episode_index: number;
+    expected_revision: number;
+    excluded_intervals: { start_frame: number; end_frame: number }[];
+  },
+): Promise<WorkflowRun> {
+  return annotationRequest(
+    `/api/workflow/${encodeURIComponent(alias)}/exclusions`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
   ) as Promise<WorkflowRun>;
 }
 export async function postWorkflowDecision(
@@ -220,12 +253,52 @@ export async function postWorkflowDecision(
   return annotationRequest(
     `/api/workflow/${encodeURIComponent(alias)}/decision`,
     { method: "POST", body: JSON.stringify(body) },
-  );
+  ) as Promise<WorkflowRun>;
 }
-export async function exportWorkflow(alias: string, expected_revision: number) {
+export async function keepWorkflowRemaining(
+  alias: string,
+  expected_revision: number,
+) {
+  return annotationRequest(
+    `/api/workflow/${encodeURIComponent(alias)}/keep-remaining`,
+    {
+      method: "POST",
+      body: JSON.stringify({ expected_revision }),
+    },
+  ) as Promise<WorkflowRun>;
+}
+export async function reviewWorkflowRetained(
+  alias: string,
+  body: {
+    expected_revision: number;
+    expected_review_sha256: string;
+    confirmed: true;
+  },
+) {
+  return annotationRequest(
+    `/api/workflow/${encodeURIComponent(alias)}/review-retained`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  ) as Promise<WorkflowRun>;
+}
+export type WorkflowExportOptions = {
+  export_format: "groot_v21" | "rich";
+  instruction_mode: "task" | "subtask";
+  dataset_name: string;
+  destination_repo_id: string | null;
+  destination_revision: string;
+  destination_private: boolean;
+};
+export async function exportWorkflow(
+  alias: string,
+  expected_revision: number,
+  options?: WorkflowExportOptions,
+) {
   return annotationRequest(
     `/api/workflow/${encodeURIComponent(alias)}/export`,
-    { method: "POST", body: JSON.stringify({ expected_revision }) },
+    { method: "POST", body: JSON.stringify({ expected_revision, ...options }) },
   );
 }
 export async function publishWorkflow(
@@ -345,6 +418,7 @@ export async function setEpisodeReview(
   ident: DatasetIdent,
   reviewed: boolean,
   annotationSha256: string,
+  exclusionsSha256?: string,
 ): Promise<EpisodeReview> {
   const res = await fetch(
     buildUrl(`/api/episodes/${episodeId}/review`, ident),
@@ -358,6 +432,9 @@ export async function setEpisodeReview(
         episode_index: episodeId,
         reviewed,
         annotation_sha256: annotationSha256,
+        ...(exclusionsSha256
+          ? { expected_exclusions_sha256: exclusionsSha256 }
+          : {}),
       }),
     },
   );
@@ -448,4 +525,27 @@ export async function pushToHub(
     throw new Error(text || `push: ${res.status}`);
   }
   return res.json();
+}
+
+export interface RobotMotion {
+  joint_names: string[];
+  timestamps: number[];
+  positions: number[][];
+  root_orientations: number[][] | null;
+}
+
+export async function fetchRobotMotion(
+  episodeId: number,
+  ident: DatasetIdent,
+  signal: AbortSignal,
+): Promise<RobotMotion> {
+  const response = await fetch(
+    buildUrl(`/api/episodes/${episodeId}/robot-motion`, ident),
+    { signal },
+  );
+  if (!response.ok)
+    throw new Error(
+      `Robot motion unavailable (${response.status}). This replay requires named, measured joint states.`,
+    );
+  return response.json();
 }

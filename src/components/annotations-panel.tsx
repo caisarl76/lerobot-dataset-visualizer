@@ -28,10 +28,6 @@ import {
   speechText,
   type LanguageAtom,
 } from "../types/language.types";
-import {
-  exportDataset as apiExport,
-  isAnnotateBackendEnabled,
-} from "../utils/annotationsClient";
 import { OfficialAnnotationControls } from "./official-annotation-controls";
 import { AnnotationWorkflowControls } from "./annotation-workflow-controls";
 import { AnnotationReviewControl } from "./annotation-review-control";
@@ -476,6 +472,8 @@ export const AnnotationsPanel: React.FC<Props> = ({ cameraKeys }) => {
   const { currentTime } = useTime();
 
   // ============ Inline quick-add state ============
+  const [tool, setTool] = useState<"generate" | "edit">("generate");
+  const composerRef = React.useRef<HTMLElement>(null);
   const [qaKind, setQaKind] = useState<QuickAddKind>("subtask");
   const [qaValues, setQaValues] = useState<Record<string, string>>({});
   const [exportStatus, setExportStatus] = useState<string | null>(null);
@@ -549,39 +547,14 @@ export const AnnotationsPanel: React.FC<Props> = ({ cameraKeys }) => {
     }
   };
 
-  const handleSaveDataset = async () => {
-    if (!isAnnotateBackendEnabled()) {
-      setExportStatus(
-        "Backend not configured. Set NEXT_PUBLIC_ANNOTATE_BACKEND_URL and run backend/app.py.",
-      );
-      return;
-    }
-    setExportStatus("Saving dataset…");
-    try {
-      if (dirty) {
-        const saved = await save();
-        if (!saved.ok) {
-          setExportStatus(
-            `Save episode failed: ${saved.error || "unknown error"}`,
-          );
-          return;
-        }
-      }
-      const r = await apiExport(ident);
-      setExportStatus(
-        `Saved dataset to ${r.output_dir} (persistent: ${r.persistent_rows}, events: ${r.event_rows}).`,
-      );
-    } catch (e) {
-      setExportStatus(
-        `Save dataset failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
-    }
-  };
-
   const selectedAtom =
     selectedIdx != null && selectedIdx >= 0 && selectedIdx < atoms.length
       ? atoms[selectedIdx]
       : null;
+
+  React.useEffect(() => {
+    if (selectedIdx != null) setTool("edit");
+  }, [selectedIdx]);
 
   // ============ Render ============
   return (
@@ -589,13 +562,10 @@ export const AnnotationsPanel: React.FC<Props> = ({ cameraKeys }) => {
       <div className="annotation-actionbar">
         <div>
           <h3>
-            Language annotations
+            Annotation controls
             {dirty && <span className="dirty-pill">unsaved</span>}
           </h3>
-          <p>
-            Select an atom from the timeline or list, then edit it in the
-            inspector.
-          </p>
+          <p>Save edits, generate subtasks, or review this episode.</p>
         </div>
         <div className="actionbar-actions">
           {!backendEnabled && (
@@ -610,138 +580,188 @@ export const AnnotationsPanel: React.FC<Props> = ({ cameraKeys }) => {
           >
             {saving ? "Saving…" : "Save episode"}
           </button>
+          <button
+            type="button"
+            className="text-xs h-7 px-3 rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-40"
+            onClick={() => {
+              setTool("edit");
+              if (qaKind !== "subtask") setQaValues({});
+              setQaKind("subtask");
+              requestAnimationFrame(() => {
+                composerRef.current?.scrollIntoView({ block: "nearest" });
+                composerRef.current
+                  ?.querySelector<HTMLInputElement>('input[type="text"]')
+                  ?.focus({ preventScroll: true });
+              });
+            }}
+          >
+            + Add subtask
+          </button>
           <AnnotationReviewControl />
-          {!process.env.NEXT_PUBLIC_ANNOTATE_BACKEND_URL?.startsWith("/") && (
+          {ident.repoId?.startsWith("local/") && (
             <button
-              disabled={!backendEnabled || saving}
-              onClick={handleSaveDataset}
+              disabled={saving}
+              onClick={() => {
+                window.dispatchEvent(
+                  new window.Event("annotation-open-export"),
+                );
+              }}
               className="text-xs h-7 px-3 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-40"
             >
-              Save dataset
+              Review &amp; export
             </button>
           )}
         </div>
       </div>
 
       {exportStatus && <div className="save-status">{exportStatus}</div>}
-      <OfficialAnnotationControls />
       <AnnotationWorkflowControls />
-
-      <section className="annotation-composer">
-        <div className="composer-copy">
-          <span className="section-kicker">Add text annotation</span>
-          <p>
-            Adds task phrasing, subtask, plan, memory, speech, or non-spatial
-            VQA atoms. Task phrasings are saved at episode start.
-          </p>
-        </div>
-        <div className="quick-add">
-          <span className="ts-pill">
-            t = {qaDef.atEpisodeStart ? fmtTime(0) : fmtTime(currentTime)}
-          </span>
-          <select
-            value={qaKind}
-            onChange={(e) => {
-              setQaKind(e.target.value as QuickAddKind);
-              setQaValues({});
-            }}
-          >
-            {QUICK_ADD_DEFS.map((d) => (
-              <option key={d.kind} value={d.kind}>
-                {d.label}
-              </option>
-            ))}
-          </select>
-          {qaDef.fields.map((f, i) => (
-            <input
-              key={f.name}
-              type={f.type === "number" ? "number" : "text"}
-              placeholder={f.placeholder}
-              className={f.grow ? "grow" : undefined}
-              style={f.width ? { width: f.width } : undefined}
-              value={qaValues[f.name] ?? ""}
-              onChange={(e) =>
-                setQaValues((v) => ({ ...v, [f.name]: e.target.value }))
-              }
-              onKeyDown={
-                i === qaDef.fields.length - 1
-                  ? (e) => e.key === "Enter" && handleQuickAdd()
-                  : undefined
-              }
-            />
-          ))}
-          <button className="add-btn" onClick={handleQuickAdd}>
-            + Add at frame
-          </button>
-        </div>
-      </section>
-
-      <div className="workspace inspector-workspace">
-        <div className="rail annotation-list">
-          <div className="list-head">
-            <div>
-              <span className="section-kicker">Annotations</span>
-              <p>{atoms.length} atoms in this episode</p>
-            </div>
-            <span className="ts-pill">{fmtTime(currentTime)}</span>
+      <div
+        className="annotation-tool-tabs"
+        role="group"
+        aria-label="Annotation tools"
+      >
+        <button
+          type="button"
+          aria-pressed={tool === "generate"}
+          onClick={() => setTool("generate")}
+        >
+          Generate annotations
+        </button>
+        <button
+          type="button"
+          aria-pressed={tool === "edit"}
+          onClick={() => setTool("edit")}
+        >
+          Edit annotations
+        </button>
+      </div>
+      <div hidden={tool !== "generate"}>
+        <OfficialAnnotationControls />
+      </div>
+      <div hidden={tool !== "edit"} className="annotation-manual-editor">
+        <section ref={composerRef} className="annotation-composer">
+          <div className="composer-copy">
+            <span className="section-kicker">Add text annotation</span>
+            <p>
+              Adds task phrasing, subtask, plan, memory, speech, or non-spatial
+              VQA atoms. Task phrasings are saved at episode start.
+            </p>
           </div>
-          {atoms.length === 0 && (
-            <div className="rail-empty">
-              No annotations yet.
-              <br />
-              Add text above or draw on the active video.
-            </div>
-          )}
-          {(["persistent", "events"] as const).map((column) => {
-            const colGroups = groups.filter(({ def }) => def.column === column);
-            const total = colGroups.reduce(
-              (n, { entries }) => n + entries.length,
-              0,
-            );
-            if (total === 0) return null;
-            return (
-              <div className="rail-column" key={column}>
-                <div className={`rail-column-head ${column}`}>
-                  <span className="rail-column-title">
-                    {column === "persistent" ? "Persistent" : "Events"}
-                  </span>
-                  <span className="rail-column-sub">
-                    {column === "persistent"
-                      ? "language_persistent · broadcast across every frame"
-                      : "language_events · fire on a single frame"}
-                  </span>
-                </div>
-                {colGroups.map(({ def, entries }) => (
-                  <RailGroup
-                    key={def.key}
-                    title={def.title}
-                    dotClass={def.dotClass}
-                    entries={entries}
-                    currentTime={currentTime}
-                  />
-                ))}
-              </div>
-            );
-          })}
-        </div>
+          <div className="quick-add">
+            <span className="ts-pill">
+              t = {qaDef.atEpisodeStart ? fmtTime(0) : fmtTime(currentTime)}
+            </span>
+            <select
+              value={qaKind}
+              onChange={(e) => {
+                setQaKind(e.target.value as QuickAddKind);
+                setQaValues({});
+              }}
+            >
+              {QUICK_ADD_DEFS.map((d) => (
+                <option key={d.kind} value={d.kind}>
+                  {d.label}
+                </option>
+              ))}
+            </select>
+            {qaDef.fields.map((f, i) => (
+              <input
+                key={f.name}
+                type={f.type === "number" ? "number" : "text"}
+                placeholder={f.placeholder}
+                className={f.grow ? "grow" : undefined}
+                style={f.width ? { width: f.width } : undefined}
+                value={qaValues[f.name] ?? ""}
+                onChange={(e) =>
+                  setQaValues((v) => ({ ...v, [f.name]: e.target.value }))
+                }
+                onKeyDown={
+                  i === qaDef.fields.length - 1
+                    ? (e) => e.key === "Enter" && handleQuickAdd()
+                    : undefined
+                }
+              />
+            ))}
+            <button className="add-btn" onClick={handleQuickAdd}>
+              {qaKind === "subtask"
+                ? "+ Add subtask at frame"
+                : "+ Add at frame"}
+            </button>
+          </div>
+        </section>
 
-        <div className="editor inspector">
-          {selectedAtom == null ? (
-            <div className="editor-empty">
-              <span className="section-kicker">Inspector</span>
-              <p>
-                Select an annotation from the list or timeline, or draw a new
-                bbox/keypoint on the video.
-              </p>
+        <div className="workspace inspector-workspace">
+          <div className="rail annotation-list">
+            <div className="list-head">
+              <div>
+                <span className="section-kicker">Annotations</span>
+                <p>{atoms.length} atoms in this episode</p>
+              </div>
+              <span className="ts-pill">{fmtTime(currentTime)}</span>
             </div>
-          ) : (
-            <AtomEditor
-              atom={selectedAtom}
-              cameraKeys={cameraKeys}
-              onChange={(updates) => updateAtom(selectedIdx as number, updates)}
-              onDelete={() => deleteAtom(selectedAtom)}
-            />
-          )}
+            {atoms.length === 0 && (
+              <div className="rail-empty">
+                No annotations yet.
+                <br />
+                Add text above or draw on the active video.
+              </div>
+            )}
+            {(["persistent", "events"] as const).map((column) => {
+              const colGroups = groups.filter(
+                ({ def }) => def.column === column,
+              );
+              const total = colGroups.reduce(
+                (n, { entries }) => n + entries.length,
+                0,
+              );
+              if (total === 0) return null;
+              return (
+                <div className="rail-column" key={column}>
+                  <div className={`rail-column-head ${column}`}>
+                    <span className="rail-column-title">
+                      {column === "persistent" ? "Persistent" : "Events"}
+                    </span>
+                    <span className="rail-column-sub">
+                      {column === "persistent"
+                        ? "language_persistent · broadcast across every frame"
+                        : "language_events · fire on a single frame"}
+                    </span>
+                  </div>
+                  {colGroups.map(({ def, entries }) => (
+                    <RailGroup
+                      key={def.key}
+                      title={def.title}
+                      dotClass={def.dotClass}
+                      entries={entries}
+                      currentTime={currentTime}
+                    />
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="editor inspector">
+            {selectedAtom == null ? (
+              <div className="editor-empty">
+                <span className="section-kicker">Inspector</span>
+                <p>
+                  Select an annotation from the list or timeline, or draw a new
+                  bbox/keypoint on the video.
+                </p>
+              </div>
+            ) : (
+              <AtomEditor
+                atom={selectedAtom}
+                cameraKeys={cameraKeys}
+                onChange={(updates) =>
+                  updateAtom(selectedIdx as number, updates)
+                }
+                onDelete={() => deleteAtom(selectedAtom)}
+              />
+            )}
+          </div>
         </div>
       </div>
     </div>

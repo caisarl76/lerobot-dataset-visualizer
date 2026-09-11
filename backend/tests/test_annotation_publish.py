@@ -586,3 +586,70 @@ def test_raw_v21_recovery_filters_only_frozen_export(reviewed_run, tmp_path, mon
         assert last["observation.state"].to_pylist() == [[2.0, float(i)] for i in range(4)]
     for root in (source, raw):
         assert {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()} == before[root]
+
+
+def test_clipping_export_rebases_rows_prompts_and_provenance(reviewed_run, tmp_path):
+    run = reviewed_run
+    root = Path(run["root"])
+    source_before = source_inventory(root)
+    intervals = [{"start_frame": 0, "end_frame": 1}, {"start_frame": 2, "end_frame": 3}]
+    run["episodes"]["0"]["excluded_intervals"] = intervals
+    with pytest.raises(ValueError, match="explicit human review"):
+        publish.prepare_export(run, tmp_path / "unreviewed-clip")
+    atoms = json.loads((root / "meta/lerobot_annotations.json").read_text())["episodes"]["0"]["atoms"]
+    history.save_review(root, 0, atoms, True, history.annotation_hash(atoms), excluded_intervals=intervals)
+    result = publish.prepare_export(run, tmp_path / "clipped-export")
+    records = list(engine.iter_episodes(Path(result["rich_root"])))
+    assert [r.row_count for r in records] == [2, 4, 4]
+    table = pq.read_table(records[0].data_path).slice(records[0].row_offset, records[0].row_count)
+    assert table["frame_index"].to_pylist() == [0, 1]
+    assert table["observation.state"].to_pylist() == [[0, 1], [0, 3]]
+    assert table["timestamp"].to_pylist() == pytest.approx([0, 0.1])
+    rich = Path(result["rich_root"])
+    assert history.review_status(rich, 0, engine.read_atoms(records[0]))["status"] == "reviewed"
+    provenance = json.loads((rich / "meta/source_episode_mapping.json").read_text())
+    assert provenance["frame_mapping"]["0"]["retained_segments"] == [
+        {"source_start_frame": 1, "source_end_frame": 2, "output_start_frame": 0},
+        {"source_start_frame": 3, "source_end_frame": 4, "output_start_frame": 1},
+    ]
+    assert source_inventory(root) == source_before
+    assert result["clipped_episodes"] == [0]
+
+
+def test_clip_and_delete_apply_one_stable_episode_mapping(reviewed_run, tmp_path):
+    run = reviewed_run
+    root = Path(run["root"])
+    run["episodes"]["0"]["decision"] = "delete"
+    intervals = [{"start_frame": 0, "end_frame": 2}]
+    run["episodes"]["2"]["excluded_intervals"] = intervals
+    atoms = json.loads((root / "meta/lerobot_annotations.json").read_text())["episodes"]["2"]["atoms"]
+    history.save_review(root, 2, atoms, True, history.annotation_hash(atoms), excluded_intervals=intervals)
+    result = publish.prepare_export(run, tmp_path / "clip-delete-export")
+    assert result["old_to_new"] == {"1": 0, "2": 1}
+    records = list(engine.iter_episodes(Path(result["rich_root"])))
+    assert [r.row_count for r in records] == [4, 2]
+    provenance = json.loads((Path(result["rich_root"]) / "meta/source_episode_mapping.json").read_text())
+    assert provenance["frame_mapping"]["2"]["output_episode_index"] == 1
+
+
+def test_v21_clipping_keeps_main_and_rich_frames_identical(reviewed_run, tmp_path):
+    run = reviewed_run
+    root = Path(run["root"])
+    source = make_v21_source(run, tmp_path)
+    before = source_inventory(source)
+    run["episodes"]["0"]["decision"] = "delete"
+    intervals = [{"start_frame": 0, "end_frame": 1}, {"start_frame": 2, "end_frame": 3}]
+    run["episodes"]["2"]["excluded_intervals"] = intervals
+    atoms = json.loads((root / "meta/lerobot_annotations.json").read_text())["episodes"]["2"]["atoms"]
+    history.save_review(root, 2, atoms, True, history.annotation_hash(atoms), excluded_intervals=intervals)
+    result = publish.prepare_export(run, tmp_path / "v21-clip-export")
+    assert result["old_to_new"] == {"1": 0, "2": 1}
+    main = Path(result["root"])
+    rich_records = list(engine.iter_episodes(Path(result["rich_root"])))
+    assert [r.row_count for r in rich_records] == [4, 2]
+    for record in rich_records:
+        rich = pq.read_table(record.data_path).slice(record.row_offset, record.row_count)
+        legacy = pq.read_table(main / f"data/chunk-000/episode_{record.episode_index:06d}.parquet")
+        for column in ["frame_index", "timestamp", "index", "episode_index", "observation.state"]:
+            assert legacy[column].to_pylist() == rich[column].to_pylist(), column
+    assert source_inventory(source) == before

@@ -33,6 +33,7 @@ export type DatasetDisplayInfo = {
   total_episodes: number;
   fps: number;
   robot_type: string | null;
+  joint_names?: string[];
   codebase_version: string;
   total_tasks: number;
   dataset_size_mb: number;
@@ -353,6 +354,9 @@ export async function getEpisodeData(
     result.datasetInfo = {
       ...result.datasetInfo,
       robot_type: rawInfo.robot_type ?? null,
+      joint_names: Array.isArray(rawInfo.features["observation.state"]?.names)
+        ? (rawInfo.features["observation.state"].names as string[])
+        : undefined,
       codebase_version: rawInfo.codebase_version,
       total_tasks: rawInfo.total_tasks ?? 0,
       dataset_size_mb:

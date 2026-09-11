@@ -15,6 +15,7 @@ import {
   type ActiveTab,
 } from "@/utils/episodeViewerTabs";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
+import { hasG1JointNames } from "@/utils/robotMotion";
 import PlaybackBar from "@/components/playback-bar";
 import { TimeProvider, useTime } from "@/context/time-context";
 import { FlaggedEpisodesProvider } from "@/context/flagged-episodes-context";
@@ -37,7 +38,7 @@ import StatsPanel from "@/components/stats-panel";
 import OverviewPanel from "@/components/overview-panel";
 import Loading from "@/components/loading-component";
 import HfAuthButton from "@/components/hf-auth-button";
-import { hasURDFSupport } from "@/lib/so101-robot";
+import { isG1Robot, hasURDFSupport } from "@/lib/so101-robot";
 import {
   getAdjacentEpisodesVideoInfo,
   computeColumnMinMax,
@@ -54,6 +55,7 @@ import {
 import { getDatasetVersionAndInfo } from "@/utils/versionUtils";
 import type { DatasetMetadata } from "@/utils/parquetUtils";
 
+const G1MotionReplay = lazy(() => import("@/components/g1-motion-replay"));
 const URDFViewer = lazy(() => import("@/components/urdf-viewer"));
 const ActionInsightsPanel = lazy(
   () => import("@/components/action-insights-panel"),
@@ -333,6 +335,28 @@ function EpisodeViewerInner({
     datasetInfo.repoId,
     datasetInfo.codebase_version,
   );
+  const g1Replay =
+    isG1Robot(datasetInfo.robot_type) ||
+    hasG1JointNames(datasetInfo.joint_names);
+  const media = (
+    <div className={g1Replay ? "episode-media-with-robot" : undefined}>
+      <div className="min-w-0">
+        <SimpleVideosPlayer
+          videosInfo={videosInfo}
+          onVideosReady={() => setVideosReady(true)}
+        />
+      </div>
+      {g1Replay && (
+        <Suspense fallback={<p>Loading G1 replay…</p>}>
+          <G1MotionReplay
+            key={`${datasetInfo.repoId}/${episodeId}`}
+            repoId={datasetInfo.repoId}
+            episodeId={episodeId}
+          />
+        </Suspense>
+      )}
+    </div>
+  );
   const urdfAvailable =
     hasURDFSupport(datasetInfo.robot_type) &&
     datasetInfo.codebase_version >= "v3.0";
@@ -564,16 +588,29 @@ function EpisodeViewerInner({
     };
   }, [org, dataset, episodeId]);
 
-  // Initialize based on URL time parameter
+  // Read the deep link once per episode. UrlTimeSync writes rounded bookmarks
+  // during playback; feeding those writes back into seek loses frame precision.
+  const initializedTimeScope = useRef<string | null>(null);
   useEffect(() => {
-    const timeParam = searchParams.get("t");
-    if (timeParam) {
-      const timeValue = parseFloat(timeParam);
-      if (!isNaN(timeValue)) {
-        seek(timeValue);
-      }
-    }
-  }, [searchParams, seek]);
+    const scope = `${datasetInfo.repoId}/${episodeId}`;
+    if (initializedTimeScope.current === scope) return;
+    initializedTimeScope.current = scope;
+    const value = Number.parseFloat(searchParams.get("t") || "");
+    if (Number.isFinite(value))
+      seek(Math.max(0, Math.min(data.duration, value)));
+  }, [searchParams, seek, datasetInfo.repoId, episodeId, data.duration]);
+
+  useEffect(() => {
+    const restoreUrlTime = () => {
+      const value = Number.parseFloat(
+        new URLSearchParams(window.location.search).get("t") || "",
+      );
+      if (Number.isFinite(value))
+        seek(Math.max(0, Math.min(data.duration, value)));
+    };
+    window.addEventListener("popstate", restoreUrlTime);
+    return () => window.removeEventListener("popstate", restoreUrlTime);
+  }, [seek, data.duration]);
 
   // sync with parent window hf.co/spaces
   useEffect(() => {
@@ -762,12 +799,7 @@ function EpisodeViewerInner({
               </div>
 
               {/* Videos */}
-              {videosInfo.length > 0 && (
-                <SimpleVideosPlayer
-                  videosInfo={videosInfo}
-                  onVideosReady={() => setVideosReady(true)}
-                />
-              )}
+              {videosInfo.length > 0 && media}
 
               {/* Language Instruction */}
               {task && (
@@ -809,12 +841,6 @@ function EpisodeViewerInner({
                   Episode · {episodeId}
                 </p>
               </div>
-              {videosInfo.length > 0 && (
-                <SimpleVideosPlayer
-                  videosInfo={videosInfo}
-                  onVideosReady={() => setVideosReady(true)}
-                />
-              )}
               {taskIndexDataset && (
                 <div
                   className="flex w-fit rounded border border-slate-700 bg-slate-950/60 p-1"
@@ -847,35 +873,40 @@ function EpisodeViewerInner({
                   </button>
                 </div>
               )}
-              {activeAnnotationMode === "task_index" ? (
-                <>
+              {g1Replay && videosInfo.length > 0 && media}
+              <div
+                className={
+                  activeAnnotationMode === "atoms"
+                    ? "annotation-studio"
+                    : undefined
+                }
+              >
+                <div className="annotation-preview">
+                  {!g1Replay && videosInfo.length > 0 && media}
                   <PlaybackBar />
+                  {activeAnnotationMode === "atoms" && (
+                    <>
+                      <AnnotationsTimeline duration={data.duration} />
+                      <details className="grounding-intro">
+                        <summary>
+                          Visual questions: drawing boxes and points
+                        </summary>
+                        <p>
+                          Draw on a video to add a bounding-box or keypoint
+                          question. Press Enter to confirm, or Esc to cancel.
+                        </p>
+                      </details>
+                    </>
+                  )}
+                </div>
+                {activeAnnotationMode === "task_index" ? (
                   <TaskIndexCurationWorkspace currentRouteEpisode={episodeId} />
-                </>
-              ) : (
-                <>
-                  <div className="grounding-intro">
-                    <span className="section-kicker">Grounded VQA</span>
-                    <ul>
-                      <li>
-                        Draw directly on the active video to create visual
-                        questions. Drag for a bounding box, click for a point.
-                        The camera is detected from the video you draw on.
-                      </li>
-                      <li>
-                        Drag on any video to add a bbox question. Click any
-                        video to add a keypoint question. Confirm the popup with{" "}
-                        <kbd>↵</kbd>, or cancel with <kbd>Esc</kbd>.
-                      </li>
-                    </ul>
-                  </div>
-                  <PlaybackBar />
-                  <AnnotationsTimeline duration={data.duration} />
+                ) : (
                   <AnnotationsPanel
                     cameraKeys={videosInfo.map((v) => v.filename)}
                   />
-                </>
-              )}
+                )}
+              </div>
             </div>
           )}
 

@@ -10,6 +10,7 @@ import { AnnotationReviewControl } from "../annotation-review-control";
 const unreviewed = {
   status: "unreviewed" as const,
   annotation_sha256: "sha",
+  exclusions_sha256: "clip-sha",
   reviewed_at: null,
   prediction_available: false,
 };
@@ -70,6 +71,7 @@ test("requires click and disables while dirty", async () => {
       { repoId: "org/data" },
       true,
       "sha",
+      "clip-sha",
     ),
   );
   fireEvent.click(ui.getByRole("button", { name: "Edit" }));
@@ -108,4 +110,26 @@ test("cannot review until the displayed atoms have loaded with their hash", asyn
   await act(async () => {});
   expect(ui.queryByRole("button", { name: "Mark reviewed" })).toBeNull();
   expect(client.setEpisodeReview).not.toHaveBeenCalled();
+});
+
+test("reloads the review binding after exclusions change", async () => {
+  const ui = render(content());
+  await ui.findByRole("button", { name: "Mark reviewed" });
+  spyOn(client, "fetchEpisodeReview").mockResolvedValue({
+    ...unreviewed,
+    exclusions_sha256: "new-clips",
+  });
+  await act(async () => {
+    window.dispatchEvent(new window.Event("annotation-clipping-changed"));
+  });
+  fireEvent.click(await ui.findByRole("button", { name: "Mark reviewed" }));
+  await waitFor(() =>
+    expect(client.setEpisodeReview).toHaveBeenCalledWith(
+      1,
+      { repoId: "org/data" },
+      true,
+      "sha",
+      "new-clips",
+    ),
+  );
 });

@@ -15,7 +15,7 @@ import logging
 import os
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -38,6 +38,7 @@ try:  # Supports both ``import backend.app`` and the legacy ``import app`` entry
     from .curation.security import CurationLoopbackGuard
     from .curation.source import SourceRegistry
     from .curation.worker import BatchService
+    from .robot_motion import read_robot_motion
 except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from annotation_access import AnnotationAccess, validate_dataset_paths
     import annotation_history
@@ -50,6 +51,7 @@ except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from curation.security import CurationLoopbackGuard
     from curation.source import SourceRegistry
     from curation.worker import BatchService
+    from robot_motion import read_robot_motion
 
 logger = logging.getLogger("lerobot-annotate")
 logging.basicConfig(level=logging.INFO)
@@ -143,6 +145,7 @@ class EpisodeReviewPayload(DatasetRef):
     episode_index: int
     reviewed: bool
     annotation_sha256: str
+    expected_exclusions_sha256: str | None = None
 
 
 class ExportRequest(DatasetRef):
@@ -526,6 +529,12 @@ def _download_full_dataset(state: DatasetState) -> None:
 
 
 def _do_export(state: DatasetState, output_dir: str | None, copy_videos: bool) -> dict[str, Any]:
+    run = annotation_runs.RunStore(EXPORT_ROOT).for_root(state.root)
+    if run and any(episode.get("excluded_intervals") for episode in run["episodes"].values()):
+        raise HTTPException(
+            status_code=409,
+            detail="This dataset has excluded intervals. Use Export & publish → Preview export to apply clipping.",
+        )
     engine = _official_engine()
     _download_full_dataset(state)
     out_root = Path(output_dir).expanduser().resolve() if output_dir else EXPORT_ROOT / f"annotated-{uuid4().hex}"
@@ -727,7 +736,9 @@ def get_episode_review(
         state, atoms = _review_atoms(
             episode_index, DatasetRef(repo_id=repo_id, revision=revision, local_path=local_path)
         )
-        return annotation_history.review_status(state.root, episode_index, atoms)
+        run = annotation_runs.RunStore(EXPORT_ROOT).for_root(state.root)
+        intervals = (run or {}).get("episodes", {}).get(str(episode_index), {}).get("excluded_intervals", [])
+        return annotation_history.review_status(state.root, episode_index, atoms, intervals)
 
 
 @app.post("/api/episodes/{episode_index}/review")
@@ -738,8 +749,20 @@ def set_episode_review(episode_index: int, payload: EpisodeReviewPayload) -> dic
         state, atoms = _review_atoms(episode_index, payload)
         try:
             _require_editable(state.root)
+            run = annotation_runs.RunStore(EXPORT_ROOT).for_root(state.root)
+            intervals = (run or {}).get("episodes", {}).get(str(episode_index), {}).get("excluded_intervals", [])
+            clip_digest = annotation_history.exclusions_hash(intervals)
+            if (
+                payload.expected_exclusions_sha256 is not None or intervals
+            ) and payload.expected_exclusions_sha256 != clip_digest:
+                raise ValueError("Excluded intervals changed. Reload before reviewing.")
             result = annotation_history.save_review(
-                state.root, episode_index, atoms, payload.reviewed, payload.annotation_sha256
+                state.root,
+                episode_index,
+                atoms,
+                payload.reviewed,
+                payload.annotation_sha256,
+                excluded_intervals=intervals,
             )
             annotation_runs.RunStore(EXPORT_ROOT).edited(state.root)
             return result
@@ -757,6 +780,22 @@ def episode_frame_timestamps(
     state = _ensure_state(DatasetRef(repo_id=repo_id, revision=revision, local_path=local_path))
     ts = _frame_timestamps(state, episode_index)
     return JSONResponse({"episode_index": episode_index, "timestamps": ts})
+
+
+@app.get("/api/episodes/{episode_index}/robot-motion")
+def episode_robot_motion(
+    episode_index: int,
+    repo_id: str | None = None,
+    revision: str | None = None,
+    local_path: str | None = None,
+) -> JSONResponse:
+    state = _ensure_state(DatasetRef(repo_id=repo_id, revision=revision, local_path=local_path))
+    if state.episodes_df[state.episodes_df["episode_index"] == episode_index].empty:
+        raise HTTPException(404, "Episode not found")
+    path = _episode_data_path(state, episode_index)
+    if path is None:
+        raise HTTPException(422, "Episode motion data is unavailable")
+    return JSONResponse(read_robot_motion(state, episode_index, path))
 
 
 @app.post("/api/export")
@@ -1179,6 +1218,11 @@ def annotation_dataset_asset(dataset: str, revision: str, asset_path: str):
 
 
 def _require_editable(root: Path):
+    manifest = root.parent / "manifest.json"
+    if manifest.is_file():
+        frozen = json.loads(manifest.read_text())
+        if frozen.get("dataset_name") == root.name and frozen.get("format") in {"groot_v21", "rich"}:
+            raise HTTPException(409, "Frozen export is read-only; edit the review draft and export again")
     run = annotation_runs.RunStore(EXPORT_ROOT).for_root(root)
     if run:
         if Path(run["root"]).resolve() != root.resolve():
@@ -1228,7 +1272,7 @@ def _workflow_payload(run: dict) -> dict:
                     }
                 )
         data["atoms"] = atoms
-        data["review"] = annotation_history.review_status(root, int(ep), atoms)
+        data["review"] = annotation_history.review_status(root, int(ep), atoms, data.get("excluded_intervals", []))
         data["predictions"] = [
             {"atoms": snap.get("episodes", {}).get(ep, {}).get("atoms"), "created_at": snap["created_at"]}
             for snap in snapshots
@@ -1242,6 +1286,7 @@ def _workflow_payload(run: dict) -> dict:
     for snap in snapshots:
         examples.update(snap.get("example_episode_indices", []))
     result["metrics"] = summarize(result["episodes"], list(examples))
+    result["review_snapshot_sha256"] = _review_snapshot(result["episodes"])
     if result.get("export"):
         result["export"] = {
             k: v
@@ -1257,9 +1302,30 @@ def _workflow_payload(run: dict) -> dict:
                 "managed_changes",
                 "main_files",
                 "rich_files",
+                "format",
+                "instruction_mode",
+                "dataset_name",
+                "retained_frames",
+                "clipped_episodes",
+                "destination",
+                "output_repo_id",
             }
         }
+        if not os.environ.get("ANNOTATION_BACKEND_TOKEN") and run["export"].get("local_path"):
+            result["export"]["local_path"] = run["export"]["local_path"]
     return result
+
+
+def _review_snapshot(episodes):
+    value = {
+        ep: {
+            "decision": data["decision"],
+            "annotation_sha256": annotation_history.annotation_hash(data["atoms"]),
+            "exclusions_sha256": annotation_history.exclusions_hash(data.get("excluded_intervals")),
+        }
+        for ep, data in episodes.items()
+    }
+    return sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
 @app.get("/api/workflow/{alias}")
@@ -1300,12 +1366,139 @@ def set_workflow_decision(alias: str, payload: WorkflowDecision):
         return _workflow_payload(run)
 
 
-class WorkflowExport(BaseModel):
+class WorkflowExclusions(BaseModel):
+    episode_index: int
     expected_revision: int
+    excluded_intervals: list[dict]
+
+
+@app.post("/api/workflow/{alias}/exclusions")
+def set_workflow_exclusions(alias: str, payload: WorkflowExclusions):
+    try:
+        from .annotation_clipping import normalize_exclusions
+    except ImportError:
+        from annotation_clipping import normalize_exclusions
+    with _annotation_edit_lock:
+        store, run = _workflow(alias)
+        root = Path(run["root"])
+        _require_editable(root)
+        if run["revision"] != payload.expected_revision:
+            raise HTTPException(409, "Workflow changed; reload before editing excluded intervals")
+        ep = str(payload.episode_index)
+        if ep not in run["episodes"]:
+            raise HTTPException(422, "Select an existing episode")
+        if run["episodes"][ep].get("decision") == "delete":
+            raise HTTPException(422, "Undo episode deletion before editing excluded intervals")
+        records = _official_engine().source_episode_rows(root)
+        row = next((r for r in records if int(r["episode_index"]) == payload.episode_index), None)
+        if row is None:
+            raise HTTPException(422, "Episode metadata is missing")
+        try:
+            intervals = normalize_exclusions(payload.excluded_intervals, int(row["length"]))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if intervals == run["episodes"][ep].get("excluded_intervals", []):
+            return _workflow_payload(run)
+        run["episodes"][ep]["excluded_intervals"] = intervals
+        run["publication_state"] = "draft"
+        run.pop("export", None)
+        saved = store.save(run, payload.expected_revision)
+        reviews = annotation_history.read_reviews(root)
+        reviews.pop(ep, None)
+        annotation_history.write_reviews(root, reviews)
+        return _workflow_payload(saved)
+
+
+class WorkflowRevision(BaseModel):
+    expected_revision: int
+
+
+class WorkflowBulkReview(WorkflowRevision):
+    expected_review_sha256: str
+    confirmed: Literal[True]
+
+
+def _editable_workflow(alias, revision):
+    store, run = _workflow(alias)
+    _require_editable(Path(run["root"]))
+    if run["revision"] != revision:
+        raise HTTPException(409, "Workflow changed; reload before applying bulk actions")
+    return store, run
+
+
+@app.post("/api/workflow/{alias}/keep-remaining")
+def keep_remaining(alias: str, payload: WorkflowRevision):
+    with _annotation_edit_lock:
+        store, run = _editable_workflow(alias, payload.expected_revision)
+        changed = False
+        for episode in run["episodes"].values():
+            if episode.get("decision") == "pending":
+                episode["decision"] = "keep"
+                changed = True
+        if changed:
+            run["publication_state"] = "draft"
+            run.pop("export", None)
+            run = store.save(run, run["revision"])
+        return _workflow_payload(run)
+
+
+@app.post("/api/workflow/{alias}/review-retained")
+def review_retained(alias: str, payload: WorkflowBulkReview):
+    from datetime import datetime, timezone
+
+    with _annotation_edit_lock:
+        store, run = _editable_workflow(alias, payload.expected_revision)
+        current = _workflow_payload(run)
+        if current["review_snapshot_sha256"] != payload.expected_review_sha256:
+            raise HTTPException(
+                409, "Prompts, intervals or decisions changed; inspect the current review before confirming"
+            )
+        retained = {ep: row for ep, row in current["episodes"].items() if row["decision"] != "delete"}
+        if not retained:
+            raise HTTPException(422, "No retained episodes to review")
+        # Validate every row first; a failure must not partially mark the batch.
+        for ep, row in retained.items():
+            if not row["atoms"]:
+                raise HTTPException(422, f"Episode {ep} has no saved annotations to review")
+            if any(issue.get("code") == "unreadable_episode" for issue in row.get("issues", [])):
+                raise HTTPException(422, f"Episode {ep} cannot be read")
+        root = Path(run["root"])
+        reviews = annotation_history.read_reviews(root)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        for ep, row in retained.items():
+            reviews[ep] = {
+                "annotation_sha256": row["review"]["annotation_sha256"],
+                "exclusions_sha256": row["review"]["exclusions_sha256"],
+                "reviewed_at": timestamp,
+            }
+        # Invalidate publication before the atomic review replacement. If the
+        # review write fails, no stale frozen export can remain publishable.
+        run["publication_state"] = "draft"
+        run.pop("export", None)
+        run = store.save(run, run["revision"])
+        annotation_history.write_reviews(root, reviews)
+        return _workflow_payload(run)
+
+
+class WorkflowExport(WorkflowRevision):
+    export_format: Literal["groot_v21", "rich"] | None = None
+    instruction_mode: Literal["task", "subtask"] = "task"
+    dataset_name: str = "retained-dataset"
+    destination_repo_id: str | None = None
+    destination_revision: str = "main"
+    destination_private: bool = True
 
 
 class WorkflowPublish(WorkflowExport):
     manifest_sha256: str
+
+
+def _delivery_engine():
+    try:
+        from . import annotation_delivery
+    except ImportError:
+        import annotation_delivery
+    return annotation_delivery
 
 
 def _publication_engine():
@@ -1332,21 +1525,34 @@ def _queue_workflow_operation(alias, expected_revision, operation):
             with _annotation_edit_lock:
                 current = store.read(run["run_id"])
                 if "manifest_sha256" in result:
+                    if result.get("local_path"):
+                        result["output_repo_id"] = _register_local_dataset(Path(result["local_path"]))
                     current["export"] = result
                     current["publication_state"] = "exported"
                 else:
                     current["publication"] = result
                     current["publication_state"] = "published"
                 store.save(current, current["revision"])
-            return {
-                k: v for k, v in result.items() if k not in {"root", "rich_root", "export_root", "manifest_path"}
-            }
+            hidden = {"root", "rich_root", "export_root", "manifest_path"}
+            if os.environ.get("ANNOTATION_BACKEND_TOKEN"):
+                hidden.add("local_path")
+            return {k: v for k, v in result.items() if k not in hidden}
 
         return _start_annotation_job(execute, queued)
 
 
 @app.post("/api/workflow/{alias}/export")
 def export_workflow(alias: str, payload: WorkflowExport):
+    if payload.export_format:
+        engine = _delivery_engine()
+        options = payload.model_dump(exclude={"expected_revision"})
+        try:
+            engine.validate_options(options)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return _queue_workflow_operation(
+            alias, payload.expected_revision, lambda run, output: engine.prepare_delivery(run, output, options)
+        )
     return _queue_workflow_operation(
         alias, payload.expected_revision, lambda run, output: _publication_engine().prepare_export(run, output)
     )
@@ -1364,7 +1570,11 @@ def publish_workflow(alias: str, payload: WorkflowPublish):
     return _queue_workflow_operation(
         alias,
         payload.expected_revision,
-        lambda run, output: _publication_engine().publish_export(run, payload.manifest_sha256),
+        lambda run, output: (
+            _delivery_engine().publish_delivery(run, payload.manifest_sha256)
+            if run.get("export", {}).get("format")
+            else _publication_engine().publish_export(run, payload.manifest_sha256)
+        ),
     )
 
 

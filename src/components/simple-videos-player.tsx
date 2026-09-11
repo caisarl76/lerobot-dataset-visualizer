@@ -8,7 +8,6 @@ import { proxyHfUrl } from "@/utils/auth";
 import { VideoOverlayCanvas } from "./video-overlay-canvas";
 
 const THRESHOLDS = {
-  VIDEO_SYNC_TOLERANCE: 0.2,
   VIDEO_SEGMENT_BOUNDARY: 0.05,
 };
 
@@ -208,6 +207,16 @@ export const SimpleVideosPlayer = ({
             }
           };
 
+      // Drive pose subscribers at decoded-video cadence, using the same clock
+      // and segment-boundary handling as the normal timeupdate fallback.
+      let frameCallback: number | undefined;
+      const reportVideoFrame = () => {
+        handleTimeUpdate();
+        frameCallback = video.requestVideoFrameCallback(reportVideoFrame);
+      };
+      if (typeof video.requestVideoFrameCallback === "function") {
+        frameCallback = video.requestVideoFrameCallback(reportVideoFrame);
+      }
       video.addEventListener("timeupdate", handleTimeUpdate);
       if (handlePlay) video.addEventListener("play", handlePlay);
       if (handleEnded) video.addEventListener("ended", handleEnded);
@@ -232,6 +241,8 @@ export const SimpleVideosPlayer = ({
       }
 
       videoEventCleanup.set(video, () => {
+        if (frameCallback !== undefined)
+          video.cancelVideoFrameCallback(frameCallback);
         video.removeEventListener("timeupdate", handleTimeUpdate);
         if (handlePlay) video.removeEventListener("play", handlePlay);
         if (handleLoadedData)
@@ -297,10 +308,9 @@ export const SimpleVideosPlayer = ({
         targetTime = (info.segmentStart ?? 0) + currentTime;
       }
 
-      if (
-        Math.abs(video.currentTime - targetTime) >
-        THRESHOLDS.VIDEO_SYNC_TOLERANCE
-      ) {
+      // An explicit seek must reach the requested frame, even for a tiny
+      // adjustment while paused. Drift tolerance would leave video behind pose.
+      if (Math.abs(video.currentTime - targetTime) > 1e-6) {
         video.currentTime = targetTime;
       }
     });
@@ -353,7 +363,9 @@ export const SimpleVideosPlayer = ({
               className={`${
                 isEnlarged
                   ? "z-40 fixed inset-0 bg-black bg-opacity-90 flex flex-col items-center justify-center"
-                  : "max-w-96"
+                  : info.filename.endsWith("ego_view")
+                    ? "w-[36rem] max-w-full"
+                    : "max-w-96"
               }`}
             >
               <p className="truncate w-full rounded-t-md bg-[var(--surface-1)] border border-b-0 border-white/5 px-2.5 py-1 text-[11px] text-slate-400 flex items-center justify-between gap-2">

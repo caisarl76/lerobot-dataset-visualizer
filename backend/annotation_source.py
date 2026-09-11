@@ -4,12 +4,14 @@ This helper is shared by raw-source generation and frozen publication. It never
 modifies the source and uses one explicit original-to-output episode mapping.
 """
 
+from fractions import Fraction
 import json
 from pathlib import Path
 import shutil
 
+import av
 from lerobot.annotations.steerable_pipeline.reader import EpisodeRecord
-from lerobot.datasets.compute_stats import aggregate_stats
+from lerobot.datasets.compute_stats import aggregate_stats, get_feature_stats, sample_indices
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -40,7 +42,35 @@ def _source_path(root, relative):
     return path
 
 
-def align_source_v21(source, output, mapping):
+def _trim_video(source, target, frame_indices, fps):
+    """Decode the complete source stream and encode exactly the requested frames."""
+    wanted = set(frame_indices)
+    with av.open(str(source)) as inp:
+        stream = inp.streams.video[0]
+        width, height = stream.width, stream.height
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with av.open(str(target), mode="w") as out:
+            out_stream = out.add_stream("libx264", rate=fps)
+            out_stream.width, out_stream.height, out_stream.pix_fmt = width, height, "yuv420p"
+            out_stream.time_base = Fraction(1, int(round(fps)))
+            out_stream.codec_context.max_b_frames = 0
+            output_index = 0
+            for input_index, frame in enumerate(inp.decode(stream)):
+                if input_index not in wanted:
+                    continue
+                packet_frame = av.VideoFrame.from_ndarray(frame.to_ndarray(format="rgb24"), format="rgb24")
+                packet_frame.pts = output_index
+                packet_frame.time_base = out_stream.time_base
+                for packet in out_stream.encode(packet_frame):
+                    out.mux(packet)
+                output_index += 1
+            if output_index != len(frame_indices):
+                raise ValueError(f"Video has fewer frames than requested: {source}")
+            for packet in out_stream.encode():
+                out.mux(packet)
+
+
+def align_source_v21(source, output, mapping, *, kept_frames=None):
     """Apply the official export's one identity map to original v2.1 frames and media."""
     info = _json(source / "meta/info.json")
     if info.get("codebase_version") != "v2.1":
@@ -51,6 +81,20 @@ def align_source_v21(source, output, mapping):
         raise ValueError("Retained source episodes or their per-episode stats are missing")
     chunks = info["chunks_size"]
     cameras = [key for key, feature in info.get("features", {}).items() if feature.get("dtype") == "video"]
+    if kept_frames is not None:
+        for old, indices in kept_frames.items():
+            old = int(old)
+            values = list(indices)
+            if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in values):
+                raise ValueError(f"kept_frames[{old}] must contain integer frame indices")
+            if not values or values != sorted(set(values)) or values[0] < 0:
+                raise ValueError(f"kept_frames[{old}] must be nonempty, unique, and ascending")
+            if old not in episodes or values[-1] >= episodes[old]["length"]:
+                raise ValueError(f"kept_frames[{old}] contains an out-of-range frame")
+        unknown = {int(old) for old in kept_frames} - set(episodes)
+        unknown |= set(int(old) for old in kept_frames) - {int(old) for old in mapping}
+        if unknown:
+            raise ValueError(f"kept_frames contains unknown episodes: {sorted(unknown)}")
     output.mkdir(parents=True)
     shutil.copytree(source / "meta", output / "meta")
     retained_episodes, retained_stats = [], []
@@ -65,8 +109,45 @@ def align_source_v21(source, output, mapping):
             raise ValueError(f"Invalid source frame counts or order for episode {old}")
         if table["episode_index"].to_pylist() != [old] * count:
             raise ValueError(f"Source episode identity mismatch for {old}")
+        selected = list(range(count)) if kept_frames is None else list(kept_frames.get(old, range(count)))
+        if kept_frames is not None:
+            table = table.take(pa.array(selected, type=pa.int64()))
+            fps = float(info.get("fps", info.get("video_fps", 30)))
+            for column, values in (
+                ("frame_index", list(range(len(selected)))),
+                ("timestamp", [i / fps for i in range(len(selected))]),
+                ("episode_index", [new] * len(selected)),
+                ("index", list(range(offset, offset + len(selected)))),
+            ):
+                index = table.schema.get_field_index(column)
+                if index >= 0:
+                    field = table.schema.field(index)
+                    cast = pa.array(values, type=field.type)
+                    table = table.set_column(index, field, cast)
+            count = table.num_rows
         stats = json.loads(json.dumps(episode_stats[old]))
-        for column, values in (("episode_index", [new] * count), ("index", list(range(offset, offset + count)))):
+        if kept_frames is not None:
+            # Recompute statistics from the retained rows; stale source statistics
+            # would describe frames that are absent from the materialized episode.
+            for column, feature in info.get("features", {}).items():
+                if column not in table.column_names or feature.get("dtype") in {
+                    "string",
+                    "language",
+                    "video",
+                    "image",
+                }:
+                    continue
+                values = np.asarray(table[column].to_pylist())
+                if values.dtype.kind not in "biufc":
+                    continue
+                stats[column] = {
+                    k: v.tolist() for k, v in get_feature_stats(values, axis=0, keepdims=values.ndim == 1).items()
+                }
+        for column, values in (
+            (("episode_index", [new] * count), ("index", list(range(offset, offset + count))))
+            if kept_frames is None
+            else ()
+        ):
             index = table.schema.get_field_index(column)
             if index < 0:
                 continue
@@ -95,8 +176,31 @@ def align_source_v21(source, output, mapping):
             if not target.resolve().is_relative_to(output):
                 raise ValueError("Source video template escapes the export")
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(_source_path(source, original_video), target)
-        retained_episodes.append({**episodes[old], "episode_index": new})
+            if kept_frames is None or old not in kept_frames:
+                shutil.copy2(_source_path(source, original_video), target)
+            else:
+                _trim_video(_source_path(source, original_video), target, selected, info.get("fps", 30))
+                feature = info["features"][camera]
+                feature["info"] = {**feature.get("info", {}), "video.codec": "h264"}
+                with av.open(str(target)) as clipped:
+                    sample_set = set(sample_indices(count))
+                    pixels = np.stack(
+                        [
+                            frame.to_ndarray(format="rgb24").transpose(2, 0, 1)
+                            for index, frame in enumerate(clipped.decode(video=0))
+                            if index in sample_set
+                        ]
+                    )
+                media_stats = get_feature_stats(pixels, axis=(0, 2, 3), keepdims=True)
+                stats[camera] = {
+                    key: (
+                        np.asarray(value / 255.0 if key != "count" else value)
+                        .reshape((1,) if key == "count" else (3, 1, 1))
+                        .tolist()
+                    )
+                    for key, value in media_stats.items()
+                }
+        retained_episodes.append({**episodes[old], "episode_index": new, "length": count})
         retained_stats.append({"episode_index": new, "stats": stats})
         offset += count
     count = len(mapping)

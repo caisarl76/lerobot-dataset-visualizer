@@ -15,7 +15,7 @@ fi
 tmux new-session -d -s lerobot-annotation -n tunnel \
   "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:34002:127.0.0.1:34002 h100 > '$logs/tunnel.log' 2>&1"
 tmux new-window -t lerobot-annotation -n backend \
-  "cd '$PWD'; LEROBOT_ANNOTATE_CONFIG='$LEROBOT_ANNOTATE_CONFIG' LEROBOT_ANNOTATE_EXPORT='$LEROBOT_ANNOTATE_EXPORT' LEROBOT_ANNOTATE_CACHE='$LEROBOT_ANNOTATE_CACHE' LEROBOT_ANNOTATE_BROWSER_ORIGIN='$LEROBOT_ANNOTATE_BROWSER_ORIGIN' backend/.venv/bin/uvicorn backend.app:app --host 127.0.0.1 --port 7861 > '$logs/backend.log' 2>&1"
+  "cd '$PWD'; LEROBOT_ANNOTATE_CONFIG='$LEROBOT_ANNOTATE_CONFIG' LEROBOT_ANNOTATE_EXPORT='$LEROBOT_ANNOTATE_EXPORT' LEROBOT_ANNOTATE_CACHE='$LEROBOT_ANNOTATE_CACHE' LEROBOT_ANNOTATE_BROWSER_ORIGIN='$LEROBOT_ANNOTATE_BROWSER_ORIGIN' backend/.venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 7861 > '$logs/backend.log' 2>&1"
 tmux new-window -t lerobot-annotation -n ui \
   "cd '$PWD'; NEXT_PUBLIC_ANNOTATE_BACKEND_URL='$NEXT_PUBLIC_ANNOTATE_BACKEND_URL' bun run start --hostname 127.0.0.1 --port 3000 > '$logs/ui.log' 2>&1"
 echo 'UI: http://127.0.0.1:3000/annotate'

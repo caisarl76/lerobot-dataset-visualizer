@@ -19,6 +19,7 @@ package-lock.json
 /out/
 /public/*
 !/public/urdf/
+!/public/robots/
 
 # production
 /build

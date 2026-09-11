@@ -1042,3 +1042,421 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   line-height: 14px;
 }
+
+/* Keep episode actions beside the video instead of below a full-page timeline. */
+.annotations-skin .annotation-studio {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(400px, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+.annotations-skin .annotation-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  position: sticky;
+  top: 0;
+}
+.annotations-skin .annotation-workbench {
+  min-width: 0;
+}
+.annotations-skin .annotation-studio .annotation-actionbar {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 10px;
+}
+.annotations-skin .annotation-studio .actionbar-actions {
+  justify-content: flex-start;
+}
+.annotations-skin .annotation-workflow,
+.annotations-skin .annotation-generation {
+  padding: 14px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-lg);
+  background: var(--surface-0);
+  min-width: 0;
+}
+.annotations-skin .annotation-workflow h3,
+.annotations-skin .annotation-workflow h4,
+.annotations-skin .annotation-generation h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 700;
+}
+.annotations-skin .annotation-workflow p,
+.annotations-skin .annotation-generation p {
+  margin: 6px 0;
+  color: var(--fg-3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.annotations-skin .workflow-episode-actions > label,
+.annotations-skin .annotation-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  color: var(--fg-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+.annotations-skin input:not([type]),
+.annotations-skin input[type="text"] {
+  background: var(--surface-1);
+  color: var(--fg-1);
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+.annotations-skin .annotation-field input,
+.annotations-skin .annotation-field textarea,
+.annotations-skin .annotation-field select,
+.annotations-skin .workflow-episode-actions input,
+.annotations-skin .generation-fields > details textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+}
+.annotations-skin textarea {
+  resize: vertical;
+}
+.annotations-skin .generation-fields {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+.annotations-skin .generation-options,
+.annotations-skin .generation-actions,
+.annotations-skin .workflow-action-buttons,
+.annotations-skin .annotation-tool-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.annotations-skin .generation-options label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.annotations-skin .annotation-workflow button,
+.annotations-skin .annotation-generation button,
+.annotations-skin .annotation-tool-tabs button,
+.annotations-skin .annotation-prepare-primary {
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  color: var(--fg-1);
+  padding: 8px 12px;
+  min-height: 36px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.annotations-skin button:disabled {
+  cursor: not-allowed;
+}
+.annotations-skin .annotation-workflow button:disabled,
+.annotations-skin .annotation-generation button:disabled {
+  opacity: 0.5;
+}
+.annotations-skin .workflow-action-buttons {
+  margin: 10px 0;
+}
+.annotations-skin .workflow-action-buttons button:nth-child(2) {
+  border-color: #ef5350;
+  color: #fca5a5;
+  background: rgba(239, 83, 80, 0.12);
+}
+.annotations-skin .annotation-tool-tabs button[aria-pressed="true"],
+.annotations-skin .generation-actions button:last-child,
+.annotations-skin .annotation-prepare-primary {
+  border-color: var(--hf-cyan);
+  background: rgba(56, 189, 248, 0.12);
+  color: #a5e9ff;
+}
+.annotations-skin .workflow-details,
+.annotations-skin .annotation-generation details {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-1);
+  padding-top: 10px;
+}
+.annotations-skin summary {
+  cursor: pointer;
+  color: var(--fg-2);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 4px 0;
+}
+.annotations-skin .annotation-workflow table {
+  width: 100%;
+  text-align: left;
+  font-size: 12px;
+  border-collapse: collapse;
+}
+.annotations-skin .annotation-workflow th,
+.annotations-skin .annotation-workflow td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border-1);
+}
+.annotations-skin .annotation-manual-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.annotations-skin .annotation-manual-editor[hidden] {
+  display: none;
+}
+.annotations-skin .annotation-studio .annotation-composer,
+.annotations-skin .annotation-studio .workspace.inspector-workspace {
+  grid-template-columns: minmax(0, 1fr);
+}
+.annotations-skin .grounding-intro p {
+  font-size: 12px;
+}
+.annotations-skin.annotation-prepare-page {
+  max-width: 760px;
+  margin: 48px auto;
+  padding: 24px;
+}
+.annotations-skin.annotation-prepare-page h1 {
+  font-size: 26px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.annotations-skin .annotation-prepare-fields {
+  display: grid;
+  gap: 18px;
+  padding: 24px;
+  margin-top: 24px;
+  border: 1px solid var(--border-2);
+  border-radius: var(--radius-lg);
+  background: var(--surface-0);
+}
+.annotations-skin .annotation-prepare-output {
+  display: inline-block;
+  margin-top: 16px;
+  color: var(--hf-cyan);
+  text-decoration: underline;
+}
+@media (max-width: 1100px) {
+  .annotations-skin .annotation-studio {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .annotations-skin .annotation-preview {
+    position: static;
+  }
+  .annotations-skin .annotation-studio .annotation-workbench {
+    order: -1;
+  }
+}
+
+.annotations-skin .workflow-export-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--border, #334155);
+  border-radius: 6px;
+}
+.annotations-skin .workflow-export-options label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.annotations-skin .workflow-export-options input:not([type="checkbox"]),
+.annotations-skin .workflow-export-options select {
+  width: 100%;
+  min-width: 0;
+}
+.annotations-skin .workflow-bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+.annotations-skin .workflow-frozen-export {
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid var(--border, #334155);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+.annotations-skin .workflow-frozen-export [role="alert"] {
+  color: #fbbf24;
+}
+.annotations-skin .workflow-frozen-export > label {
+  display: block;
+  margin: 12px 0;
+}
+.workflow-queue {
+  max-height: 240px;
+  overflow: auto;
+}
+.annotation-generation .generation-actions {
+  margin: 10px 0;
+}
+
+.annotations-skin .workflow-details {
+  margin-top: 4px;
+  padding-top: 4px;
+}
+.annotations-skin .annotation-generation .composer-copy a {
+  font-size: 12px;
+  color: var(--hf-cyan);
+  text-decoration: underline;
+}
+.annotations-skin .annotation-preview > .panel-raised {
+  flex-wrap: wrap;
+}
+.annotations-skin .annotation-preview > .panel-raised > div:last-child {
+  display: none;
+}
+.annotations-skin .annotation-preview input[type="range"] {
+  min-width: 60px;
+  width: 60px;
+}
+/* Source-frame exclusion controls */
+.episode-exclusions {
+  margin: 8px 0 12px;
+  color: var(--fg-2, #cbd5e1);
+  font-size: 12px;
+}
+.episode-exclusions-lane {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.episode-exclusions-lane > span {
+  flex: 0 0 84px;
+  color: #f87171;
+}
+.episode-exclusions-track {
+  position: relative;
+  height: 28px;
+  flex: 1;
+  background: rgba(248, 113, 113, 0.08);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: 4px;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+.episode-exclusions-track[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.65;
+}
+.episode-exclusion-bar,
+.episode-exclusion-selection {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  min-width: 2px;
+  border-radius: 2px;
+}
+.episode-exclusion-bar {
+  background: rgba(239, 83, 80, 0.8);
+  border: 1px solid #f87171;
+  cursor: pointer;
+}
+.episode-exclusion-bar[aria-pressed="true"],
+.episode-exclusion-bar:focus-visible {
+  outline: 2px solid #fecaca;
+  outline-offset: 1px;
+}
+.episode-exclusion-selection {
+  pointer-events: none;
+  border: 1px dashed #fecaca;
+  background: repeating-linear-gradient(
+    135deg,
+    rgba(248, 113, 113, 0.2) 0 4px,
+    rgba(248, 113, 113, 0.45) 4px 8px
+  );
+}
+.episode-exclusions-controls,
+.episode-exclusions-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.episode-exclusions-controls,
+.episode-exclusions-summary,
+.episode-exclusions-list {
+  margin: 8px 0 0 94px;
+}
+.episode-exclusions-controls label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.episode-exclusions-controls input[type="number"] {
+  width: 88px;
+}
+.episode-exclusions button:not(.episode-exclusion-bar) {
+  padding: 5px 9px;
+  border: 1px solid rgba(248, 113, 113, 0.5);
+  border-radius: 5px;
+  background: rgba(248, 113, 113, 0.12);
+  color: #fecaca;
+}
+.episode-exclusions button:disabled,
+.episode-exclusions input:disabled {
+  opacity: 0.5;
+}
+.episode-exclusions-list {
+  list-style: none;
+  padding: 0;
+}
+.episode-exclusions-list li {
+  padding: 5px 0;
+}
+.episode-exclusions-list li.selected {
+  color: #fecaca;
+}
+.episode-exclusions [role="alert"] {
+  color: #fca5a5;
+  margin-top: 8px;
+}
+.episode-exclusions .episode-exclusion-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #fef08a;
+  pointer-events: none;
+  z-index: 3;
+}
+.episode-exclusions .episode-exclusion-playhead span {
+  position: absolute;
+  top: -19px;
+  left: 0;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(15, 23, 42, 0.94);
+  color: #fef08a;
+  font-size: 10px;
+  line-height: 15px;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+.episode-exclusions .episode-exclusion-playhead.start span {
+  transform: none;
+}
+.episode-exclusions .episode-exclusion-playhead.end span {
+  transform: translateX(-100%);
+}
+@media (max-width: 640px) {
+  .episode-exclusions-lane > span {
+    flex-basis: 56px;
+  }
+  .episode-exclusions-controls,
+  .episode-exclusions-summary,
+  .episode-exclusions-list {
+    margin-left: 0;
+  }
+}

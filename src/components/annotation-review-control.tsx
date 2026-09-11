@@ -23,6 +23,13 @@ export function AnnotationReviewControl() {
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const requestId = React.useRef(0);
+  const [clipRevision, setClipRevision] = React.useState(0);
+  React.useEffect(() => {
+    const changed = () => setClipRevision((value) => value + 1);
+    window.addEventListener("annotation-clipping-changed", changed);
+    return () =>
+      window.removeEventListener("annotation-clipping-changed", changed);
+  }, []);
 
   React.useEffect(() => {
     const id = ++requestId.current;
@@ -61,7 +68,15 @@ export function AnnotationReviewControl() {
     return () => {
       requestId.current += 1;
     };
-  }, [backendEnabled, annotationSha256, episodeId, ident, atoms, dirty]);
+  }, [
+    backendEnabled,
+    annotationSha256,
+    episodeId,
+    ident,
+    atoms,
+    dirty,
+    clipRevision,
+  ]);
 
   const markReviewed = async () => {
     if (
@@ -82,6 +97,7 @@ export function AnnotationReviewControl() {
         ident,
         review.status !== "reviewed",
         annotationSha256,
+        review.exclusions_sha256,
       );
       if (id === requestId.current) setReview(next);
     } catch (cause) {

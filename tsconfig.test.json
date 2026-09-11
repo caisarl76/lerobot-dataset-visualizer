@@ -19,7 +19,11 @@
     "src/utils/__tests__/episodeViewerTabs.test.ts",
     "src/components/__tests__/official-annotation-controls.test.tsx",
     "src/utils/__tests__/annotationsClient.test.ts",
-    "src/context/__tests__/annotations-context.test.tsx"
+    "src/context/__tests__/annotations-context.test.tsx",
+    "src/components/__tests__/episode-exclusions.test.tsx",
+    "src/components/__tests__/annotation-workflow-controls.test.tsx",
+    "src/utils/__tests__/robotMotion.test.ts",
+    "src/components/__tests__/video-motion-sync.test.tsx"
   ],
   "include": ["src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["node_modules", "src/**/__tests__/**"]

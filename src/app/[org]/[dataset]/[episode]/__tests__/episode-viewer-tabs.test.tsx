@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { act, render, type RenderResult } from "@testing-library/react";
 
 let loadedFixture = episodeFixture();
+const seekSpy = mock(() => {});
 
 mock.module("next/navigation", () => ({
   useRouter: () => ({ push: mock(() => {}) }),
@@ -23,7 +24,7 @@ mock.module("@/context/time-context", () => ({
   useTime: () => ({
     currentTime: 0,
     isPlaying: false,
-    seek: mock(() => {}),
+    seek: seekSpy,
     setIsPlaying: mock(() => {}),
   }),
 }));
@@ -179,4 +180,19 @@ describe("EpisodeViewer initial tab wiring", () => {
       expect(ineligible.queryByTestId("urdf-probe")).toBeNull();
     });
   }
+});
+
+test("rounded URL bookmarks do not seek the current episode again", async () => {
+  seekSpy.mockClear();
+  const view = await renderViewer({ query: "?t=0.72" });
+  expect(seekSpy).toHaveBeenCalledWith(0.72);
+  seekSpy.mockClear();
+  window.history.replaceState({}, "", "/local/pnp_trash/episode_0?t=0");
+  await act(async () => {
+    view.rerender(
+      <EpisodeViewer org="local" dataset="pnp_trash" episodeId={0} />,
+    );
+  });
+  expect(seekSpy).not.toHaveBeenCalled();
+  view.unmount();
 });

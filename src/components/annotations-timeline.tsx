@@ -35,6 +35,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTime } from "../context/time-context";
 import { useAnnotations } from "../context/annotations-context";
+import { EpisodeExclusions } from "./episode-exclusions";
 import {
   classifyVqa,
   isSpeechAtom,
@@ -475,6 +476,7 @@ export const AnnotationsTimeline: React.FC<Props> = ({ duration }) => {
           {currentTime.toFixed(2)}s / {duration.toFixed(2)}s
         </span>
       </div>
+      <EpisodeExclusions duration={duration} />
 
       {/* Time-axis ruler — clicking it scrubs */}
       <div

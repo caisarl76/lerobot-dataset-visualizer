@@ -20,14 +20,16 @@ import pyarrow.parquet as pq
 
 try:
     from . import official_annotations as engine
-    from .annotation_history import annotation_hash, read_reviews
+    from .annotation_clipping import clip_v3_dataset, normalize_exclusions, remap_atoms, retained_indices
+    from .annotation_history import annotation_hash, exclusions_hash, read_reviews
     from .annotation_quality import check_prompt_sequence
     from .annotation_runs import source_inventory
     from .annotation_source import align_source_v21 as _align_source_v21, v21_records
     from .groot_export import export_groot_dataset
     from .official_annotations import delete_dataset_episodes
 except ImportError:
-    from annotation_history import annotation_hash, read_reviews
+    from annotation_clipping import clip_v3_dataset, normalize_exclusions, remap_atoms, retained_indices
+    from annotation_history import annotation_hash, exclusions_hash, read_reviews
     from annotation_quality import check_prompt_sequence
     from annotation_runs import source_inventory
     from annotation_source import align_source_v21 as _align_source_v21, v21_records
@@ -95,7 +97,7 @@ def _sanitize_metadata(value, source_ref):
     return result
 
 
-def _publication_metadata(root, run, mapping, reviews):
+def _publication_metadata(root, run, mapping, reviews, frame_mapping=None):
     for relative in ("meta/annotation_run.json", RECEIPT):
         pointer = root / relative
         if pointer.exists():
@@ -112,6 +114,7 @@ def _publication_metadata(root, run, mapping, reviews):
             "run_revision": run["revision"],
             "old_to_new": mapping,
             "prediction_identity_space": "source_episode_index",
+            "frame_mapping": frame_mapping or {},
             "task_prompt": run.get("task_prompt", ""),
             "subtask_prompts": run.get("subtask_prompts", []),
             "example_episode_indices": run.get("example_episode_indices", []),
@@ -329,6 +332,18 @@ def prepare_export(run: dict, output: Path) -> dict:
     if not retained:
         raise ValueError("Cannot delete all episodes")
     _validate_structure(root, retained)
+    exclusions = {
+        record.episode_index: normalize_exclusions(
+            states[str(record.episode_index)].get("excluded_intervals", []), record.row_count
+        )
+        for record in retained
+    }
+    has_clips = any(exclusions.values())
+    fps = _json(root / "meta/info.json")["fps"]
+    kept_frames = {
+        record.episode_index: retained_indices(record.row_count, exclusions[record.episode_index])
+        for record in retained
+    }
     saved = _json(root / "meta/lerobot_annotations.json")["episodes"]
     reviews = read_reviews(root)
     labels = {}
@@ -338,7 +353,12 @@ def prepare_export(run: dict, output: Path) -> dict:
             raise ValueError(f"Episode {ep} has no saved human annotations")
         atoms = saved[ep]["atoms"]
         review = reviews.get(ep, {})
-        if not review.get("reviewed_at") or review.get("annotation_sha256") != annotation_hash(atoms):
+        if (
+            not review.get("reviewed_at")
+            or review.get("annotation_sha256") != annotation_hash(atoms)
+            or review.get("exclusions_sha256", exclusions_hash())
+            != exclusions_hash(exclusions[record.episode_index])
+        ):
             raise ValueError(f"Episode {ep} needs a current explicit human review")
         if states[ep].get("issues") and states[ep].get("decision") != "keep":
             raise ValueError(f"Episode {ep} has unresolved quality findings")
@@ -379,23 +399,70 @@ def prepare_export(run: dict, output: Path) -> dict:
             raise ValueError("Retained source episode identities are missing")
         _validate_structure(source, source_records)
     mapped_reviews = {str(new): reviews[str(ep)] for ep, new in current_to_new.items()}
+    frame_mapping = {}
     output.mkdir(parents=True)
     rich, main = output / "rich", output / "main"
     try:
-        if raw_v21:
+        if raw_v21 or (has_clips and run["source_format"] == "v2.1"):
             # Pinned official delete_episodes requires a v3 LeRobotDataset and
             # cannot read raw v2 or corrupt excluded shards. In this recovery
             # exception only, materialize retained IDs into frozen v2 staging,
             # apply the single mapping there, then use official conversion and
             # writer. Review/source files and their identities remain untouched.
             aligned = output / "aligned_source"
-            _align_source_v21(source, aligned, mapping)
+            selected_source_frames = (
+                {
+                    int(states[str(ep)].get("original_episode_index", ep)): frames
+                    for ep, frames in kept_frames.items()
+                }
+                if has_clips
+                else None
+            )
+            if has_clips:
+                _align_source_v21(source, aligned, mapping, kept_frames=selected_source_frames)
+            else:
+                _align_source_v21(source, aligned, mapping)
             converted = output / "converted_source"
             engine.prepare_dataset(aligned, converted)
             if not _json(converted / "meta/info.json").get("codebase_version", "").startswith("v3"):
                 raise ValueError("Retained raw source could not be converted safely")
-            remapped_labels = {current_to_new[ep]: atoms for ep, atoms in labels.items()}
+            remapped_labels = {
+                current_to_new[record.episode_index]: remap_atoms(
+                    labels[record.episode_index],
+                    record.frame_timestamps,
+                    kept_frames[record.episode_index],
+                    fps,
+                )
+                if has_clips
+                else labels[record.episode_index]
+                for record in retained
+            }
+            if has_clips:
+                converted_records = {r.episode_index: r for r in engine.iter_episodes(converted)}
+                for ep, atoms in remapped_labels.items():
+                    for atom in atoms:
+                        atom["timestamp"] = converted_records[ep].frame_timestamps[round(atom["timestamp"] * fps)]
             engine.export_dataset(converted, rich, remapped_labels, copy_videos=True)
+            history = root / "meta/annotation_predictions"
+            if history.exists():
+                shutil.copytree(history, rich / "meta/annotation_predictions", dirs_exist_ok=True)
+        elif has_clips:
+            clipping_source, clipping_labels, clipping_exclusions = root, labels, exclusions
+            if deleted:
+                clipping_source = output / "retained_source"
+                deletion = delete_dataset_episodes(root, clipping_source, labels, deleted)
+                if deletion["old_to_new"] != current_to_new:
+                    raise ValueError("Official deletion produced an unexpected identity mapping")
+                clipping_labels = {current_to_new[ep]: atoms for ep, atoms in labels.items()}
+                clipping_exclusions = {current_to_new[ep]: ranges for ep, ranges in exclusions.items()}
+            clipped = output / "clipped_source"
+            result = clip_v3_dataset(
+                clipping_source, clipped, clipping_exclusions, clipping_labels, sorted(clipping_labels)
+            )
+            expected_mapping = {ep: ep for ep in clipping_labels} if deleted else current_to_new
+            if result["old_to_new"] != expected_mapping:
+                raise ValueError("Clipping produced an unexpected episode identity mapping")
+            engine.export_dataset(clipped, rich, result["annotations"])
             history = root / "meta/annotation_predictions"
             if history.exists():
                 shutil.copytree(history, rich / "meta/annotation_predictions", dirs_exist_ok=True)
@@ -408,15 +475,46 @@ def prepare_export(run: dict, output: Path) -> dict:
                 shutil.copytree(history, rich / "meta/annotation_predictions", dirs_exist_ok=True)
         else:
             engine.export_dataset(root, rich, labels)
-        _publication_metadata(rich, run, mapping, mapped_reviews)
+        if has_clips:
+            rich_records = {r.episode_index: r for r in engine.iter_episodes(rich)}
+            for record in retained:
+                ep = record.episode_index
+                new = current_to_new[ep]
+                original = str(states[str(ep)].get("original_episode_index", ep))
+                segments = []
+                for output_index, source_index in enumerate(kept_frames[ep]):
+                    if not segments or source_index != segments[-1]["source_end_frame"]:
+                        segments.append(
+                            {
+                                "source_start_frame": source_index,
+                                "source_end_frame": source_index + 1,
+                                "output_start_frame": output_index,
+                            }
+                        )
+                    else:
+                        segments[-1]["source_end_frame"] += 1
+                frame_mapping[original] = {
+                    "output_episode_index": new,
+                    "source_frame_count": record.row_count,
+                    "output_frame_count": len(kept_frames[ep]),
+                    "retained_segments": segments,
+                }
+                mapped_reviews[str(new)] = {
+                    **mapped_reviews[str(new)],
+                    "source_annotation_sha256": mapped_reviews[str(new)]["annotation_sha256"],
+                    "source_exclusions_sha256": exclusions_hash(exclusions[ep]),
+                    "annotation_sha256": annotation_hash(engine.read_atoms(rich_records[new])),
+                    "exclusions_sha256": exclusions_hash(),
+                }
+        _publication_metadata(rich, run, mapping, mapped_reviews, frame_mapping)
         if run["source_format"] == "v2.1":
             aligned = output / "aligned_source"
-            if not raw_v21:
+            if not raw_v21 and not has_clips:
                 _align_source_v21(source, aligned, mapping)
             export_groot_dataset(rich, aligned, main, mode="subtask")
             for name in ("lerobot_annotations.json", "annotation_reviews.json", "source_episode_mapping.json"):
                 shutil.copy2(rich / "meta" / name, main / "meta" / name)
-            _publication_metadata(main, run, mapping, mapped_reviews)
+            _publication_metadata(main, run, mapping, mapped_reviews, frame_mapping)
         else:
             engine.copy_dataset(rich, main)
         for dataset in (rich, main):
@@ -433,6 +531,7 @@ def prepare_export(run: dict, output: Path) -> dict:
             "source_commit": run.get("source_commit"),
             "source_format": run["source_format"],
             "old_to_new": mapping,
+            "frame_mapping": frame_mapping,
             "review_sha256": _review_digest(run),
             "source_files": input_files[source],
             "files": {"main": _inventory(main), "rich": _inventory(rich)},
@@ -446,6 +545,7 @@ def prepare_export(run: dict, output: Path) -> dict:
             "run_revision": run["revision"],
             "retained_episodes": len(retained),
             "deleted_episodes": deleted,
+            "clipped_episodes": sorted(ep for ep, intervals in exclusions.items() if intervals),
             "old_to_new": mapping,
             "validation": validation,
             "managed_changes": {

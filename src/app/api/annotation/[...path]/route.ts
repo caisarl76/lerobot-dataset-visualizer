@@ -68,7 +68,11 @@ function allowed(path: string[], method: string) {
       /^api\/workflow\/[A-Za-z0-9_-]+$/.test(key)
     )
       return true;
-    if (/^api\/episodes\/\d+\/(atoms|review|frame_timestamps)$/.test(key))
+    if (
+      /^api\/episodes\/\d+\/(atoms|review|frame_timestamps|robot-motion)$/.test(
+        key,
+      )
+    )
       return true;
     if (
       /^datasets\/local\/[A-Za-z0-9_-]+\/resolve\/main\/(meta|data|videos)\/.+/.test(

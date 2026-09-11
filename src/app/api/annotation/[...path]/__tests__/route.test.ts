@@ -32,6 +32,17 @@ describe("hosted annotation proxy", () => {
     mock.restore();
   });
 
+  test("allows read-only robot motion and rejects writes to it", async () => {
+    globalThis.fetch = mock(async () =>
+      Response.json({ timestamps: [0] }),
+    ) as typeof fetch;
+    const path = "api/episodes/1/robot-motion";
+    expect((await GET(req(path), ctx(...path.split("/")))).status).toBe(200);
+    expect(
+      (await POST(req(path, { method: "POST" }), ctx(...path.split("/"))))
+        .status,
+    ).toBe(403);
+  });
   test("denies unlisted config paths", async () => {
     const fetchSpy = mock(async () => Response.json({ ok: true }));
     globalThis.fetch = fetchSpy as typeof fetch;

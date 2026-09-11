@@ -393,3 +393,87 @@ Pre-binding experimental runs must be prepared again to obtain that provenance.
 Generation checkpoints each episode, and **Resume unfinished episodes** reuses
 saved prompts/configuration/examples while skipping successful targets and delete
 flags. Each failed attempt is retained separately from successful predictions.
+
+Episode clipping is a reversible review decision. In the annotations timeline,
+drag the red Exclude lane or enter Start/End seconds, then select **Exclude
+interval**. **Preview clipping** skips those source intervals during playback;
+remove an exclusion or use **Clear** to undo it. Boundaries snap to source
+frames and exclude the start frame through (but not including) the end frame.
+At least one frame must remain.
+
+After reviewing affected episodes, use **Export & publish → Preview export**
+to create the clipped copy. Removing 0–1 seconds makes source time 1 second
+the beginning of the output at time zero. Interior cuts join the retained parts
+into one episode. Data rows, RGB videos, tasks, language timestamps and statistics
+are rebuilt together. The export records retained source-frame segments alongside
+the final episode identity mapping; original datasets and prediction history stay
+intact. Changing exclusions invalidates review and any frozen export. The legacy
+**Save dataset** path refuses datasets with exclusions to prevent an untrimmed
+copy being mistaken for the clipped export.
+
+Clipping supports the local v2.1 and v3 numeric/string/RGB-video datasets. Audio,
+depth and embedded-image features are rejected explicitly by the v3 clip writer.
+Ambiguous persistent language states introduced by a cut must be resolved before
+export; tool schemas and valid persistent states are preserved.
+
+### Unified review and retained-dataset export
+
+The top **Review & export** button opens one workflow panel. **Keep remaining**
+changes pending decisions to Keep without altering deletion flags or existing
+reasons. After inspecting prompts and exclusions, tick the verification checkbox
+and select **Mark retained reviewed**. The batch is bound to both the workflow
+revision and a snapshot of the saved labels, exclusions and decisions; stale
+requests do not partially review the dataset.
+
+Choose **GR00T v2.1** or **Rich annotations**, task/subtask instruction mode,
+and a dataset folder name. The GR00T option materializes a standalone retained
+v2.1 dataset directly from the official frozen output, including per-episode
+videos, task vocabulary, modality mapping and statistics. A single task_aug
+prompt overrides the original task on its active timeline. Multiple task
+variants are rejected in task mode so no prompt is chosen silently. RGB videos
+are decoded strictly and re-encoded per episode; robot columns are preserved.
+The rich option preserves official language columns. Both apply deletion and
+exclusion decisions before materializing the selected format.
+
+Leave the HF repository blank for local export, or enter the exact
+namespace/dataset and destination branch (for example `main` or `ver.260909`).
+**Preview export** creates a new independent dataset and displays its counts,
+format, local path (local deployments only), viewer link, destination visibility,
+branch and expected commit. The dataset folder is inside a unique job directory;
+repeating a folder name never overwrites an earlier export. Frozen viewer aliases
+are read-only; edit the review draft and export again to change them.
+
+Publishing requires confirmation of the displayed frozen destination. Changing
+any export option requires a new preview. Existing branch updates use the commit
+observed during preview as the required parent; concurrent changes reject the
+upload. New repository/branch creation happens only on Publish, and repository
+creation uses the displayed visibility. Commit receipts support safe retry after
+a timeout. File hashes and obsolete managed-file absence are checked after
+upload. The resulting Hub link is displayed in the same panel. The target may
+differ from the input repository; immutable source provenance is retained.
+Hosted deployments still require `ANNOTATION_HUB_REPOS` to allow the exact target.
+Local deployments without an allowlist use the authenticated user's Hub access.
+
+Legacy source-bound export/publish APIs remain compatible for older callers;
+the browser uses the explicit-format/destination workflow above.
+
+
+### G1 motion replay and Exclude playhead
+
+The Episodes and Annotations views show a local Unitree G1 body-and-Dex3-hand
+model beside the video. Recordings with missing `robot_type` are recognized by
+G1 joint feature names. `GET /api/episodes/{episode_index}/robot-motion` reads
+all measured `observation.state` rows at their original timestamps, for v2.1
+and v3 datasets. It maps URDF joints by exact names, uses radians without
+clamping measured values to URDF limits, and optionally applies the recorded
+WXYZ `observation.root_orientation`. Commanded actions are not replayed.
+
+The robot shares the video's playback/seek clock; supported browsers report
+that clock at decoded-video cadence. The Exclude lane displays the same
+current-time playhead and label without intercepting interval selection.
+
+Root translation is not recorded in the current datasets: replay uses a fixed
+base position, not an inferred walking trajectory. Orbit and zoom adjust only
+the viewing camera. Model assets are bundled under `public/robots/g1/` and do
+not require an external model host. Missing motion, incompatible joint names,
+asset loading errors, or unavailable WebGL are shown in the replay panel.

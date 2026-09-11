@@ -245,66 +245,34 @@ export function OfficialAnnotationControls() {
   const enabled = (key: string) =>
     (displayed[key] as { enabled?: boolean } | undefined)?.enabled !== false;
   return (
-    <section className="annotation-composer" aria-label="Official annotation">
+    <section className="annotation-generation" aria-label="Official annotation">
       <div className="composer-copy">
-        <span className="section-kicker">Official LeRobot annotation</span>
-        <p>Generate an independent draft and open it for review when ready.</p>
+        <h3>Generate annotations</h3>
         <Link href="/annotate">Prepare another dataset</Link>
       </div>
-      <div className="quick-add" style={{ flexWrap: "wrap" }}>
-        <label>
-          <input
-            type="checkbox"
-            checked={enabled("plan")}
-            disabled={!ready || busy}
-            onChange={(e) => toggleModule("plan", e.target.checked)}
-          />{" "}
-          Subtasks, plans, memory and task phrasings
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={enabled("interjections")}
-            disabled={!ready || busy}
-            onChange={(e) => toggleModule("interjections", e.target.checked)}
-          />{" "}
-          Interjections and speech
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={enabled("vqa")}
-            disabled={!ready || busy}
-            onChange={(e) => toggleModule("vqa", e.target.checked)}
-          />{" "}
-          VQA
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={all}
-            disabled={busy}
-            onChange={(e) => setAll(e.target.checked)}
-          />{" "}
-          All episodes
-        </label>
-        <label style={{ flexBasis: "100%" }}>
-          Example episodes (comma-separated IDs)
-          <input
-            value={exampleEpisodes}
-            disabled={busy}
-            onInput={(e) => setExampleEpisodes(e.currentTarget.value)}
-            placeholder="e.g. 0, 3, 7"
-            aria-label="Example episodes"
-          />
-        </label>
-        <small style={{ flexBasis: "100%" }}>
-          Save and review these episodes first. They are preserved and excluded
-          from generation; all episodes means all remaining episodes.
-        </small>
-        <label style={{ flexBasis: "100%" }}>
+      <div className="generation-actions">
+        <button
+          type="button"
+          className="add-btn"
+          onClick={validate}
+          disabled={busy || !ready}
+        >
+          Validate
+        </button>
+        <button
+          type="button"
+          className="add-btn"
+          onClick={run}
+          disabled={busy || !ready}
+        >
+          {busy ? "Generating…" : "Generate draft"}
+        </button>
+      </div>
+      <form className="generation-fields" onSubmit={(e) => e.preventDefault()}>
+        <label className="annotation-field">
           Task prompt
           <input
+            type="text"
             value={taskPrompt}
             disabled={busy}
             onInput={(e) => setTaskPrompt(e.currentTarget.value)}
@@ -313,7 +281,7 @@ export function OfficialAnnotationControls() {
             }
           />
         </label>
-        <label style={{ flexBasis: "100%" }}>
+        <label className="annotation-field">
           Ordered subtask prompts (one per line)
           <textarea
             value={subtaskPrompts}
@@ -322,17 +290,60 @@ export function OfficialAnnotationControls() {
             rows={3}
           />
         </label>
-        <button
-          className="add-btn"
-          onClick={validate}
-          disabled={busy || !ready}
-        >
-          Validate
-        </button>
-        <button className="add-btn" onClick={run} disabled={busy || !ready}>
-          {busy ? "Generating…" : "Generate draft"}
-        </button>
-        <details style={{ width: "100%" }}>
+        <label className="annotation-field">
+          Example episodes (comma-separated IDs)
+          <input
+            type="text"
+            value={exampleEpisodes}
+            disabled={busy}
+            onInput={(e) => setExampleEpisodes(e.currentTarget.value)}
+            placeholder="e.g. 0, 3, 7"
+            aria-label="Example episodes"
+          />
+        </label>
+        <small>
+          Save and review these episodes first. They are preserved and excluded
+          from generation; all episodes means all remaining episodes.
+        </small>
+        <div className="generation-options">
+          <label>
+            <input
+              type="checkbox"
+              checked={all}
+              disabled={busy}
+              onChange={(e) => setAll(e.target.checked)}
+            />{" "}
+            All episodes
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={enabled("plan")}
+              disabled={!ready || busy}
+              onChange={(e) => toggleModule("plan", e.target.checked)}
+            />{" "}
+            Subtasks, plans, memory and task phrasings
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={enabled("interjections")}
+              disabled={!ready || busy}
+              onChange={(e) => toggleModule("interjections", e.target.checked)}
+            />{" "}
+            Interjections and speech
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={enabled("vqa")}
+              disabled={!ready || busy}
+              onChange={(e) => toggleModule("vqa", e.target.checked)}
+            />{" "}
+            VQA
+          </label>
+        </div>
+        <details>
           <summary>Advanced options</summary>
           <textarea
             aria-label="Official pipeline options"
@@ -342,7 +353,7 @@ export function OfficialAnnotationControls() {
             onChange={(e) => setJson(e.target.value)}
           />
         </details>
-      </div>
+      </form>
       {status && (
         <div className="save-status" role="status">
           {status}

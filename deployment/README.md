@@ -1,3 +1,40 @@
+# Local checkout
+
+The active checkout is `/home/jihun/work/lerobot-dataset-visualizer`.
+Run the launch commands below from that directory. Future feature worktrees
+belong under its `.worktrees/` directory; see [AGENTS.md](../AGENTS.md).
+The annotation backend requires Python 3.12 or newer and the pinned packages
+in `backend/requirements-annotations.txt`.
+
+# Current default: Qwen3.6-27B
+
+The local annotation backend defaults to `Qwen/Qwen3.6-27B` on H100 through the
+loopback SSH tunnel at port 34002. Start the default stack after reboot with
+`bash deployment/start-annotation-local.sh`. Refresh
+http://127.0.0.1:3000/annotate after switching providers. Existing saved jobs
+retain their recorded generation configuration for reproducibility.
+
+# Optional local annotation with Genon
+
+This optional setup for http://127.0.0.1:3000/annotate uses the CPU annotation
+backend at port 7861 and `qwen/qwen3.5-397b-a17b-fp8` at
+`https://api.genon.ai/v1`. No HF Space or local GPU is required. Existing review
+workspace and caches stay under
+`/mnt/data/jihun/datasets/G1_WBT_GR00T/official_annotations`.
+
+The backend-only dotenv file must define `GENON_API_KEY` and
+`LEROBOT_VLM_API_KEY=${GENON_API_KEY}`. Start after reboot from this repository:
+
+```bash
+bash deployment/start-annotation-genon.sh /home/jihun/work/GR00T-WholeBodyControl/.env
+```
+
+The script creates the `lerobot-annotation` tmux session and refuses to replace
+an existing session. It loads the credential file only into the backend.
+Generation sends selected dataset frames to Genon. Dataset publication remains
+an explicit action in the review workflow. Refresh the annotation page after
+switching providers so previously loaded configuration is refreshed.
+
 # Annotation service on h100 GPU 0
 
 The local visualizer and CPU annotation backend use Qwen3.6-27B through an
@@ -95,7 +132,7 @@ Configure these Space secrets:
 
 Configure these runtime variables:
 
-- `ANNOTATION_VLM_API_BASE`: the confirmed Genon OpenAI-compatible HTTPS base URL.
+- `ANNOTATION_VLM_API_BASE=https://api.genon.ai/v1`: the confirmed Genon endpoint.
 - `ANNOTATION_WORKSPACE`: a writable **persistent mounted filesystem**. Configure
   storage before use; temporary container disk is not durable annotation storage.
 - `ANNOTATION_HOSTED_PRIVATE_SPACE=1`: set only after verifying Space visibility.
@@ -111,3 +148,16 @@ The deployment is not complete until the provider URL and image runtime are
 verified, durable storage is configured, and an external-browser review/export
 smoke test passes. The initial mncai creation attempt returned HTTP 402 requiring
 an organization hosting plan; no subscription was purchased or Space created.
+
+Provider verification (2026-09-09): the root `.env` key authenticated successfully
+with HTTP 200 for the configured Qwen model and correctly identified a synthetic
+red image. The supplied `thinking_token_budget=2048` was accepted by the API.
+The pinned official LeRobot client does not expose that provider-specific field;
+its `max_new_tokens` is a total completion limit, not a separate reasoning cap.
+The key was not printed or committed. HF hosting and persistent storage remain
+required before deployment.
+
+The official LeRobot OpenAI client also returned valid image-based JSON
+(`{"color":"#FF0000"}`) without provider-specific request extensions. The smoke
+assertion initially expected the word `red`; the returned hex code is the correct
+color. This checks client compatibility, not episode boundary accuracy.

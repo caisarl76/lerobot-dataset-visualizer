@@ -61,48 +61,64 @@ export default function AnnotatePage() {
     }
   };
   return (
-    <main style={{ maxWidth: 720, margin: "4rem auto", padding: 24 }}>
+    <main className="annotations-skin annotation-prepare-page">
       <h1>Prepare annotation dataset</h1>
       <p>Prepare an independent draft; the source remains unchanged.</p>
-      <select
-        aria-label="Dataset source type"
-        value={kind}
-        onChange={(e) => setKind(e.target.value as typeof kind)}
-        disabled={busy}
-      >
-        <option value="repo_id">Hugging Face repo ID</option>
-        {!hosted && <option value="local_path">Local dataset path</option>}
-      </select>
-      <input
-        aria-label="Dataset source"
-        style={{ width: "100%", marginTop: 12 }}
-        value={source}
-        onChange={(e) => setSource(e.target.value)}
-        placeholder={kind === "repo_id" ? "org/dataset" : "/path/to/dataset"}
-        disabled={busy}
-      />
-      <label>
-        Source revision
-        <input
-          aria-label="Source revision"
-          value={revision}
-          onInput={(e) => setRevision(e.currentTarget.value)}
-          disabled={busy}
-        />
-      </label>
-      <button
-        style={{ marginTop: 12 }}
-        onClick={prepare}
-        disabled={!source.trim() || busy}
-      >
-        {busy ? "Preparing…" : "Prepare draft"}
-      </button>
-      {status && <p>{status}</p>}
+      <div className="annotation-prepare-fields">
+        <label className="annotation-field">
+          Source type
+          <select
+            aria-label="Dataset source type"
+            value={kind}
+            onChange={(e) => setKind(e.target.value as typeof kind)}
+            disabled={busy}
+          >
+            <option value="repo_id">Hugging Face repo ID</option>
+            {!hosted && <option value="local_path">Local dataset path</option>}
+          </select>
+        </label>
+        <label className="annotation-field">
+          Dataset source
+          <input
+            type="text"
+            aria-label="Dataset source"
+            value={source}
+            onChange={(e) => setSource(e.target.value)}
+            placeholder={
+              kind === "repo_id" ? "org/dataset" : "/path/to/dataset"
+            }
+            disabled={busy}
+          />
+        </label>
+        {kind === "repo_id" && (
+          <label className="annotation-field">
+            Source revision
+            <input
+              type="text"
+              aria-label="Source revision"
+              value={revision}
+              onInput={(e) => setRevision(e.currentTarget.value)}
+              disabled={busy}
+            />
+          </label>
+        )}
+        <button
+          className="annotation-prepare-primary"
+          onClick={prepare}
+          disabled={!source.trim() || busy}
+        >
+          {busy ? "Preparing…" : "Prepare draft"}
+        </button>
+      </div>
+      {status && <p role="status">{status}</p>}
       {validationMessages.map((message) => (
         <p key={message}>{message}</p>
       ))}
       {repo && (
-        <a href={`/${repo}/episode_${firstEpisode}?tab=annotations`}>
+        <a
+          className="annotation-prepare-output"
+          href={`/${repo}/episode_${firstEpisode}?tab=annotations`}
+        >
           Review prepared dataset
         </a>
       )}

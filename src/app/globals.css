@@ -148,3 +148,31 @@ body {
   animation: menuPop 0.14s ease-out forwards;
   transform-origin: top right;
 }
+
+.episode-media-with-robot {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: stretch;
+  margin-bottom: 1rem;
+}
+.g1-replay {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+.g1-replay-canvas {
+  position: relative;
+  flex: 1;
+  min-height: 320px;
+}
+@media (max-width: 800px) {
+  .episode-media-with-robot {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .g1-replay-canvas {
+    height: 360px;
+    flex: auto;
+  }
+}
