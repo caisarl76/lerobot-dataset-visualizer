@@ -466,3 +466,453 @@ def attach_relationships(datasets: list[dict], runs: list[dict]) -> list[dict]:
         if any(d["severity"] != "info" for d in row["diagnostics"]):
             row["state"] = "Updating"
     return datasets
+
+
+def _valid_episode_key(key) -> bool:
+    return isinstance(key, str) and key.isascii() and key.isdigit() and str(int(key)) == key
+
+
+def _checkpoint_signature(root: Path) -> tuple:
+    paths = [root / "meta/lerobot_annotations.json", root / "meta/annotation_reviews.json", root / "data"]
+    if (root / "data").is_dir():
+        paths.extend((root / "data").rglob("*.parquet"))
+    return _metadata_signature(root), _signature(root, paths)
+
+
+def _saved_object(path: Path, diagnostics: list) -> dict | None:
+    try:
+        return _json_object(path) if path.exists() else {}
+    except _READ_ERRORS as exc:
+        diagnostics.append(_diag("invalid_review_evidence", f"{path}: {exc}"))
+        return None
+
+
+def _sidecar_atoms(payload: dict) -> list:
+    """Match the editor's saved v2 atoms and legacy v1 conversion."""
+    if not isinstance(payload, dict):
+        raise ValueError("annotation episode must be an object")
+    if payload.get("atoms") is not None:
+        return payload["atoms"]
+    if not any(key in payload for key in ("subtasks", "high_levels")):
+        raise ValueError("annotation episode has no atoms or legacy segments")
+    atoms = []
+    for seg in payload.get("subtasks", []):
+        if "label" in seg and "start" in seg:
+            atoms.append(
+                dict(
+                    role="assistant",
+                    content=str(seg["label"]),
+                    style="subtask",
+                    timestamp=float(seg["start"]),
+                    tool_calls=None,
+                )
+            )
+    for seg in payload.get("high_levels", []):
+        timestamp = float(seg.get("start", 0.0))
+        if seg.get("user_prompt"):
+            atoms.append(
+                dict(
+                    role="user",
+                    content=str(seg["user_prompt"]),
+                    style="interjection",
+                    timestamp=timestamp,
+                    tool_calls=None,
+                )
+            )
+        if seg.get("robot_utterance"):
+            atoms.append(
+                dict(
+                    role="assistant",
+                    content=None,
+                    style=None,
+                    timestamp=timestamp,
+                    tool_calls=[
+                        {
+                            "type": "function",
+                            "function": {"name": "say", "arguments": {"text": str(seg["robot_utterance"])}},
+                        }
+                    ],
+                )
+            )
+    return atoms
+
+
+def _parquet_atoms(rows: list[dict]) -> list[dict]:
+    """Editor fallback: first-row persistent atoms, all events, normalized/deduplicated."""
+    atoms, seen = [], set()
+    for index, row in enumerate(rows):
+        groups = [(row.get("language_events") or [], row.get("timestamp"))]
+        if index == 0:
+            groups.insert(0, (row.get("language_persistent") or [], None))
+        for values, fallback in groups:
+            for raw in values:
+                if not isinstance(raw, dict) or not raw.get("role"):
+                    raise ValueError("invalid language atom")
+                calls = raw.get("tool_calls")
+                if calls is not None and not isinstance(calls, list):
+                    calls = [calls]
+                camera = raw.get("camera")
+                timestamp = raw.get("timestamp")
+                atom = dict(
+                    role=str(raw["role"]),
+                    content=None if raw.get("content") is None else str(raw["content"]),
+                    style=raw.get("style"),
+                    camera=camera if isinstance(camera, str) and camera else None,
+                    tool_calls=calls or None,
+                    timestamp=float(
+                        timestamp if timestamp is not None else fallback if fallback is not None else 0
+                    ),
+                )
+                key = json.dumps(atom, sort_keys=True)
+                if key not in seen:
+                    seen.add(key)
+                    atoms.append(atom)
+    return sorted(atoms, key=lambda atom: (atom["timestamp"], atom.get("style") or "", atom.get("role") or ""))
+
+
+def _episode_tables(root: Path, info: dict, episode_ids, lengths: dict, diagnostics: list) -> dict:
+    """Read only requested episodes; share one column-projected read per data shard.
+
+    The returned rows include timestamps for prompt coverage. Episode identities,
+    rather than global dataset offsets, delimit episodes in shared v3 shards.
+    """
+    import pyarrow.parquet as pq
+
+    result, paths, metadata = {}, {}, {}
+    if not episode_ids:
+        return result
+    if info.get("codebase_version") != "v2.1":
+        for path in sorted((root / "meta/episodes").rglob("*.parquet")):
+            try:
+                rows = pq.read_table(
+                    path, columns=["episode_index", "data/chunk_index", "data/file_index"]
+                ).to_pylist()
+                for row in rows:
+                    metadata[str(row["episode_index"])] = row
+            except _READ_ERRORS as exc:
+                diagnostics.append(_diag("invalid_episode_data", f"{path}: {exc}"))
+    for ep in episode_ids:
+        try:
+            row = metadata.get(ep, {})
+            legacy = info.get("codebase_version") == "v2.1"
+            if not legacy and not row:
+                raise ValueError("missing episode shard metadata")
+            chunks = info.get("chunks_size", 1000)
+            if type(chunks) is not int or chunks <= 0:
+                raise ValueError("invalid chunks_size")
+            rel = info["data_path"].format(
+                episode_index=int(ep),
+                episode_chunk=int(ep) // chunks,
+                chunk_index=row.get("data/chunk_index", 0),
+                file_index=row.get("data/file_index", 0),
+            )
+            path = (root / rel).resolve()
+            if not _inside(path, root):
+                raise ValueError("data path escapes checkpoint")
+            paths.setdefault(path, []).append(ep)
+        except (KeyError, IndexError, AttributeError, *_READ_ERRORS) as exc:
+            diagnostics.append(_diag("invalid_episode_data", f"{root}: episode {ep}: {exc}"))
+    for path, episodes in paths.items():
+        try:
+            names = pq.read_schema(path).names
+            columns = [
+                name
+                for name in ("episode_index", "timestamp", "language_persistent", "language_events")
+                if name in names
+            ]
+            if "episode_index" not in columns:
+                raise ValueError("missing episode_index column")
+            table = pq.read_table(path, columns=columns)
+            grouped = {ep: [] for ep in episodes}
+            for row in table.to_pylist():
+                ep = str(row["episode_index"])
+                if ep in grouped:
+                    grouped[ep].append(row)
+            for ep, rows in grouped.items():
+                if len(rows) != lengths.get(ep) or not rows:
+                    diagnostics.append(
+                        _diag("invalid_episode_data", f"{path}: episode {ep} row count differs from metadata")
+                    )
+                else:
+                    result[ep] = rows
+        except _READ_ERRORS as exc:
+            diagnostics.append(_diag("invalid_episode_data", f"{path}: {exc}"))
+    return result
+
+
+def _review_evidence(run: dict) -> dict:
+    """Batch checkpoint evidence shared by summary and prompt calculations.
+
+    Each retained episode has atoms, exclusions, length and reviewed. None means
+    unreadable evidence; False means a known absent or stale explicit review.
+    """
+    import math
+
+    try:
+        from .annotation_clipping import normalize_exclusions
+        from .annotation_history import annotation_hash, exclusions_hash
+    except ImportError:
+        from annotation_clipping import normalize_exclusions
+        from annotation_history import annotation_hash, exclusions_hash
+
+    root = Path(run["root"])
+    checkpoint = _read_dataset(root)
+    diagnostics = list(checkpoint["diagnostics"])
+    try:
+        info = _json_object(root / "meta/info.json")
+    except _READ_ERRORS:
+        info = {}
+    fps = info.get("fps")
+    if type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0:
+        fps = None
+    saved = _saved_object(root / "meta/lerobot_annotations.json", diagnostics)
+    reviews = _saved_object(root / "meta/annotation_reviews.json", diagnostics)
+    annotations = saved.get("episodes", {}) if saved is not None else None
+    if annotations is not None and not isinstance(annotations, dict):
+        diagnostics.append(_diag("invalid_review_evidence", f"{root}: annotation episodes must be an object"))
+        annotations = None
+    episodes, fallback = {}, []
+    for ep, state in run["episodes"].items():
+        if (
+            not _valid_episode_key(ep)
+            or not isinstance(state, dict)
+            or state.get("decision") not in ("keep", "pending", "delete")
+        ):
+            diagnostics.append(
+                _diag("invalid_episode_state", f"{root}: episode {ep}: invalid identity or decision")
+            )
+            continue
+        if state["decision"] == "delete":
+            continue
+        length = checkpoint["episode_lengths"].get(ep)
+        evidence = dict(state=state, length=length, atoms=None, exclusions=None, reviewed=None)
+        episodes[ep] = evidence
+        try:
+            if length is None:
+                raise ValueError("missing checkpoint frame count")
+            evidence["exclusions"] = normalize_exclusions(state.get("excluded_intervals", []), length)
+        except _READ_ERRORS as exc:
+            diagnostics.append(_diag("invalid_exclusions", f"{root}: episode {ep}: {exc}"))
+        if annotations is not None:
+            if ep in annotations:
+                try:
+                    evidence["atoms"] = _sidecar_atoms(annotations[ep])
+                except (KeyError, AttributeError, *_READ_ERRORS) as exc:
+                    diagnostics.append(_diag("invalid_annotations", f"{root}: episode {ep}: {exc}"))
+            elif length is not None:
+                fallback.append(ep)
+    tables = _episode_tables(root, info, fallback, checkpoint["episode_lengths"], diagnostics)
+    for ep, evidence in episodes.items():
+        try:
+            if ep in tables:
+                evidence["atoms"] = _parquet_atoms(tables[ep])
+            atoms = evidence["atoms"]
+            if not isinstance(atoms, list) or any(
+                not isinstance(atom, dict)
+                or not atom.get("role")
+                or type(atom.get("timestamp")) not in (int, float)
+                or not math.isfinite(atom["timestamp"])
+                for atom in atoms
+            ):
+                raise ValueError("missing or invalid annotation atoms")
+            evidence["annotation_sha256"] = annotation_hash(atoms)
+            if evidence["exclusions"] is None or evidence["length"] is None or reviews is None:
+                continue
+            review = reviews.get(ep, {})
+            if not isinstance(review, dict):
+                raise ValueError("review record must be an object")
+            if any(
+                review.get(key) is not None and not isinstance(review[key], str)
+                for key in ("reviewed_at", "annotation_sha256", "exclusions_sha256")
+            ):
+                raise ValueError("review timestamp and hashes must be strings or null")
+            evidence["exclusions_sha256"] = exclusions_hash(evidence["exclusions"])
+            evidence["reviewed"] = bool(review.get("reviewed_at")) and (
+                review.get("annotation_sha256") == evidence["annotation_sha256"]
+                and review.get("exclusions_sha256", exclusions_hash()) == evidence["exclusions_sha256"]
+            )
+        except (KeyError, AttributeError, *_READ_ERRORS) as exc:
+            evidence["atoms"] = None
+            diagnostics.append(_diag("invalid_review_evidence", f"{root}: episode {ep}: {exc}"))
+    return dict(root=root, info=info, fps=fps, checkpoint=checkpoint, episodes=episodes, diagnostics=diagnostics)
+
+
+def _current_alias(root: Path, workspace: Path, diagnostics: list) -> str | None:
+    aliases = _saved_object(workspace / "local_datasets.json", diagnostics)
+    return next(
+        (
+            alias
+            for alias, path in sorted((aliases or {}).items())
+            if alias.startswith("local/") and _canonical(path) == str(root.resolve())
+        ),
+        None,
+    )
+
+
+def _current_job(run: dict, workspace: Path, diagnostics: list) -> dict | None:
+    job_id = run.get("current_job_id")
+    if job_id is None:
+        return None
+    if not isinstance(job_id, str) or len(job_id) != 32 or any(c not in "0123456789abcdef" for c in job_id):
+        diagnostics.append(_diag("invalid_job", "Current job ID is invalid"))
+        return None
+    path = workspace / "jobs" / (job_id + ".json")
+    try:
+        if not _inside(path, workspace):
+            raise ValueError("job path escapes workspace")
+        return _json_object(path)
+    except _READ_ERRORS as exc:
+        diagnostics.append(_diag("invalid_job", f"{path}: {exc}"))
+        return None
+
+
+def summarize_run(dataset: dict, run: dict, workspace: Path) -> dict:
+    """Summarize one immutable import identity against current checkpoint reviews."""
+    from datetime import datetime, timezone
+
+    workspace = Path(workspace)
+    evidence = _review_evidence(run)
+    root, episodes, diagnostics = evidence["root"], evidence["episodes"], evidence["diagnostics"]
+    states = run["episodes"]
+    decisions = {key: 0 for key in ("keep", "delete", "pending")}
+    originals, identity_complete, decisions_complete = {}, True, True
+    findings = dict(unresolved=0, accepted_advisory=0, generation_failed=0, unreadable=0)
+    for ep, state in states.items():
+        if not isinstance(state, dict):
+            decisions_complete = identity_complete = False
+            findings["unreadable"] += 1
+            continue
+        decision = state.get("decision")
+        if isinstance(decision, str) and decision in decisions:
+            decisions[decision] += 1
+        else:
+            decisions_complete = False
+        if not _valid_episode_key(ep):
+            decisions_complete = False
+        original = state.get("original_episode_index")
+        if not _nonnegative_int(original) or original in originals:
+            identity_complete = False
+            diagnostics.append(
+                _diag(
+                    "invalid_original_episode_id",
+                    f"{root}: episode {ep}: missing, invalid or duplicate original ID",
+                )
+            )
+        else:
+            originals[original] = evidence["checkpoint"]["episode_lengths"].get(ep)
+        if decision != "delete":
+            issues = state.get("issues", [])
+            if not isinstance(issues, list):
+                diagnostics.append(_diag("invalid_episode_state", f"{root}: episode {ep}: issues must be a list"))
+            elif issues:
+                if decision == "keep":
+                    findings["accepted_advisory"] += 1
+                elif decision == "pending":
+                    findings["unresolved"] += 1
+            findings["generation_failed"] += state.get("generation_status") == "failed"
+            findings["unreadable"] += (
+                ep not in episodes
+                or episodes[ep]["atoms"] is None
+                or (
+                    isinstance(issues, list)
+                    and any(
+                        isinstance(issue, dict) and issue.get("code") == "unreadable_episode" for issue in issues
+                    )
+                )
+            )
+    imported = len(states)
+    retained = decisions["keep"] + decisions["pending"] if decisions_complete else None
+    reviewed = (
+        sum(ep["reviewed"] is True for ep in episodes.values())
+        if decisions_complete and all(ep["reviewed"] is not None for ep in episodes.values())
+        else None
+    )
+    exclusions_complete = decisions_complete and all(ep["exclusions"] is not None for ep in episodes.values())
+    exclusions = {"episodes": None, "frames": None}
+    if exclusions_complete:
+        exclusions = dict(
+            episodes=sum(bool(ep["exclusions"]) for ep in episodes.values()),
+            frames=sum(
+                span["end_frame"] - span["start_frame"] for ep in episodes.values() for span in ep["exclusions"]
+            ),
+        )
+    accepted = [ep for ep in episodes.values() if ep["state"]["decision"] == "keep"]
+    accepted_frames = None
+    if decisions_complete and all(ep["length"] is not None and ep["exclusions"] is not None for ep in accepted):
+        accepted_frames = sum(
+            ep["length"] - sum(span["end_frame"] - span["start_frame"] for span in ep["exclusions"])
+            for ep in accepted
+        )
+    accepted_seconds = (
+        accepted_frames / evidence["fps"] if accepted_frames is not None and evidence["fps"] is not None else None
+    )
+    source_complete = dataset.get("state") == "Ready"
+    live = {int(ep): length for ep, length in dataset["episode_lengths"].items()}
+    new_ids = sorted(set(live) - set(originals)) if identity_complete and source_complete else None
+    missing_ids = sorted(set(originals) - set(live)) if identity_complete and source_complete else None
+    changed_ids = (
+        sorted(ep for ep in set(originals) & set(live) if originals[ep] != live[ep])
+        if identity_complete and source_complete and all(length is not None for length in originals.values())
+        else None
+    )
+    if not source_complete:
+        diagnostics.append(
+            _diag("source_metadata_incomplete", "Source metadata is incomplete; growth comparison is unknown")
+        )
+    metadata_changed = any(bool(ids) for ids in (new_ids, missing_ids, changed_ids))
+    source_changed = (
+        True
+        if metadata_changed
+        else False
+        if all(ids is not None for ids in (new_ids, missing_ids, changed_ids))
+        else None
+    )
+    metrics = dict(
+        imported=imported,
+        accepted=decisions["keep"],
+        rejected=decisions["delete"],
+        pending=decisions["pending"],
+        retained=retained,
+        reviewed=reviewed,
+        decision_rate=(decisions["keep"] + decisions["delete"]) / imported
+        if imported and decisions_complete
+        else None,
+        review_rate=reviewed / retained if reviewed is not None and retained else None,
+        new_episode_ids=new_ids,
+        missing_episode_ids=missing_ids,
+        changed_length_ids=changed_ids,
+        accepted_frames=accepted_frames,
+        accepted_seconds=accepted_seconds,
+        counts_complete=not diagnostics and decisions_complete and identity_complete and source_complete,
+    )
+    try:
+        signature = _checkpoint_signature(root)
+    except _READ_ERRORS as exc:
+        signature = None
+        diagnostics.append(_diag("invalid_checkpoint_signature", f"{root}: {exc}"))
+        metrics["counts_complete"] = False
+    public_run = {key: value for key, value in run.items() if not key.startswith("_")}
+    detail_signature = hashlib.sha256(
+        json.dumps([public_run, signature, dataset.get("_signature")], sort_keys=True).encode()
+    ).hexdigest()
+    mtime = run.get("_mtime_ns")
+    updated_at = datetime.fromtimestamp(mtime / 1e9, timezone.utc).isoformat() if mtime is not None else None
+    return dict(
+        run_id=run["run_id"],
+        updated_at=updated_at,
+        current_repo_id=_current_alias(root, workspace, diagnostics),
+        first_retained_episode=min(map(int, episodes)) if episodes and decisions_complete else None,
+        detail_signature=detail_signature,
+        metrics=metrics,
+        findings=findings,
+        exclusions=exclusions,
+        job=_current_job(run, workspace, diagnostics),
+        freshness=dict(
+            publication_state=run.get("publication_state"),
+            metadata_only=True,
+            source_changed=source_changed,
+            local_changes=None,
+            verifiable=False,
+        ),
+        diagnostics=diagnostics,
+    )

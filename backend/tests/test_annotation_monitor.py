@@ -2,8 +2,9 @@ import json
 import os
 from pathlib import Path
 
-from annotation_monitor import attach_relationships, discover_datasets, read_runs
-from monitor_fixtures import write_json, write_run, write_v3, write_v21
+from annotation_history import annotation_hash
+from annotation_monitor import attach_relationships, discover_datasets, read_runs, summarize_run
+from monitor_fixtures import review_fixture as review_fixture, write_json, write_run, write_v3, write_v21
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -433,3 +434,378 @@ def test_confirmed_source_with_unreadable_competing_provenance_stays_ungrouped(
     assert "invalid_provenance" in codes(rows["child"])
     assert rows["child"]["parent_ids"] == []
     assert rows["source"]["child_ids"] == []
+
+
+def test_source_growth_does_not_dilute_imported_review_rate(review_fixture):
+    dataset, run, workspace = review_fixture
+    result = summarize_run(dataset, run, workspace)
+    metrics = result["metrics"]
+    assert (metrics["imported"], metrics["accepted"], metrics["rejected"], metrics["pending"]) == (3, 1, 1, 1)
+    assert metrics["review_rate"] == 1.0
+    assert metrics["decision_rate"] == 2 / 3
+    assert metrics["new_episode_ids"] == [3]
+    assert metrics["accepted_frames"] == 10
+    assert metrics["accepted_seconds"] == 1.0
+    assert metrics["counts_complete"] is True
+    assert result["first_retained_episode"] == 0
+
+
+def test_exclusions_edit_makes_review_stale_and_reduces_duration(review_fixture):
+    dataset, run, workspace = review_fixture
+    run["episodes"]["0"]["excluded_intervals"] = [{"start_frame": 2, "end_frame": 5}]
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] == 1
+    assert result["metrics"]["review_rate"] == 0.5
+    assert result["metrics"]["accepted_frames"] == 7
+    assert result["metrics"]["accepted_seconds"] == 0.7
+    assert result["exclusions"] == {"episodes": 1, "frames": 3}
+
+
+def test_growth_maps_original_ids_and_uses_checkpoint_lengths(review_fixture):
+    dataset, run, workspace = review_fixture
+    run["episodes"]["0"]["original_episode_index"] = 8
+    dataset["episode_lengths"] = {"1": 200, "3": 40}
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["missing_episode_ids"] == [2, 8]
+    assert result["metrics"]["changed_length_ids"] == [1]
+    assert result["metrics"]["new_episode_ids"] == [3]
+    assert result["metrics"]["accepted_frames"] == 10
+    assert result["freshness"]["source_changed"] is True
+
+
+def test_summary_missing_original_identity_is_unknown(review_fixture):
+    dataset, run, workspace = review_fixture
+    del run["episodes"]["0"]["original_episode_index"]
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["new_episode_ids"] is None
+    assert result["metrics"]["counts_complete"] is False
+    assert "invalid_original_episode_id" in codes(result)
+
+
+@pytest.mark.parametrize(
+    "intervals", [[{"start_frame": 0, "end_frame": 10}], [{"start_frame": -1, "end_frame": 3}], None]
+)
+def test_invalid_exclusions_preserve_decisions_but_not_review_or_duration(review_fixture, intervals):
+    dataset, run, workspace = review_fixture
+    run["episodes"]["0"]["excluded_intervals"] = intervals
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["accepted"] == 1
+    assert result["metrics"]["reviewed"] is None
+    assert result["metrics"]["review_rate"] is None
+    assert result["metrics"]["accepted_frames"] is None
+    assert result["exclusions"] == {"episodes": None, "frames": None}
+    assert result["metrics"]["counts_complete"] is False
+
+
+def test_summary_all_deleted_and_zero_imported(review_fixture):
+    dataset, run, workspace = review_fixture
+    for state in run["episodes"].values():
+        state["decision"] = "delete"
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] == 0
+    assert result["metrics"]["review_rate"] is None
+    assert result["metrics"]["accepted_frames"] == 0
+    assert result["first_retained_episode"] is None
+    run["episodes"] = {}
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["imported"] == 0
+    assert result["metrics"]["decision_rate"] is None
+
+
+def test_summary_missing_checkpoint_keeps_decisions_unknown_review(review_fixture):
+    dataset, run, workspace = review_fixture
+    run["root"] = str(workspace / "missing")
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["accepted"] == 1
+    assert result["metrics"]["reviewed"] is None
+    assert result["metrics"]["accepted_seconds"] is None
+    assert result["metrics"]["counts_complete"] is False
+    assert result["diagnostics"]
+
+
+def test_summary_no_run_is_not_invented(tmp_path):
+    source = write_v21(tmp_path / "collection/source", [5])
+    row = discover(source.parent, tmp_path / "workspace")["source"]
+    assert row["runs"] == []
+    assert row["default_run_id"] is None
+
+
+def test_summary_findings_separate_accepted_pending_and_deleted(review_fixture):
+    dataset, run, workspace = review_fixture
+    for state in run["episodes"].values():
+        state["issues"] = [{"code": "warning", "severity": "warning"}]
+        state["generation_status"] = "failed"
+    result = summarize_run(dataset, run, workspace)
+    assert result["findings"] == {"unresolved": 1, "accepted_advisory": 1, "generation_failed": 2, "unreadable": 0}
+
+
+def test_summary_reads_alias_and_persisted_job_without_mutation(review_fixture):
+    dataset, run, workspace = review_fixture
+    write_json(
+        workspace / "local_datasets.json", {"local/exact-current": run["root"], "local/source": dataset["path"]}
+    )
+    run["current_job_id"] = "b" * 32
+    job = {"job_id": run["current_job_id"], "status": "running", "kind": "generate"}
+    write_json(workspace / "jobs" / (run["current_job_id"] + ".json"), job)
+    before = {p: p.read_bytes() for p in workspace.parent.rglob("*") if p.is_file()}
+    result = summarize_run(dataset, run, workspace)
+    after = {p: p.read_bytes() for p in workspace.parent.rglob("*") if p.is_file()}
+    assert before == after
+    assert result["job"] == job
+    assert result["current_repo_id"] == "local/exact-current"
+
+
+def test_summary_signature_changes_for_sidecar_run_and_parquet(review_fixture):
+    dataset, run, workspace = review_fixture
+    previous = summarize_run(dataset, run, workspace)["detail_signature"]
+    run["episodes"]["0"]["decision"] = "pending"
+    current = summarize_run(dataset, run, workspace)["detail_signature"]
+    assert previous != current
+    path = Path(run["root"]) / "data/chunk-000/episode_000000.parquet"
+    os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1000))
+    assert summarize_run(dataset, run, workspace)["detail_signature"] != current
+
+
+def test_summary_real_parquet_fallback_and_sidecar_precedence(review_fixture, monkeypatch):
+    dataset, run, workspace = review_fixture
+    root = Path(run["root"])
+    saved = json.loads((root / "meta/lerobot_annotations.json").read_text())
+    atoms = saved["episodes"].pop("1")["atoms"]
+    write_json(root / "meta/lerobot_annotations.json", saved)
+    path = root / "data/chunk-000/episode_000001.parquet"
+    table = pq.read_table(path)
+    table = table.append_column("language_persistent", pa.array([atoms] * len(table)))
+    events = [{"role": "assistant", "content": "hello", "style": "interjection"}]
+    table = table.append_column("language_events", pa.array([events] + [None] * (len(table) - 1)))
+    pq.write_table(table, path)
+    reviews = json.loads((root / "meta/annotation_reviews.json").read_text())
+    reviews["1"]["annotation_sha256"] = annotation_hash(atoms + [{**events[0], "timestamp": 0.0}])
+    write_json(root / "meta/annotation_reviews.json", reviews)
+    read = pq.read_table
+    reads = []
+
+    def track(path, *args, **kwargs):
+        reads.append(str(path))
+        return read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_table", track)
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] == 2
+    assert reads == [str(path)]
+
+
+@pytest.mark.parametrize("bad", ["atoms", "review", "state", "decision", "fps"])
+def test_summary_malformed_evidence_is_diagnostic(review_fixture, bad):
+    dataset, run, workspace = review_fixture
+    root = Path(run["root"])
+    if bad == "atoms":
+        write_json(root / "meta/lerobot_annotations.json", {"episodes": {"0": {"atoms": [{"timestamp": "bad"}]}}})
+    elif bad == "review":
+        write_json(root / "meta/annotation_reviews.json", {"0": []})
+    elif bad == "state":
+        run["episodes"]["0"] = None
+    elif bad == "decision":
+        run["episodes"]["0"]["decision"] = "unknown"
+    else:
+        info = json.loads((root / "meta/info.json").read_text())
+        info["fps"] = 0
+        write_json(root / "meta/info.json", info)
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["counts_complete"] is False
+    assert result["diagnostics"]
+
+
+def test_summary_unreadable_fallback_never_becomes_reviewed_empty(review_fixture):
+    dataset, run, workspace = review_fixture
+    root = Path(run["root"])
+    (root / "meta/lerobot_annotations.json").unlink()
+    (root / "data/chunk-000/episode_000000.parquet").write_bytes(b"broken")
+    write_json(
+        root / "meta/annotation_reviews.json",
+        {"0": {"reviewed_at": "now", "annotation_sha256": annotation_hash([])}},
+    )
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] is None
+    assert result["findings"]["unreadable"] == 1
+
+
+def test_summary_never_calls_heavy_workflow_paths(review_fixture, monkeypatch):
+    import annotation_runs
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("heavy workflow called")
+
+    monkeypatch.setattr(annotation_runs, "source_inventory", forbidden)
+    import builtins
+
+    original = builtins.__import__
+
+    def guard(name, *args, **kwargs):
+        if name in {"app", "official_annotations"} or "video" in name or "vlm" in name:
+            raise AssertionError(f"heavy import {name}")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guard)
+    dataset, run, workspace = review_fixture
+    assert summarize_run(dataset, run, workspace)["metrics"]["reviewed"] == 2
+
+
+def test_summary_shared_v3_shard_separates_episode_identity(review_fixture, monkeypatch):
+    dataset, run, workspace = review_fixture
+    root = Path(run["root"])
+    saved = json.loads((root / "meta/lerobot_annotations.json").read_text())
+    write_v3(root / "v3", [10, 20, 30])
+    checkpoint = root / "v3"
+    run["root"] = str(checkpoint)
+    tables = []
+    for ep in range(3):
+        path = checkpoint / f"data/chunk-000/file-{ep:03d}.parquet"
+        table = pq.read_table(path)
+        tables.append(
+            table.append_column(
+                "language_persistent", pa.array([saved["episodes"][str(ep)]["atoms"]] * len(table))
+            )
+        )
+    shared = checkpoint / "data/chunk-000/file-000.parquet"
+    pq.write_table(pa.concat_tables(tables), shared)
+    meta_path = checkpoint / "meta/episodes/chunk-000/file-000.parquet"
+    meta = pq.read_table(meta_path)
+    meta = meta.set_column(meta.schema.get_field_index("data/file_index"), "data/file_index", pa.array([0, 0, 0]))
+    pq.write_table(meta, meta_path)
+    write_json(
+        checkpoint / "meta/annotation_reviews.json",
+        json.loads((root / "meta/annotation_reviews.json").read_text()),
+    )
+    read = pq.read_table
+    reads = []
+
+    def track(path, *args, **kwargs):
+        reads.append(str(path))
+        return read(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_table", track)
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] == 2
+    assert reads.count(str(shared)) == 1
+    assert result["metrics"]["accepted_frames"] == 10
+
+
+def test_summary_deleted_exclusions_do_not_poison_retained_counts(review_fixture):
+    dataset, run, workspace = review_fixture
+    run["episodes"]["2"]["excluded_intervals"] = "broken"
+    result = summarize_run(dataset, run, workspace)
+    assert result["exclusions"] == {"episodes": 0, "frames": 0}
+    assert result["metrics"]["counts_complete"] is True
+
+
+def test_summary_no_alias_is_not_registered(review_fixture):
+    dataset, run, workspace = review_fixture
+    assert summarize_run(dataset, run, workspace)["current_repo_id"] is None
+    assert not (workspace / "local_datasets.json").exists()
+
+
+def test_summary_fps_is_checkpoint_fps(review_fixture):
+    dataset, run, workspace = review_fixture
+    info_path = Path(run["root"]) / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["fps"] = 20
+    write_json(info_path, info)
+    assert summarize_run(dataset, run, workspace)["metrics"]["accepted_seconds"] == 0.5
+
+
+def test_summary_absent_review_is_known_unreviewed(review_fixture):
+    dataset, run, workspace = review_fixture
+    (Path(run["root"]) / "meta/annotation_reviews.json").unlink()
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] == 0
+    assert result["metrics"]["review_rate"] == 0
+    assert result["metrics"]["counts_complete"] is True
+
+
+def test_summary_batches_sidecars_once_and_never_enumerates_predictions(review_fixture, monkeypatch):
+    dataset, run, workspace = review_fixture
+    original = Path.read_text
+    counts = {}
+
+    def read(path, *args, **kwargs):
+        assert "annotation_predictions" not in path.parts
+        counts[path.name] = counts.get(path.name, 0) + 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] == 2
+    assert counts["lerobot_annotations.json"] == counts["annotation_reviews.json"] == 1
+
+
+def test_summary_unknown_source_metadata_does_not_claim_missing_episodes(review_fixture):
+    dataset, run, workspace = review_fixture
+    dataset["state"] = "Updating"
+    dataset["episode_lengths"] = {}
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["missing_episode_ids"] is None
+    assert result["freshness"]["source_changed"] is None
+    assert result["metrics"]["counts_complete"] is False
+
+
+@pytest.mark.parametrize("edit", ["annotation", "review"])
+def test_summary_current_hash_requires_annotation_and_explicit_review(review_fixture, edit):
+    dataset, run, workspace = review_fixture
+    root = Path(run["root"])
+    if edit == "annotation":
+        path = root / "meta/lerobot_annotations.json"
+        saved = json.loads(path.read_text())
+        saved["episodes"]["0"]["atoms"][0]["content"] = "changed"
+    else:
+        path = root / "meta/annotation_reviews.json"
+        saved = json.loads(path.read_text())
+        saved["0"]["reviewed_at"] = None
+    write_json(path, saved)
+    assert summarize_run(dataset, run, workspace)["metrics"]["reviewed"] == 1
+
+
+def test_summary_parquet_fallback_matches_editor_hash(review_fixture):
+    import app
+
+    dataset, run, workspace = review_fixture
+    root = Path(run["root"])
+    (root / "meta/lerobot_annotations.json").unlink()
+    path = root / "data/chunk-000/episode_000000.parquet"
+    table = pq.read_table(path)
+    persistent = [{"role": "assistant", "style": "subtask", "content": "pick", "timestamp": 0.0, "camera": ""}]
+    events = [{"role": "assistant", "style": "interjection", "content": "hello", "camera": ""}]
+    table = table.append_column("language_persistent", pa.array([persistent * 2] * len(table)))
+    table = table.append_column("language_events", pa.array([events * 2] * len(table)))
+    pq.write_table(table, path)
+    expected = app._extract_existing_atoms_from_table(table, 0)
+    assert len(expected) == 11
+    write_json(
+        root / "meta/annotation_reviews.json",
+        {"0": {"reviewed_at": "now", "annotation_sha256": annotation_hash(expected)}},
+    )
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] == 1
+    assert result["metrics"]["review_rate"] == 0.5
+
+
+@pytest.mark.parametrize("bad", [[], {}, 42, None])
+def test_summary_malformed_decision_never_raises(review_fixture, bad):
+    dataset, run, workspace = review_fixture
+    run["episodes"]["0"]["decision"] = bad
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["counts_complete"] is False
+    assert result["metrics"]["retained"] is None
+
+
+@pytest.mark.parametrize(
+    "field,value", [("reviewed_at", ["now"]), ("annotation_sha256", []), ("exclusions_sha256", {})]
+)
+def test_summary_malformed_review_fields_are_unknown(review_fixture, field, value):
+    dataset, run, workspace = review_fixture
+    path = Path(run["root"]) / "meta/annotation_reviews.json"
+    reviews = json.loads(path.read_text())
+    reviews["0"][field] = value
+    write_json(path, reviews)
+    result = summarize_run(dataset, run, workspace)
+    assert result["metrics"]["reviewed"] is None
+    assert result["metrics"]["counts_complete"] is False

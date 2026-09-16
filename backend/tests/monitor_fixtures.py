@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 
 def write_json(path, value):
@@ -100,3 +101,29 @@ def write_run(
         },
     }
     return write_json(workspace / "runs" / run_id / "run.json", payload)
+
+
+@pytest.fixture
+def review_fixture(tmp_path):
+    from annotation_history import annotation_hash, exclusions_hash
+    from annotation_monitor import discover_datasets, read_runs
+
+    workspace = tmp_path / "workspace"
+    source = write_v21(tmp_path / "collection/source", [10, 20, 30, 40])
+    checkpoint = write_v21(workspace / "drafts/current", [10, 20, 30])
+    path = write_run(workspace, source, checkpoint, [0, 1, 2])
+    run = json.loads(path.read_text())
+    annotations, reviews = {}, {}
+    for ep, decision in enumerate(("keep", "pending", "delete")):
+        run["episodes"][str(ep)]["decision"] = decision
+        atoms = [{"timestamp": 0.0, "role": "assistant", "style": "subtask", "content": f"pick {ep}"}]
+        annotations[str(ep)] = {"atoms": atoms}
+        reviews[str(ep)] = {
+            "annotation_sha256": annotation_hash(atoms),
+            "exclusions_sha256": exclusions_hash(),
+            "reviewed_at": "2026-09-16T00:00:00Z",
+        }
+    write_json(path, run)
+    write_json(checkpoint / "meta/lerobot_annotations.json", {"version": 2, "episodes": annotations})
+    write_json(checkpoint / "meta/annotation_reviews.json", reviews)
+    return discover_datasets(source.parent, workspace)[0], read_runs(workspace)[0], workspace
