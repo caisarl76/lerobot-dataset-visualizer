@@ -717,7 +717,7 @@ export function DatasetMonitorRow({
               <p>Changed length IDs: {ids(run.metrics.changed_length_ids)}</p>
               <p>Not imported source IDs: {ids(run.metrics.new_episode_ids)}</p>
               <p>
-                Generation job: {run.job?.status ?? "No recorded job"}
+                Current workflow job: {run.job?.status ?? "No recorded job"}
                 {run.job?.error ? ` · ${run.job.error}` : ""}
               </p>
               <p className={styles.muted}>
