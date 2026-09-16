@@ -549,15 +549,6 @@ def _parquet_atoms(rows: list[dict]) -> list[dict]:
             for raw in values:
                 if not isinstance(raw, dict) or not raw.get("role"):
                     raise ValueError("invalid language atom")
-                timestamp = raw.get("timestamp")
-                if timestamp is not None and (type(timestamp) not in (int, float) or not math.isfinite(timestamp)):
-                    raise ValueError("invalid language atom timestamp")
-                if (
-                    raw.get("style") == "subtask"
-                    and not raw.get("tool_calls")
-                    and (not isinstance(raw.get("content"), str) or not raw["content"].strip())
-                ):
-                    raise ValueError("invalid subtask content")
                 calls = raw.get("tool_calls")
                 if calls is not None and not isinstance(calls, list):
                     calls = [calls]
@@ -716,6 +707,7 @@ def _review_evidence(run: dict) -> dict:
         try:
             if ep in tables:
                 evidence["atoms"] = _parquet_atoms(tables[ep])
+                evidence["atoms_from_parquet"] = True
             atoms = evidence["atoms"]
             if not isinstance(atoms, list) or any(
                 not isinstance(atom, dict)
@@ -938,6 +930,25 @@ def _episode_prompt_counts(item: dict, rows: list[dict], fps: float | None) -> t
     except ImportError:
         from annotation_clipping import retained_indices
 
+    # Review hashes use editor-normalized atoms; raw validity affects coverage only.
+    if item.get("atoms_from_parquet"):
+        for index, row in enumerate(rows):
+            groups = [row.get("language_events") or []]
+            if index == 0:
+                groups.append(row.get("language_persistent") or [])
+            for atoms in groups:
+                for raw in atoms:
+                    timestamp = raw.get("timestamp")
+                    if timestamp is not None and (
+                        type(timestamp) not in (int, float) or not math.isfinite(timestamp)
+                    ):
+                        raise ValueError("invalid raw language atom timestamp")
+                    if (
+                        raw.get("style") == "subtask"
+                        and not raw.get("tool_calls")
+                        and (not isinstance(raw.get("content"), str) or not raw["content"].strip())
+                    ):
+                        raise ValueError("invalid raw subtask content")
     if fps is None:
         raise ValueError("prompt durations require a positive finite checkpoint FPS")
     timestamps = [row.get("timestamp") for row in rows]

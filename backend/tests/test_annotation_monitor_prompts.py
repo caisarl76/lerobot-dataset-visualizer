@@ -441,3 +441,49 @@ def test_no_video_or_application_imports_and_workspace_unchanged(prompt_fixture,
     result = monitor.prompt_distribution(run)
     assert counts(result) == {"A": 2, "B": 5}
     assert before == {p.relative_to(parent): p.read_bytes() for p in parent.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("field,value", [("timestamp", "0.3"), ("timestamp", False), ("content", 42)])
+def test_editor_current_review_stays_eligible_when_raw_prompt_is_invalid(prompt_fixture, field, value):
+    import app
+
+    run = prompt_fixture(labels=[[atom("A", 0.3)]], exclusions=[[]])
+    root = Path(run["root"])
+    raw = {**atom("A", 0.3), field: value}
+    replace_column(run, "language_persistent", [[raw]] * 10)
+    normalized = app._extract_existing_atoms_from_table(pq.read_table(data_path(run)), 0)
+    write_json(root / "meta/lerobot_annotations.json", {"episodes": {}})
+    reviews_path = write_json(
+        root / "meta/annotation_reviews.json",
+        {
+            "0": {
+                "annotation_sha256": annotation_hash(normalized),
+                "exclusions_sha256": exclusions_hash(),
+                "reviewed_at": "2026-09-16T00:00:00Z",
+            }
+        },
+    )
+    reviewed_bytes = reviews_path.read_bytes()
+    dataset = monitor.discover_datasets(root.parent, root.parent / "workspace")[0]
+    before = monitor.summarize_run(dataset, run, root.parent / "workspace")
+    assert before["metrics"]["reviewed"] == 1
+    assert before["metrics"]["review_rate"] == 1
+    raw_prompts = monitor.prompt_distribution(run)
+    assert raw_prompts["eligible_episodes"] == 1
+    assert raw_prompts["evaluated_episodes"] == raw_prompts["retained_frames"] == 0
+    assert raw_prompts["unknown_episode_ids"] == ["0"]
+    assert raw_prompts["complete"] is False
+    assert any(d["code"] == "invalid_prompt_evidence" for d in raw_prompts["diagnostics"])
+
+    # Same editor-normalized atoms, same persisted review; only evidence source changes.
+    write_json(root / "meta/lerobot_annotations.json", {"episodes": {"0": {"atoms": normalized}}})
+    after = monitor.summarize_run(dataset, run, root.parent / "workspace")
+    assert after["metrics"]["reviewed"] == before["metrics"]["reviewed"] == 1
+    assert after["metrics"]["review_rate"] == before["metrics"]["review_rate"] == 1
+    sidecar_prompts = monitor.prompt_distribution(run)
+    assert sidecar_prompts["eligible_episodes"] == raw_prompts["eligible_episodes"] == 1
+    assert sidecar_prompts["evaluated_episodes"] == 1
+    assert sidecar_prompts["unknown_episode_ids"] == []
+    assert sidecar_prompts["complete"] is True
+    assert counts(sidecar_prompts) == {"42" if field == "content" else "A": 10 if value is False else 7}
+    assert reviews_path.read_bytes() == reviewed_bytes
