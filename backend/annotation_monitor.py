@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 
@@ -548,6 +549,15 @@ def _parquet_atoms(rows: list[dict]) -> list[dict]:
             for raw in values:
                 if not isinstance(raw, dict) or not raw.get("role"):
                     raise ValueError("invalid language atom")
+                timestamp = raw.get("timestamp")
+                if timestamp is not None and (type(timestamp) not in (int, float) or not math.isfinite(timestamp)):
+                    raise ValueError("invalid language atom timestamp")
+                if (
+                    raw.get("style") == "subtask"
+                    and not raw.get("tool_calls")
+                    and (not isinstance(raw.get("content"), str) or not raw["content"].strip())
+                ):
+                    raise ValueError("invalid subtask content")
                 calls = raw.get("tool_calls")
                 if calls is not None and not isinstance(calls, list):
                     calls = [calls]
@@ -917,3 +927,114 @@ def summarize_run(dataset: dict, run: dict, workspace: Path) -> dict:
         ),
         diagnostics=diagnostics,
     )
+
+
+def _episode_prompt_counts(item: dict, rows: list[dict], fps: float | None) -> tuple:
+    """Resolve latest subtask changes on retained, actual source timestamps."""
+    from collections import Counter
+
+    try:
+        from .annotation_clipping import retained_indices
+    except ImportError:
+        from annotation_clipping import retained_indices
+
+    if fps is None:
+        raise ValueError("prompt durations require a positive finite checkpoint FPS")
+    timestamps = [row.get("timestamp") for row in rows]
+    if (
+        not timestamps
+        or len(timestamps) != item["length"]
+        or any(type(t) not in (int, float) or not math.isfinite(t) or t < 0 for t in timestamps)
+        or any(a >= b for a, b in zip(timestamps, timestamps[1:]))
+    ):
+        raise ValueError("source timestamps must be finite, nonnegative and strictly increasing")
+    changes = {}
+    for atom in item["atoms"]:
+        timestamp = atom["timestamp"]
+        if not timestamps[0] <= timestamp <= timestamps[-1]:
+            raise ValueError("annotation timestamp is outside source frame bounds")
+        if atom.get("style") != "subtask" or atom.get("tool_calls"):
+            continue
+        text = atom.get("content")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("subtask content must be nonempty text")
+        # Exact text is the identity; neither whitespace nor duplicate atoms add labels.
+        changes.setdefault(timestamp, set()).add(text)
+    ordered = sorted(changes.items())
+    kept = retained_indices(item["length"], item["exclusions"])
+    counts = Counter()
+    cursor, active, unlabeled, ambiguous = 0, None, 0, 0
+    for index in kept:
+        while cursor < len(ordered) and ordered[cursor][0] <= timestamps[index]:
+            active = ordered[cursor][1]
+            cursor += 1
+        if active is None:
+            unlabeled += 1
+        elif len(active) > 1:
+            ambiguous += 1
+        else:
+            counts[next(iter(active))] += 1
+    return counts, unlabeled, ambiguous, len(kept)
+
+
+def prompt_distribution(run: dict) -> dict:
+    """Count reviewed, retained subtask frames without reading or changing videos."""
+    evidence = _review_evidence(run)
+    diagnostics = list(evidence["diagnostics"])
+    episodes = evidence["episodes"]
+    eligible = {ep: item for ep, item in episodes.items() if item["reviewed"] is True}
+    unknown = {ep for ep, item in episodes.items() if item["reviewed"] is None}
+    # The shared helper omits malformed states; preserve their unknown coverage here.
+    unknown.update(
+        ep
+        for ep in run["episodes"]
+        if ep not in episodes
+        and (not isinstance(run["episodes"][ep], dict) or run["episodes"][ep].get("decision") != "delete")
+    )
+    tables = _episode_tables(
+        evidence["root"],
+        evidence["info"],
+        eligible,
+        {ep: item["length"] for ep, item in eligible.items()},
+        diagnostics,
+    )
+    result = dict(
+        eligible_episodes=len(eligible),
+        evaluated_episodes=0,
+        unknown_episode_ids=[],
+        retained_frames=0,
+        unlabeled_frames=0,
+        ambiguous_frames=0,
+        complete=False,
+        rows=[],
+        diagnostics=diagnostics,
+    )
+    totals = {}
+    for ep, item in eligible.items():
+        if ep not in tables:
+            unknown.add(ep)
+            continue
+        try:
+            counts, unlabeled, ambiguous, retained = _episode_prompt_counts(item, tables[ep], evidence["fps"])
+        except (KeyError, *_READ_ERRORS) as exc:
+            diagnostics.append(_diag("invalid_prompt_evidence", f"{evidence['root']}: episode {ep}: {exc}"))
+            unknown.add(ep)
+            continue
+        result["evaluated_episodes"] += 1
+        result["retained_frames"] += retained
+        result["unlabeled_frames"] += unlabeled
+        result["ambiguous_frames"] += ambiguous
+        for text, frames in counts.items():
+            row = totals.setdefault(text, dict(text=text, frames=0, seconds=0.0, episodes=0, ratio=None))
+            row["frames"] += frames
+            row["seconds"] += frames / evidence["fps"]
+            row["episodes"] += 1
+    for text in sorted(totals):
+        row = totals[text]
+        row["ratio"] = row["frames"] / result["retained_frames"]
+        result["rows"].append(row)
+    result["unknown_episode_ids"] = sorted(
+        unknown, key=lambda ep: (not _valid_episode_key(ep), int(ep) if _valid_episode_key(ep) else str(ep))
+    )
+    result["complete"] = not unknown
+    return result
