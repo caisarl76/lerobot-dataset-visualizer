@@ -1332,3 +1332,290 @@ def prompt_distribution(run: dict) -> dict:
     )
     result["complete"] = not unknown
     return result
+
+
+class MonitorRootUnavailable(OSError):
+    """The configured collection cannot be enumerated."""
+
+
+def _public(value):
+    if isinstance(value, dict):
+        return {key: _public(item) for key, item in value.items() if not key.startswith("_")}
+    if isinstance(value, (list, tuple)):
+        return [_public(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _now():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _hub_api():
+    from huggingface_hub import HfApi
+
+    return HfApi()
+
+
+class MonitorService:
+    """In-memory, read-only snapshots; filesystem identities are server configured."""
+
+    def __init__(self, root: Path, workspace: Path, *, api_factory=None):
+        from collections import OrderedDict
+        from threading import RLock
+
+        self.root = Path(root).expanduser().resolve()
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.api_factory = api_factory or _hub_api
+        self._lock = RLock()
+        self._snapshot = None
+        self._snapshot_key = None
+        self._details = OrderedDict()
+        self._remote_checks = OrderedDict()
+
+    def _signature(self):
+        """Stat metadata and referenced artifacts, never decode/hash frame or video data."""
+        try:
+            children = sorted(self.root.iterdir())
+            collection = _signature(self.root, [self.root, *children], follow_symlinks=False)
+        except _READ_ERRORS as exc:
+            raise MonitorRootUnavailable(
+                f"Cannot read monitor root {self.root}; check LEROBOT_MONITOR_ROOT and directory permissions."
+            ) from exc
+        entries = [collection]
+
+        def capture(path, operation):
+            try:
+                entries.append((str(path), operation()))
+            except _READ_ERRORS as exc:
+                # A broken folder remains a diagnostic row, not a page-wide failure.
+                entries.append((str(path), type(exc).__name__, str(exc)))
+
+        for path in children:
+            if path.name.startswith(".") or path.name.lower() in _INFRASTRUCTURE:
+                continue
+            if _inside(path, self.root) and not _inside(path, self.workspace):
+                capture(path, lambda path=path: _metadata_signature(path))
+        paths = [self.workspace / "local_datasets.json", self.workspace / "runs", self.workspace / "jobs"]
+        paths.extend((self.workspace / "runs").glob("*/run.json"))
+        paths.extend((self.workspace / "jobs").glob("*.json"))
+        capture(self.workspace, lambda: _signature(self.workspace, paths))
+        for path in paths:
+            if path.name != "run.json" and path.parent.name != "jobs":
+                continue
+            try:
+                if not _inside(path, self.workspace):
+                    continue
+                value = _json_object(path)
+                if path.name == "run.json":
+                    root = _canonical(value.get("root"))
+                    if root:
+                        capture(root, lambda root=root: _checkpoint_signature(Path(root)))
+                    frozen = value.get("export")
+                else:
+                    frozen = value.get("result")
+                if not isinstance(frozen, dict):
+                    continue
+                output = _canonical(frozen.get("export_root"))
+                root = _canonical(frozen.get("local_path")) or _canonical(frozen.get("root"))
+                if root:
+                    capture(root, lambda root=root: _metadata_signature(Path(root)))
+                if output:
+                    output = Path(output)
+                    manifests = [output / "manifest.json", output / "frozen/manifest.json"]
+                    capture(output, lambda: _signature(output, manifests))
+                    if root:
+                        manifest = _json_object(manifests[0])
+                        files = manifest.get("files", {})
+                        if isinstance(files, dict) and "main" in files:
+                            files = files["main"]
+                        if isinstance(files, dict):
+                            root = Path(root)
+                            artifacts = [
+                                root / name
+                                for name in files
+                                if isinstance(name, str) and _inside(root / name, root)
+                            ]
+                            capture(root, lambda: _signature(root, artifacts))
+            except _READ_ERRORS:
+                # The persisted record's stat already invalidates the cache on repair.
+                continue
+        return tuple(entries)
+
+    def _build(self):
+        datasets = discover_datasets(self.root, self.workspace)
+        if any(d.get("code") == "root_unavailable" for row in datasets for d in row["diagnostics"]):
+            raise MonitorRootUnavailable(
+                f"Cannot read monitor root {self.root}; check LEROBOT_MONITOR_ROOT and directory permissions."
+            )
+        runs = read_runs(self.workspace)
+        diagnostics = [run["_diagnostic"] for run in runs if "_diagnostic" in run]
+        datasets = attach_relationships(datasets, runs)
+        for row in datasets:
+            raw_runs = row["runs"]
+            row["runs"], row["publications"], row["exports"] = [], [], []
+            row["_runs"] = {}
+            for run in raw_runs:
+                try:
+                    summary = summarize_run(row, run, self.workspace)
+                    publications = publication_records(run, self.workspace)
+                    exports = export_records(run, self.workspace)
+                    summary["detail_signature"] = hashlib.sha256(
+                        json.dumps([summary["detail_signature"], publications, exports], sort_keys=True).encode()
+                    ).hexdigest()
+                except (KeyError, AttributeError, *_READ_ERRORS) as exc:
+                    row["diagnostics"].append(_diag("invalid_run", f"Run {run['run_id']}: {exc}", "error"))
+                    continue
+                row["runs"].append(summary)
+                row["_runs"][run["run_id"]] = run
+                row["publications"].extend(publications)
+                row["exports"].extend(exports)
+            row["publications"] = list({p["id"]: p for p in row["publications"]}.values())
+            row["exports"] = list({p["id"]: p for p in row["exports"]}.values())
+            row["default_run_id"] = row["runs"][0]["run_id"] if row["runs"] else None
+        return dict(
+            configured=True,
+            root=str(self.root),
+            scanned_at=_now(),
+            updating=False,
+            diagnostics=diagnostics,
+            datasets=datasets,
+        )
+
+    def _get_snapshot(self, *, refresh=False):
+        for _ in range(2):
+            before = self._signature()
+            if not refresh and self._snapshot is not None and before == self._snapshot_key:
+                return self._snapshot
+            result = self._build()
+            after = self._signature()
+            all_diagnostics = result["diagnostics"] + [d for row in result["datasets"] for d in row["diagnostics"]]
+            changing = any(
+                d["code"] in {"metadata_changing", "collection_changing", "runs_changing"} for d in all_diagnostics
+            )
+            if before == after and not changing:
+                self._snapshot, self._snapshot_key = result, after
+                return result
+        from copy import deepcopy
+
+        stale = (
+            deepcopy(self._snapshot)
+            if self._snapshot
+            else dict(configured=True, root=str(self.root), scanned_at=None, diagnostics=[], datasets=[])
+        )
+        stale["updating"] = True
+        stale["diagnostics"].append(
+            _diag(
+                "snapshot_changing", "Metadata changed during both attempts; showing the last consistent snapshot."
+            )
+        )
+        return stale
+
+    def _response(self, value):
+        result = _public(value)
+
+        def attach(item):
+            if isinstance(item, dict):
+                if "remote_check" in item and "id" in item:
+                    item["remote_check"] = _public(self._remote_checks.get(item["id"]))
+                for child in item.values():
+                    attach(child)
+            elif isinstance(item, list):
+                for child in item:
+                    attach(child)
+
+        attach(result)
+        return result
+
+    def summary(self, *, refresh: bool = False) -> dict:
+        with self._lock:
+            return self._response(self._get_snapshot(refresh=refresh))
+
+    def detail(self, dataset_id: str, run_id: str | None = None) -> dict:
+        with self._lock:
+            prior = None
+            for _ in range(2):
+                snapshot = self._get_snapshot()
+                dataset = next((d for d in snapshot["datasets"] if d["id"] == dataset_id), None)
+                if dataset is None:
+                    raise KeyError(dataset_id)
+                selected = run_id if run_id is not None else dataset["default_run_id"]
+                if selected is not None and selected not in dataset["_runs"]:
+                    raise KeyError(selected)
+                key = (dataset_id, selected)
+                prior = self._details.get(key)
+                summary = next((r for r in dataset["runs"] if r["run_id"] == selected), None)
+                signature = summary["detail_signature"] if summary else None
+                if snapshot["updating"]:
+                    break
+                if prior and prior["signature"] == signature:
+                    self._details.move_to_end(key)
+                    return self._response(prior)
+                before = self._signature()
+                if before != self._snapshot_key:
+                    continue
+                run = dataset["_runs"].get(selected)
+                prompts = prompt_distribution(run) if run else None
+                result = dict(
+                    dataset_id=dataset_id,
+                    run_id=selected,
+                    signature=signature,
+                    scanned_at=snapshot["scanned_at"],
+                    updating=False,
+                    metrics=summary["metrics"] if summary else None,
+                    findings=summary["findings"] if summary else None,
+                    exclusions=summary["exclusions"] if summary else None,
+                    prompts=prompts,
+                    publications=publication_records(run, self.workspace) if run else [],
+                    exports=export_records(run, self.workspace) if run else [],
+                    diagnostics=dataset["diagnostics"]
+                    + (summary["diagnostics"] if summary else [])
+                    + (prompts.get("diagnostics", []) if prompts else []),
+                )
+                if before == self._signature():
+                    self._details[key] = result
+                    self._details.move_to_end(key)
+                    while len(self._details) > 32:
+                        self._details.popitem(last=False)
+                    return self._response(result)
+            if prior:
+                result = self._response(prior)
+            else:
+                result = dict(
+                    dataset_id=dataset_id,
+                    run_id=selected,
+                    signature=None,
+                    scanned_at=None,
+                    metrics=None,
+                    findings=None,
+                    exclusions=None,
+                    prompts=None,
+                    publications=[],
+                    exports=[],
+                    diagnostics=[],
+                )
+            result["updating"] = True
+            result["diagnostics"].append(
+                _diag("snapshot_changing", "Metadata is changing; retry after the current update finishes.")
+            )
+            return result
+
+    def check(self, publication_id: str) -> dict:
+        with self._lock:
+            snapshot = self._get_snapshot()
+            publication = next(
+                (p for d in snapshot["datasets"] for p in d["publications"] if p["id"] == publication_id), None
+            )
+            if publication is None or snapshot["updating"]:
+                raise KeyError(publication_id)
+        # Client creation and all network traffic happen after ID validation, outside the lock.
+        result = check_publication(publication, self.api_factory())
+        with self._lock:
+            self._remote_checks[publication_id] = result
+            self._remote_checks.move_to_end(publication_id)
+            while len(self._remote_checks) > 64:
+                self._remote_checks.popitem(last=False)
+            return _public(result)

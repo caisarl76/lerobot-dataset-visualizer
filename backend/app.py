@@ -29,8 +29,9 @@ from pydantic import BaseModel, Field
 
 try:  # Supports both ``import backend.app`` and the legacy ``import app`` entrypoint.
     from . import annotation_history, annotation_runs
-    from .annotation_import_filters import apply_transition_filter
     from .annotation_access import AnnotationAccess, validate_dataset_paths
+    from .annotation_import_filters import apply_transition_filter
+    from .annotation_monitor import MonitorRootUnavailable, MonitorService
     from .curation.assets import LocalAssetService
     from .curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
     from .curation.db import CurationDatabase
@@ -43,8 +44,9 @@ try:  # Supports both ``import backend.app`` and the legacy ``import app`` entry
 except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from annotation_access import AnnotationAccess, validate_dataset_paths
     import annotation_history
-    import annotation_runs
     from annotation_import_filters import apply_transition_filter
+    from annotation_monitor import MonitorRootUnavailable, MonitorService
+    import annotation_runs
     from curation.assets import LocalAssetService
     from curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
     from curation.db import CurationDatabase
@@ -617,6 +619,59 @@ def health() -> JSONResponse:
             "event_styles": sorted(EVENT_ONLY_STYLES),
         }
     )
+
+
+_monitor_instance: MonitorService | None = None
+_monitor_instance_lock = Lock()
+
+
+def _monitor_service() -> MonitorService | None:
+    global _monitor_instance
+    root = os.environ.get("LEROBOT_MONITOR_ROOT")
+    if not root or os.environ.get("ANNOTATION_BACKEND_TOKEN"):
+        return None
+    pair = (Path(root).expanduser().resolve(), EXPORT_ROOT.expanduser().resolve())
+    with _monitor_instance_lock:
+        if _monitor_instance is None or (_monitor_instance.root, _monitor_instance.workspace) != pair:
+            _monitor_instance = MonitorService(*pair)
+        return _monitor_instance
+
+
+@app.get("/api/monitor")
+def monitor_summary(refresh: bool = False):
+    service = _monitor_service()
+    if service is None:
+        return dict(configured=False, root=None, scanned_at=None, updating=False, diagnostics=[], datasets=[])
+    try:
+        return service.summary(refresh=refresh)
+    except MonitorRootUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/monitor/datasets/{dataset_id}")
+def monitor_detail(dataset_id: str, run_id: str | None = None):
+    service = _monitor_service()
+    if service is None:
+        raise HTTPException(status_code=404, detail="Dataset monitor is not configured")
+    try:
+        return service.detail(dataset_id, run_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown dataset or unrelated run") from exc
+    except MonitorRootUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/monitor/publications/{publication_id}/check")
+def monitor_publication_check(publication_id: str):
+    service = _monitor_service()
+    if service is None:
+        raise HTTPException(status_code=404, detail="Dataset monitor is not configured")
+    try:
+        return service.check(publication_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Unknown publication") from exc
+    except MonitorRootUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/dataset/load")
