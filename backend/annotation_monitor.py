@@ -910,15 +910,298 @@ def summarize_run(dataset: dict, run: dict, workspace: Path) -> dict:
         findings=findings,
         exclusions=exclusions,
         job=_current_job(run, workspace, diagnostics),
-        freshness=dict(
-            publication_state=run.get("publication_state"),
-            metadata_only=True,
-            source_changed=source_changed,
-            local_changes=None,
-            verifiable=False,
-        ),
+        freshness=_publication_freshness(run, workspace, source_changed, diagnostics),
         diagnostics=diagnostics,
     )
+
+
+def _record_id(values: list) -> str:
+    return hashlib.sha256(json.dumps(values, separators=(",", ":"), sort_keys=True).encode()).hexdigest()[:24]
+
+
+def _text(value) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _linked_jobs(run: dict, workspace: Path):
+    """Old jobs without a run identity are usable only through current_job_id."""
+    directory = Path(workspace) / "jobs"
+    try:
+        paths = sorted(directory.glob("*.json")) if _inside(directory, workspace) else []
+    except _READ_ERRORS:
+        return
+    for path in paths:
+        try:
+            if not _inside(path, workspace):
+                continue
+            value = _json_object(path)
+            result = value.get("result")
+            if value.get("status") != "completed" or not isinstance(result, dict):
+                continue
+            identities = [v for v in (value.get("run_id"), result.get("run_id")) if v is not None]
+            if any(v != run["run_id"] for v in identities):
+                continue
+            current = path.stem == run.get("current_job_id") and value.get("job_id") == path.stem
+            if identities or current:
+                yield value, result, current
+        except _READ_ERRORS:
+            continue
+
+
+def _publication_receipts(run: dict, workspace: Path):
+    saved = run.get("publication")
+    if isinstance(saved, dict) and saved.get("run_id", run["run_id"]) == run["run_id"]:
+        yield saved, True
+    for job, result, current in _linked_jobs(run, workspace):
+        if job.get("kind") not in (None, "publish", "publication"):
+            continue
+        # Unlabelled jobs must match the actual publisher result, not a source commit.
+        if job.get("kind") is None and not _text(result.get("main_commit")):
+            continue
+        yield result, current and not isinstance(saved, dict)
+
+
+def _publication_identity(receipt: dict) -> tuple | None:
+    values = tuple(_text(receipt.get(key)) for key in ("repo_id", "revision")) + (
+        _text(receipt.get("main_commit")) or _text(receipt.get("commit")),
+    )
+    return values if all(values) else None
+
+
+def _frozen_export(run: dict, frozen: dict) -> tuple[dict, dict | None]:
+    """Read only recorded paths and small manifests; never validate video bytes."""
+    path = _canonical(frozen.get("local_path")) or _canonical(frozen.get("root"))
+    digest = _text(frozen.get("manifest_sha256"))
+    frames = frozen.get("retained_frames")
+    record = dict(
+        id=_record_id([run["run_id"], path, digest]),
+        run_id=run["run_id"],
+        path=path,
+        available=False,
+        format=_text(frozen.get("format")),
+        instruction_mode=_text(frozen.get("instruction_mode")),
+        frames=frames if _nonnegative_int(frames) else None,
+        seconds=None,
+        manifest_sha256=digest,
+        output_repo_id=_text(frozen.get("output_repo_id")),
+    )
+    manifest = None
+    output = _canonical(frozen.get("export_root"))
+    try:
+        if output and digest:
+            raw = (Path(output) / "manifest.json").read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise ValueError("Frozen manifest digest changed")
+            manifest = json.loads(raw)
+            if not isinstance(manifest, dict) or manifest.get("run_id") != run["run_id"]:
+                raise ValueError("Frozen manifest does not belong to this run")
+            nested_digest = manifest.get("frozen_manifest_sha256")
+            if nested_digest:
+                raw_nested = (Path(output) / "frozen/manifest.json").read_bytes()
+                nested = json.loads(raw_nested)
+                if (
+                    hashlib.sha256(raw_nested).hexdigest() != nested_digest
+                    or not isinstance(nested, dict)
+                    or nested.get("run_id") != run["run_id"]
+                    or nested.get("review_sha256") != manifest.get("review_sha256")
+                ):
+                    raise ValueError("Nested frozen manifest does not match delivery")
+            if "destination" in manifest and manifest["destination"] != frozen.get("destination"):
+                raise ValueError("Frozen destination changed")
+            for key in ("format", "instruction_mode"):
+                if key in manifest:
+                    record[key] = _text(manifest[key])
+    except _READ_ERRORS:
+        return record, None
+    try:
+        if path:
+            root = Path(path)
+            if manifest:
+                name = manifest.get("dataset_name", "main")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or Path(name).name != name
+                    or root != (Path(output) / name).resolve()
+                ):
+                    return record, manifest
+            info = _json_object(root / "meta/info.json")
+            if record["frames"] is None and _nonnegative_int(info.get("total_frames")):
+                record["frames"] = info["total_frames"]
+            fps = info.get("fps")
+            if record["frames"] is not None and type(fps) in (int, float) and math.isfinite(fps) and fps > 0:
+                record["seconds"] = record["frames"] / fps
+            files = manifest.get("files") if manifest else None
+            if isinstance(files, dict) and "main" in files:
+                files = files["main"]
+            record["available"] = bool(
+                manifest
+                and isinstance(files, dict)
+                and all(
+                    isinstance(name, str) and _inside(root / name, root) and (root / name).is_file()
+                    for name in files
+                )
+            )
+    except _READ_ERRORS:
+        record["available"] = False
+    return record, manifest
+
+
+def export_records(run: dict, workspace: Path) -> list[dict]:
+    """Return known frozen outputs independently of whether any upload succeeded."""
+    exports = []
+    frozen = run.get("export")
+    if isinstance(frozen, dict):
+        exports.append(frozen)
+    for _, result, _ in _linked_jobs(run, workspace):
+        if _text(result.get("manifest_sha256")) and (
+            _canonical(result.get("local_path")) or _canonical(result.get("root"))
+        ):
+            exports.append(result)
+    records = {}
+    for frozen in exports:
+        record, _ = _frozen_export(run, frozen)
+        records.setdefault(record["id"], record)
+    return list(records.values())
+
+
+def _linked_publication_export(run: dict, receipt: dict, current: bool):
+    frozen = run.get("export")
+    if not isinstance(frozen, dict):
+        return None, None
+    record, manifest = _frozen_export(run, frozen)
+    if manifest is None:
+        return None, None
+    destination = manifest.get("destination")
+    if isinstance(destination, dict) and any(
+        destination.get(key) != receipt.get(key) for key in ("repo_id", "revision")
+    ):
+        return None, None
+    explicit = _text(receipt.get("manifest_sha256"))
+    if explicit:
+        linked = explicit == record["manifest_sha256"]
+    else:
+        linked = (
+            current
+            and run.get("publication_state") == "published"
+            and isinstance(destination, dict)
+            and all(destination.get(key) == receipt.get(key) for key in ("repo_id", "revision"))
+        )
+    return (record, manifest) if linked else (None, None)
+
+
+def publication_records(run: dict, workspace: Path) -> list[dict]:
+    """Preserve recorded commits, attaching export metadata only with proven linkage."""
+    records = {}
+    for receipt, current in _publication_receipts(run, workspace):
+        identity = _publication_identity(receipt)
+        if identity is None:
+            continue
+        record_id = _record_id(list(identity))
+        if record_id in records:
+            continue
+        export, _ = _linked_publication_export(run, receipt, current)
+        urls = receipt.get("urls")
+        records[record_id] = dict(
+            id=record_id,
+            repo_id=identity[0],
+            revision=identity[1],
+            commit=identity[2],
+            url=_text(urls.get("main")) if isinstance(urls, dict) else None,
+            export_path=export["path"] if export else None,
+            export_available=export["available"] if export else False,
+            format=export["format"] if export else None,
+            instruction_mode=export["instruction_mode"] if export else None,
+            exported_frames=export["frames"] if export else None,
+            manifest_sha256=export["manifest_sha256"] if export else None,
+            linked_run_id=run["run_id"],
+            remote_check=None,
+        )
+    return list(records.values())
+
+
+def _publication_freshness(run: dict, workspace: Path, source_changed, diagnostics: list) -> dict:
+    freshness = dict(
+        publication_state=run.get("publication_state"),
+        metadata_only=True,
+        source_changed=source_changed,
+        local_changes=None,
+        verifiable=False,
+    )
+    for receipt, current in _publication_receipts(run, workspace):
+        if not current or _publication_identity(receipt) is None:
+            continue
+        if run.get("publication_state") != "published":
+            freshness["publication_state"] = "unpublished_changes"
+        _, manifest = _linked_publication_export(run, receipt, current)
+        if manifest and _text(manifest.get("review_sha256")):
+            try:
+                try:
+                    from .annotation_publish import _review_digest
+                except ImportError:
+                    from annotation_publish import _review_digest
+                changed = _review_digest(run) != manifest["review_sha256"]
+                freshness.update(local_changes=changed, verifiable=True)
+                if changed:
+                    freshness["publication_state"] = "unpublished_changes"
+            except _READ_ERRORS as exc:
+                diagnostics.append(_diag("publication_freshness_unknown", f"Review digest unavailable: {exc}"))
+        if not freshness["verifiable"]:
+            diagnostics.append(
+                _diag("publication_freshness_unknown", "Publication has no verifiable frozen review link")
+            )
+        break
+    return freshness
+
+
+def check_publication(publication: dict, api) -> dict:
+    """Check one saved dataset revision through an injected, read-only Hub client."""
+    from datetime import datetime, timezone
+
+    from httpx import HTTPError
+    from huggingface_hub.errors import (
+        GatedRepoError,
+        HfHubHTTPError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+
+    result = dict(
+        status="unavailable",
+        checked_at=datetime.now(timezone.utc).isoformat(),
+        current_commit=None,
+        message="Publication receipt is incomplete",
+    )
+    if not all(_text(publication.get(key)) for key in ("repo_id", "revision", "commit")):
+        return result
+    try:
+        info = api.repo_info(
+            publication["repo_id"], repo_type="dataset", revision=publication["revision"], timeout=10
+        )
+        current = _text(getattr(info, "sha", None))
+        if current is None:
+            result["message"] = "Hub returned no revision commit"
+        else:
+            match = current == publication["commit"]
+            result.update(
+                status="match" if match else "changed",
+                current_commit=current,
+                message="Matches recorded commit" if match else "Revision points to a different commit",
+            )
+    except RevisionNotFoundError:
+        result.update(status="missing", message="Recorded revision was not found")
+    except GatedRepoError:
+        result.update(status="access_denied", message="Access to this dataset was denied")
+    except RepositoryNotFoundError:
+        result["message"] = "Repository is missing or inaccessible with the configured credentials"
+    except HfHubHTTPError as exc:
+        if exc.response.status_code in (401, 403):
+            result.update(status="access_denied", message="Access to this dataset was denied")
+        else:
+            result["message"] = "Hub verification is temporarily unavailable"
+    except (OSError, HTTPError):
+        result["message"] = "Hub verification failed or timed out"
+    return result
 
 
 def _episode_prompt_counts(item: dict, rows: list[dict], fps: float | None) -> tuple:
