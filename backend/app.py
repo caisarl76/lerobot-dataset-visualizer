@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 try:  # Supports both ``import backend.app`` and the legacy ``import app`` entrypoint.
     from . import annotation_history, annotation_runs
+    from .annotation_import_filters import apply_transition_filter
     from .annotation_access import AnnotationAccess, validate_dataset_paths
     from .curation.assets import LocalAssetService
     from .curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
@@ -43,6 +44,7 @@ except ImportError:  # pragma: no cover - selected only by ``uvicorn app:app``.
     from annotation_access import AnnotationAccess, validate_dataset_paths
     import annotation_history
     import annotation_runs
+    from annotation_import_filters import apply_transition_filter
     from curation.assets import LocalAssetService
     from curation.config import CurationSettings, curation_is_configured, legacy_browser_origin
     from curation.db import CurationDatabase
@@ -117,6 +119,10 @@ class DatasetRef(BaseModel):
     repo_id: str | None = None
     revision: str | None = None
     local_path: str | None = None
+
+
+class PrepareRequest(DatasetRef):
+    exclude_transition_pauses: bool = True
 
 
 class LoadRequest(DatasetRef):
@@ -916,7 +922,7 @@ def annotation_config() -> dict:
 
 
 @app.post("/api/annotation/prepare")
-def prepare_annotation_dataset(req: DatasetRef) -> dict:
+def prepare_annotation_dataset(req: PrepareRequest) -> dict:
     engine = _official_engine()
     req = _resolve_local_ref(req)
     if not req.local_path and not req.repo_id:
@@ -964,6 +970,22 @@ def prepare_annotation_dataset(req: DatasetRef) -> dict:
         run["preparation_mode"] = result.get("preparation_mode", "ready")
         for ep, record in episode_results.items():
             run["episodes"][ep].update(record)
+        if getattr(req, "exclude_transition_pauses", True):
+            filtering = apply_transition_filter(run, engine)
+            message = (
+                f"Transition filter: excluded {filtering['intervals']} intervals in "
+                f"{filtering['episodes_filtered']} episodes ({filtering['frames_excluded']} frames). "
+                "Review or adjust them on the Exclude timeline."
+            )
+            if filtering.get("skipped_reason"):
+                message = "Transition filter skipped: " + filtering["skipped_reason"] + "."
+            elif filtering["skipped_episodes"]:
+                message += f" Skipped {len(filtering['skipped_episodes'])} unavailable episodes."
+            result["validation"].setdefault("warnings", []).append(message)
+        else:
+            filtering = {"enabled": False}
+        run["import_filters"] = {"transition_pauses": filtering}
+        result["import_filters"] = run["import_filters"]
         run = annotation_runs.RunStore(EXPORT_ROOT).save(run, run["revision"])
         result["run_id"] = run["run_id"]
         return result
@@ -1013,7 +1035,8 @@ def create_annotation_job(req: GenerationRequest) -> dict:
             )
         for ep in req.example_episode_indices:
             atoms = json.loads(get_episode_atoms(ep, local_path=str(state.root)).body)["atoms"]
-            if annotation_history.review_status(state.root, ep, atoms)["status"] != "reviewed":
+            intervals = run["episodes"][str(ep)].get("excluded_intervals", [])
+            if annotation_history.review_status(state.root, ep, atoms, intervals)["status"] != "reviewed":
                 raise HTTPException(422, "Few-shot examples must be explicitly marked reviewed")
         annotations = {ep: ann.atoms for ep, ann in state.annotations.items()}
         annotations = {int(ep): atoms for ep, atoms in json.loads(json.dumps(annotations)).items()}
@@ -1424,6 +1447,48 @@ def _editable_workflow(alias, revision):
     if run["revision"] != revision:
         raise HTTPException(409, "Workflow changed; reload before applying bulk actions")
     return store, run
+
+
+class WorkflowTransitionDetection(WorkflowRevision):
+    include_reviewed: bool = False
+
+
+@app.post("/api/workflow/{alias}/detect-transition-pauses")
+def detect_workflow_transitions(alias: str, payload: WorkflowTransitionDetection):
+    with _annotation_edit_lock:
+        store, run = _editable_workflow(alias, payload.expected_revision)
+        root = Path(run["root"])
+        view = _workflow_payload(run)
+        eligible = {
+            ep: dict(episode)
+            for ep, episode in run["episodes"].items()
+            if episode.get("decision") != "delete"
+            and (payload.include_reviewed or view["episodes"][ep]["review"]["status"] != "reviewed")
+        }
+        # Generation failures do not imply unreadable robot data. The filter
+        # checks data validity independently and skips unavailable episodes.
+        for episode in eligible.values():
+            if episode.get("generation_status") == "failed":
+                episode["generation_status"] = "pending"
+        filtered = {**run, "episodes": eligible}
+        summary = apply_transition_filter(filtered, _official_engine())
+        changed = []
+        for ep, episode in eligible.items():
+            intervals = episode.get("excluded_intervals", [])
+            if intervals != run["episodes"][ep].get("excluded_intervals", []):
+                run["episodes"][ep]["excluded_intervals"] = intervals
+                run["episodes"][ep]["transition_filter_intervals"] = episode["transition_filter_intervals"]
+                changed.append(ep)
+        if changed:
+            run["publication_state"] = "draft"
+            run.pop("export", None)
+            run = store.save(run, payload.expected_revision)
+            reviews = annotation_history.read_reviews(root)
+            for ep in changed:
+                reviews.pop(ep, None)
+            annotation_history.write_reviews(root, reviews)
+        return {**_workflow_payload(run), "transition_detection": {
+            **summary, "episodes_changed": len(changed), "episodes_considered": len(eligible)}}
 
 
 @app.post("/api/workflow/{alias}/keep-remaining")

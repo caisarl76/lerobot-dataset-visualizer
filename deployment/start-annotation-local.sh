@@ -13,7 +13,7 @@ if tmux has-session -t lerobot-annotation 2>/dev/null; then
   exit 1
 fi
 tmux new-session -d -s lerobot-annotation -n tunnel \
-  "ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -L 127.0.0.1:34002:127.0.0.1:34002 h100 > '$logs/tunnel.log' 2>&1"
+  "bash '$PWD/deployment/annotation-vlm-tunnel.sh' > '$logs/tunnel.log' 2>&1"
 tmux new-window -t lerobot-annotation -n backend \
   "cd '$PWD'; LEROBOT_ANNOTATE_CONFIG='$LEROBOT_ANNOTATE_CONFIG' LEROBOT_ANNOTATE_EXPORT='$LEROBOT_ANNOTATE_EXPORT' LEROBOT_ANNOTATE_CACHE='$LEROBOT_ANNOTATE_CACHE' LEROBOT_ANNOTATE_BROWSER_ORIGIN='$LEROBOT_ANNOTATE_BROWSER_ORIGIN' backend/.venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 7861 > '$logs/backend.log' 2>&1"
 tmux new-window -t lerobot-annotation -n ui \

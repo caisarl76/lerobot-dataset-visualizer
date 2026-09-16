@@ -746,3 +746,116 @@ test("links the durable checkpoint and resumes only unfinished episodes", async 
     resume_unfinished: true,
   });
 });
+
+test("transition detection defaults to unreviewed and supports explicit reviewed inclusion", async () => {
+  const request = spyOn(client, "detectWorkflowTransitions").mockResolvedValue({
+    ...run(),
+    transition_detection: { episodes_changed: 2, episodes_considered: 2 },
+  } as client.WorkflowRun);
+  const ui = view();
+  await ready(ui);
+  expect(
+    (ui.getByLabelText("Include reviewed episodes") as HTMLInputElement)
+      .checked,
+  ).toBe(false);
+  fireEvent.click(ui.getByRole("button", { name: "Detect transition pauses" }));
+  await waitFor(() =>
+    expect(request).toHaveBeenCalledWith("annotation-demo", {
+      expected_revision: 3,
+      include_reviewed: false,
+    }),
+  );
+  await ui.findByText(
+    "Updated exclusions in 2 episodes. Review them on the Exclude timeline.",
+  );
+  await ready(ui);
+  fireEvent.click(ui.getByLabelText("Include reviewed episodes"));
+  fireEvent.click(ui.getByRole("button", { name: "Detect transition pauses" }));
+  await waitFor(() =>
+    expect(request).toHaveBeenLastCalledWith("annotation-demo", {
+      expected_revision: 3,
+      include_reviewed: true,
+    }),
+  );
+});
+
+test("generated episodes show generation separately from pending review decisions", async () => {
+  const snapshot = run() as client.WorkflowRun;
+  snapshot.episodes["0"].generation_status = "generated";
+  snapshot.episodes["0"].decision = "pending";
+  spyOn(client, "fetchWorkflow").mockResolvedValue(snapshot);
+  const ui = view();
+  await ready(ui);
+  expect(ui.getByText("Generation: generated")).toBeTruthy();
+  expect(ui.getByText("Review decision: pending")).toBeTruthy();
+  expect(ui.getByRole("heading", { name: "Episode 0" })).toBeTruthy();
+});
+
+test("job polling replaces running text with completion and refreshed episode state", async () => {
+  const snapshot = run() as client.WorkflowRun;
+  snapshot.current_job_id = "status-job";
+  const finished = structuredClone(snapshot);
+  finished.episodes["0"].generation_status = "generated";
+  spyOn(client, "fetchWorkflow")
+    .mockResolvedValueOnce(snapshot)
+    .mockResolvedValue(finished);
+  spyOn(client, "getAnnotationJob")
+    .mockResolvedValueOnce({ job_id: "status-job", status: "running" })
+    .mockResolvedValue({ job_id: "status-job", status: "completed" });
+  const ui = view();
+  await ui.findByText("Job running…");
+  await waitFor(() => expect(ui.getByText("Job completed.")).toBeTruthy(), {
+    timeout: 3000,
+  });
+  expect(ui.queryByText("Job running…")).toBeNull();
+  expect(ui.getByText("Generation: generated")).toBeTruthy();
+});
+
+for (const initiallyRunning of [false, true]) {
+  test(`opens completed checkpoint from an older URL (polling=${initiallyRunning})`, async () => {
+    const snapshot = { ...run(), current_job_id: "checkpoint-job",
+      current_repo_id: "local/annotation-latest" } as client.WorkflowRun;
+    spyOn(client, "fetchWorkflow").mockResolvedValue(snapshot);
+    const job = spyOn(client, "getAnnotationJob");
+    if (initiallyRunning) job.mockResolvedValueOnce({ job_id: "checkpoint-job", status: "running" });
+    job.mockResolvedValue({ job_id: "checkpoint-job", status: "completed" });
+    const replace = spyOn(window.location, "replace").mockImplementation(() => {});
+    const ui = view();
+    await waitFor(() => expect(replace).toHaveBeenCalledWith(
+      "/local/annotation-latest/episode_0?tab=annotations",
+    ), { timeout: 3000 });
+    ui.unmount();
+  });
+}
+
+test("does not reload an already current checkpoint", async () => {
+  spyOn(client, "fetchWorkflow").mockResolvedValue({ ...run(),
+    current_job_id: "checkpoint-job", current_repo_id: "local/annotation-demo",
+  } as client.WorkflowRun);
+  spyOn(client, "getAnnotationJob").mockResolvedValue({ job_id: "checkpoint-job", status: "completed" });
+  const replace = spyOn(window.location, "replace").mockImplementation(() => {});
+  const ui = view();
+  await ui.findByText("Job completed.");
+  expect(replace).not.toHaveBeenCalled();
+});
+
+function UnsavedEdit() {
+  const { updateAtom } = useAnnotations();
+  return <button onClick={() => updateAtom(0, { content: "Manual edit" })}>Make unsaved edit</button>;
+}
+test("completed checkpoint does not discard unsaved edits", async () => {
+  const snapshot = { ...run(), current_job_id: "checkpoint-job",
+    current_repo_id: "local/annotation-latest" } as client.WorkflowRun;
+  const pending = deferred<client.WorkflowRun>();
+  spyOn(client, "fetchWorkflow").mockReturnValue(pending.promise);
+  spyOn(client, "getAnnotationJob").mockResolvedValue({ job_id: "checkpoint-job", status: "completed" });
+  const replace = spyOn(window.location, "replace").mockImplementation(() => {});
+  const ui = render(<AnnotationsProvider><TimeProvider duration={2}>
+    <Editor repoId="local/annotation-demo" /><UnsavedEdit />
+  </TimeProvider></AnnotationsProvider>);
+  fireEvent.click(ui.getByRole("button", { name: "Make unsaved edit" }));
+  await act(async () => pending.resolve(snapshot));
+  await ui.findByRole("link", { name: "Open current checkpoint" });
+  expect(replace).not.toHaveBeenCalled();
+  expect(ui.getByRole("link", { name: "Open current checkpoint" })).toBeTruthy();
+});

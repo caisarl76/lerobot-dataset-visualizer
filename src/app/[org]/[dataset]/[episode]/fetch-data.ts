@@ -122,6 +122,65 @@ type ColumnDef = {
   value: string[];
 };
 
+const CHARTABLE_NUMERIC_DTYPES = new Set([
+  "float16",
+  "float32",
+  "float64",
+  "int8",
+  "int16",
+  "int32",
+  "int64",
+  "uint8",
+  "uint16",
+  "uint32",
+  "uint64",
+  "bool",
+  "boolean",
+]);
+
+function isChartableNumericFeature(
+  feature: DatasetMetadata["features"][string],
+): boolean {
+  return (
+    CHARTABLE_NUMERIC_DTYPES.has(feature.dtype.toLowerCase()) &&
+    feature.shape.length === 1
+  );
+}
+
+function featureNames(feature: DatasetMetadata["features"][string]): unknown {
+  let columnNames: unknown = feature.names;
+  while (typeof columnNames === "object" && columnNames !== null) {
+    if (Array.isArray(columnNames)) break;
+    columnNames = Object.values(columnNames)[0];
+  }
+  return columnNames;
+}
+
+export function buildChartColumnDefsForFeatures(
+  features: DatasetMetadata["features"],
+  excludedColumns: readonly string[],
+): ColumnDef[] {
+  return Object.entries(features)
+    .filter(
+      ([key, feature]) =>
+        isChartableNumericFeature(feature) && !excludedColumns.includes(key),
+    )
+    .map(([key, feature]) => {
+      const columnNames = featureNames(feature);
+      return {
+        key,
+        value: Array.isArray(columnNames)
+          ? columnNames.map(
+              (name: string) => `${key}${SERIES_NAME_DELIMITER}${name}`,
+            )
+          : Array.from(
+              { length: feature.shape[0] || 1 },
+              (_, i) => `${key}${CHART_CONFIG.SERIES_NAME_DELIMITER}${i}`,
+            ),
+      };
+    });
+}
+
 function parsePositiveIntEnv(
   value: string | undefined,
   fallback: number,
@@ -512,37 +571,12 @@ async function getEpisodeDataV2(
           })
       : [];
 
-  // Column data
-  const columnNames = Object.entries(info.features)
-    .filter(
-      ([, value]) =>
-        ["float32", "int32"].includes(value.dtype) && value.shape.length === 1,
-    )
-    .map(([key, { shape }]) => ({ key, length: shape[0] }));
-
   // Exclude specific columns
   const excludedColumns = EXCLUDED_COLUMNS.V2 as readonly string[];
-  const filteredColumns = columnNames.filter(
-    (column) => !excludedColumns.includes(column.key),
+  const columns = buildChartColumnDefsForFeatures(
+    info.features,
+    excludedColumns,
   );
-  const columns: ColumnDef[] = filteredColumns.map(({ key }) => {
-    let column_names: unknown = info.features[key].names;
-    while (typeof column_names === "object" && column_names !== null) {
-      if (Array.isArray(column_names)) break;
-      column_names = Object.values(column_names)[0];
-    }
-    return {
-      key,
-      value: Array.isArray(column_names)
-        ? column_names.map(
-            (name: string) => `${key}${SERIES_NAME_DELIMITER}${name}`,
-          )
-        : Array.from(
-            { length: columnNames.find((c) => c.key === key)?.length ?? 1 },
-            (_, i) => `${key}${CHART_CONFIG.SERIES_NAME_DELIMITER}${i}`,
-          ),
-    };
-  });
 
   const parquetUrl = buildVersionedUrl(
     repoId,
@@ -562,7 +596,7 @@ async function getEpisodeDataV2(
       "task",
       "task_index",
       "language_instruction",
-      ...filteredColumns.map((c) => c.key),
+      ...columns.map((c) => c.key),
     ]),
   );
   const allData = await readParquetAsObjects(arrayBuffer, parquetColumns);
@@ -658,7 +692,8 @@ async function getEpisodeDataV2(
   const ignoredColumns = Object.entries(info.features)
     .filter(
       ([, value]) =>
-        ["float32", "int32"].includes(value.dtype) && value.shape.length > 1,
+        CHARTABLE_NUMERIC_DTYPES.has(value.dtype.toLowerCase()) &&
+        value.shape.length > 1,
     )
     .map(([key]) => key);
 
@@ -1103,31 +1138,10 @@ function processEpisodeDataForCharts(
   const excludedColumns = EXCLUDED_COLUMNS.V3 as readonly string[];
 
   // Create columns structure similar to V2.1 for proper hierarchical naming
-  const columns: ColumnDef[] = Object.entries(info.features)
-    .filter(
-      ([key, value]) =>
-        ["float32", "int32"].includes(value.dtype) &&
-        value.shape.length === 1 &&
-        !excludedColumns.includes(key),
-    )
-    .map(([key, feature]) => {
-      let column_names: unknown = feature.names;
-      while (typeof column_names === "object" && column_names !== null) {
-        if (Array.isArray(column_names)) break;
-        column_names = Object.values(column_names)[0];
-      }
-      return {
-        key,
-        value: Array.isArray(column_names)
-          ? column_names.map(
-              (name: string) => `${key}${SERIES_NAME_DELIMITER}${name}`,
-            )
-          : Array.from(
-              { length: feature.shape[0] || 1 },
-              (_, i) => `${key}${CHART_CONFIG.SERIES_NAME_DELIMITER}${i}`,
-            ),
-      };
-    });
+  const columns = buildChartColumnDefsForFeatures(
+    info.features,
+    excludedColumns,
+  );
 
   // First, extract all series from the first data row to understand the structure
   if (episodeData.length > 0) {
@@ -1232,7 +1246,8 @@ function processEpisodeDataForCharts(
     ...Object.entries(info.features)
       .filter(
         ([, value]) =>
-          ["float32", "int32"].includes(value.dtype) && value.shape.length > 2, // Only ignore 3D+ data
+          CHARTABLE_NUMERIC_DTYPES.has(value.dtype.toLowerCase()) &&
+          value.shape.length > 2, // Only ignore 3D+ data
       )
       .map(([key]) => key),
     ...excludedColumns, // Also include the manually excluded columns
@@ -2496,6 +2511,16 @@ export async function loadEpisodeFlatChartData(
   info: DatasetMetadata,
   episodeId: number,
 ): Promise<Record<string, number>[]> {
+  if (version !== "v3.0" && version !== "v3.1") {
+    const { flatChartData } = await getEpisodeDataV2(
+      repoId,
+      version,
+      info,
+      episodeId,
+    );
+    return flatChartData;
+  }
+
   const episodeMetadata = await loadEpisodeMetadataV3Simple(
     repoId,
     version,

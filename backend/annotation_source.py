@@ -52,7 +52,8 @@ def _trim_video(source, target, frame_indices, fps):
         with av.open(str(target), mode="w") as out:
             out_stream = out.add_stream("libx264", rate=fps)
             out_stream.width, out_stream.height, out_stream.pix_fmt = width, height, "yuv420p"
-            out_stream.time_base = Fraction(1, int(round(fps)))
+            frame_time_base = Fraction(1, int(round(fps)))
+            out_stream.time_base = frame_time_base
             out_stream.codec_context.max_b_frames = 0
             output_index = 0
             for input_index, frame in enumerate(inp.decode(stream)):
@@ -60,7 +61,9 @@ def _trim_video(source, target, frame_indices, fps):
                     continue
                 packet_frame = av.VideoFrame.from_ndarray(frame.to_ndarray(format="rgb24"), format="rgb24")
                 packet_frame.pts = output_index
-                packet_frame.time_base = out_stream.time_base
+                # MP4 muxing may change the stream time base after the first packet.
+                # Input frame indices must keep using the original frame clock.
+                packet_frame.time_base = frame_time_base
                 for packet in out_stream.encode(packet_frame):
                     out.mux(packet)
                 output_index += 1

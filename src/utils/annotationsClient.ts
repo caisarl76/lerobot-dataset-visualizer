@@ -197,6 +197,11 @@ export type WorkflowRun = {
     raw_url?: string;
     urls?: { main?: string; rich?: string; raw?: string };
   };
+  transition_detection?: {
+    episodes_changed: number;
+    episodes_considered: number;
+    skipped_reason?: string;
+  };
   export?: {
     manifest_sha256: string;
     retained_episodes: number;
@@ -219,6 +224,19 @@ export type WorkflowRun = {
     } | null;
   };
 };
+
+export async function detectWorkflowTransitions(
+  alias: string,
+  body: { expected_revision: number; include_reviewed: boolean },
+): Promise<WorkflowRun> {
+  return annotationRequest(
+    `/api/workflow/${encodeURIComponent(alias)}/detect-transition-pauses`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    },
+  ) as Promise<WorkflowRun>;
+}
 
 export async function fetchWorkflow(alias: string): Promise<WorkflowRun> {
   return annotationRequest(

@@ -1,18 +1,19 @@
 import hashlib
 import json
 
-from annotation_source import align_source_v21
+from annotation_source import _trim_video, align_source_v21
 import av
+from groot_materialize import _episode_video
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 
-def _video(path, values):
+def _video(path, values, fps=4):
     path.parent.mkdir(parents=True, exist_ok=True)
     with av.open(str(path), "w") as container:
-        stream = container.add_stream("mpeg4", rate=4)
+        stream = container.add_stream("mpeg4", rate=fps)
         stream.width, stream.height, stream.pix_fmt = 16, 12, "yuv420p"
         for value in values:
             frame = av.VideoFrame.from_ndarray(np.full((12, 16, 3), value, np.uint8), format="rgb24")
@@ -133,3 +134,32 @@ def test_prefix_tail_and_single_retained_frame(source, tmp_path, kept):
     for camera in ["left", "right"]:
         with av.open(str(out / f"videos/chunk-000/observation.images.{camera}/episode_000000.mp4")) as container:
             assert len(list(container.decode(video=0))) == len(kept)
+
+
+@pytest.mark.parametrize("fps", [30, 50])
+@pytest.mark.parametrize("export_stage", ["clipping", "groot"])
+def test_long_clip_preserves_frames_and_continuous_timestamps(tmp_path, fps, export_stage):
+    source = tmp_path / "long-source.mp4"
+    values = list(range(200))
+    _video(source, values, fps)
+    selected = list(range(20, 90)) + list(range(110, 200))
+    target = tmp_path / "clipped.mp4"
+
+    if export_stage == "clipping":
+        _trim_video(source, target, selected, fps)
+    else:
+        selected = list(range(20, 180))
+        _episode_video(
+            source, target, [i / fps for i in range(len(selected))],
+            20 / fps, 180 / fps, fps, [12, 16, 3],
+        )
+
+    with av.open(str(target)) as container:
+        frames = list(container.decode(video=0))
+        assert len(frames) == len(selected)
+        assert [float(frame.time) for frame in frames] == pytest.approx(
+            [i / fps for i in range(len(selected))]
+        )
+        assert [float(frame.to_ndarray(format="rgb24").mean()) for frame in frames] == pytest.approx(
+            [values[i] for i in selected], abs=8
+        )

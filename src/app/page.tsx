@@ -23,6 +23,10 @@ const EXAMPLE_DATASETS = [
 function HomeInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
+  const localAllowed = Boolean(
+    process.env.NEXT_PUBLIC_ANNOTATE_BACKEND_URL &&
+    !process.env.NEXT_PUBLIC_ANNOTATE_BACKEND_URL.startsWith("/"),
+  );
 
   // Handle redirects with useEffect instead of direct redirect
   useEffect(() => {
@@ -67,6 +71,7 @@ function HomeInner() {
   }, []);
 
   const [query, setQuery] = useState("");
+  const [inputMode, setInputMode] = useState<"hf" | "local">("hf");
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
@@ -74,7 +79,18 @@ function HomeInner() {
   const [hasFetched, setHasFetched] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  const looksLocal =
+    query.trim().startsWith("/") || query.trim().startsWith("~/");
+  const localInput = localAllowed && (inputMode === "local" || looksLocal);
+
   useEffect(() => {
+    if (localInput || looksLocal) {
+      setSuggestions([]);
+      setShowSuggestions(false);
+      setIsLoading(false);
+      setHasFetched(false);
+      return;
+    }
     if (!query.trim()) {
       setSuggestions([]);
       setShowSuggestions(false);
@@ -85,6 +101,7 @@ function HomeInner() {
     setIsLoading(true);
     setHasFetched(false);
     setShowSuggestions(true);
+    let cancelled = false;
     const timer = setTimeout(async () => {
       try {
         const url = `https://huggingface.co/api/quicksearch?q=${encodeURIComponent(query)}&type=dataset`;
@@ -96,17 +113,23 @@ function HomeInner() {
         const ids: string[] = (
           (data.datasets as { id: string }[] | undefined) ?? []
         ).map((d) => d.id);
+        if (cancelled) return;
         setSuggestions(ids);
         setActiveIndex(-1);
       } catch {
+        if (cancelled) return;
         setSuggestions([]);
       } finally {
+        if (cancelled) return;
         setIsLoading(false);
         setHasFetched(true);
       }
     }, 150);
-    return () => clearTimeout(timer);
-  }, [query]);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [localInput, looksLocal, query]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -131,6 +154,14 @@ function HomeInner() {
 
   const handleSubmit = (e: { preventDefault: () => void }) => {
     e.preventDefault();
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) return;
+    if (localInput) {
+      setShowSuggestions(false);
+      router.push(`/annotate?local_path=${encodeURIComponent(trimmedQuery)}`);
+      return;
+    }
+    if (looksLocal) return;
     const target =
       activeIndex >= 0 && suggestions[activeIndex]
         ? suggestions[activeIndex]
@@ -182,12 +213,38 @@ function HomeInner() {
 
         {/* Subtitle */}
         <p className="text-white/55 text-base md:text-lg mb-8 max-w-md">
-          Explore and visualize robot learning datasets from Hugging Face
+          Explore robot learning datasets from Hugging Face
+          {localAllowed ? " or a local directory" : ""}
         </p>
 
         {/* Search form */}
-        <form onSubmit={handleSubmit} className="flex gap-2 justify-center">
-          <div ref={containerRef} className="relative">
+        <div className="flex flex-wrap items-center justify-center gap-2 mb-3 text-sm">
+          <span className="text-white/80">Open a dataset from</span>
+          <button
+            type="button"
+            aria-pressed={inputMode === "hf"}
+            onClick={() => setInputMode("hf")}
+            className={`rounded-full px-3 py-1 ${inputMode === "hf" ? "bg-white/15 text-white" : "text-white/60 hover:text-white"}`}
+          >
+            Hugging Face
+          </button>
+          {localAllowed && (
+            <button
+              type="button"
+              aria-pressed={inputMode === "local"}
+              onClick={() => setInputMode("local")}
+              className={`rounded-full border border-white/25 px-3 py-1 ${inputMode === "local" ? "bg-cyan-500/30 text-white" : "text-white/75 hover:text-white"}`}
+            >
+              Local directory
+            </button>
+          )}
+        </div>
+
+        <form
+          onSubmit={handleSubmit}
+          className="flex w-full max-w-xl gap-2 justify-center"
+        >
+          <div ref={containerRef} className="relative min-w-0 flex-1">
             {/* Search icon */}
             <svg
               className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 pointer-events-none"
@@ -209,14 +266,28 @@ function HomeInner() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={handleKeyDown}
-              onFocus={() => query.trim() && setShowSuggestions(true)}
-              placeholder="Enter dataset id (e.g. lerobot/pusht)"
-              className="pl-10 pr-4 py-2.5 rounded-md text-base text-white bg-white/10 backdrop-blur-sm border border-white/30 focus:outline-none focus:border-cyan-400 focus:bg-white/15 w-[380px] shadow-md placeholder:text-white/40 transition-colors"
+              onFocus={() =>
+                !localInput &&
+                !looksLocal &&
+                query.trim() &&
+                setShowSuggestions(true)
+              }
+              aria-label={
+                localInput
+                  ? "Local dataset directory"
+                  : "Hugging Face dataset ID"
+              }
+              placeholder={
+                inputMode === "local"
+                  ? "/home/... dataset"
+                  : "Enter dataset id (e.g. lerobot/pusht)"
+              }
+              className="pl-10 pr-4 py-2.5 rounded-md text-base text-white bg-white/10 backdrop-blur-sm border border-white/30 focus:outline-none focus:border-cyan-400 focus:bg-white/15 w-full min-w-0 shadow-md placeholder:text-white/40 transition-colors"
               autoComplete="off"
             />
 
             {/* Suggestions dropdown */}
-            {showSuggestions && (
+            {showSuggestions && !localInput && !looksLocal && (
               <ul className="absolute left-0 right-0 top-full mt-1 rounded-md bg-[var(--surface-1)]/95 backdrop-blur-sm border border-white/10 shadow-xl overflow-hidden z-50 max-h-64 overflow-y-auto">
                 {isLoading ? (
                   <li className="flex items-center gap-2.5 px-4 py-3 text-sm text-white/50">
@@ -277,12 +348,19 @@ function HomeInner() {
             type="submit"
             className="px-5 py-2.5 rounded-md bg-cyan-500 text-white font-semibold text-base hover:bg-cyan-400 active:scale-95 transition-all shadow-md flex items-center gap-2"
           >
-            Go
+            {localInput ? "Prepare" : "Go"}
             <kbd className="text-xs font-mono bg-white/20 rounded px-1 py-0.5 leading-tight">
               ↵
             </kbd>
           </button>
         </form>
+
+        {localAllowed && (
+          <p className="mt-2 max-w-[390px] text-xs text-white/55">
+            Paste an absolute path or ~/ path. The next page prepares an
+            editable workspace for review.
+          </p>
+        )}
 
         <div className="mt-3 animate-fade-in-late">
           <HfAuthButton variant="ghost" />
@@ -327,6 +405,12 @@ function HomeInner() {
               d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3"
             />
           </svg>
+        </Link>
+        <Link
+          href="/annotate"
+          className="mt-3 text-sm text-cyan-200/80 underline underline-offset-4 hover:text-white"
+        >
+          Prepare annotations
         </Link>
       </div>
     </div>

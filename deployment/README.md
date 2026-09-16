@@ -161,3 +161,32 @@ The official LeRobot OpenAI client also returned valid image-based JSON
 (`{"color":"#FF0000"}`) without provider-specific request extensions. The smoke
 assertion initially expected the word `red`; the returned hex code is the correct
 color. This checks client compatibility, not episode boundary accuracy.
+
+
+### Default transition-pause import filter
+
+On **Prepare annotation dataset**, **Import filters → Exclude transition pauses**
+is checked by default for both local and Hub sources. Uncheck it to import without
+this filter. The API equivalent is `exclude_transition_pauses: false` on
+`POST /api/annotation/prepare`.
+
+The filter handles Pose (stream mode 1) ↔ normal Planner (mode 2) and
+frozen-upper-body Planner (mode 3). It excludes from the switch to the first of
+three consecutive forward 0.2-second windows whose largest monitored joint
+angle range exceeds 0.1 radians. Planner entry monitors the 12 leg joints;
+Pose entry monitors all 29 body joints, so either arm manipulation or leg
+movement ends the pause. Hands are not used as body-motion evidence.
+All windows must lie within the same destination-mode segment. Joints are
+identified by name, not column position. A transition is skipped if its required
+joint fields are missing or no movement onset is detected. Pose pause/off/VR
+3-point modes are not covered by this rule.
+
+The preparation result reports the number of intervals and frames excluded.
+Intervals are saved in the new workflow and appear on its **Exclude** timeline;
+they can be adjusted or removed normally. They are materialized only during
+export. Opening an existing workspace does not rerun the filter or overwrite
+manual edits. The original source is unchanged. Workflow metadata retains the
+filter settings and initially detected intervals for traceability.
+
+This detects transition-related low motion, not proven stale network packets.
+Review the excluded intervals before exporting the dataset.

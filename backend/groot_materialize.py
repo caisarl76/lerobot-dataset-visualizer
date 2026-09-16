@@ -55,7 +55,8 @@ def _episode_video(source, target, timestamps, offset, end, fps, shape):
             encoder = out.add_stream("libx264", rate=rate)
             encoder.width, encoder.height = shape[1], shape[0]
             encoder.pix_fmt = "yuv420p" if shape[0] % 2 == shape[1] % 2 == 0 else "yuv444p"
-            encoder.time_base = 1 / rate
+            frame_time_base = 1 / rate
+            encoder.time_base = frame_time_base
             encoder.codec_context.max_b_frames = 0
             encoder.options = {"crf": "18"}
             index, previous = 0, None
@@ -75,7 +76,8 @@ def _episode_video(source, target, timestamps, offset, end, fps, shape):
                 if abs(timestamp - expected[index]) > tolerance:
                     raise ValueError(f"Missing video frame at {expected[index]} in {source}")
                 fresh = av.VideoFrame.from_ndarray(frame.to_ndarray(format="rgb24"), format="rgb24")
-                fresh.pts, fresh.time_base = index, encoder.time_base
+                # Muxing may change encoder.time_base; frame indices use a fixed clock.
+                fresh.pts, fresh.time_base = index, frame_time_base
                 for packet in encoder.encode(fresh):
                     out.mux(packet)
                 index += 1

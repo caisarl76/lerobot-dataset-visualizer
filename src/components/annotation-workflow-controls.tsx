@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   fetchWorkflow,
+  detectWorkflowTransitions,
   postWorkflowDecision,
   keepWorkflowRemaining,
   reviewWorkflowRetained,
@@ -99,6 +100,8 @@ export function AnnotationWorkflowControls() {
   const [loadFailed, setLoadFailed] = useState(false);
   const [reason, setReason] = useState("");
   const [filter, setFilter] = useState("all");
+  const [includeReviewedTransitions, setIncludeReviewedTransitions] =
+    useState(false);
   const [queueEpisodeId, setQueueEpisodeId] = useState<number | null>(null);
   const inspectedEpisode = queueEpisodeId ?? episodeId;
   const [refresh, setRefresh] = useState(0);
@@ -133,6 +136,7 @@ export function AnnotationWorkflowControls() {
     setDestinationConsent(null);
     setExportOpen(false);
     setFilter("all");
+    setIncludeReviewedTransitions(false);
   }, [datasetKey]);
   useEffect(() => {
     if (run && hydratedDataset.current !== datasetKey) {
@@ -202,6 +206,7 @@ export function AnnotationWorkflowControls() {
         if (next.current_job_id) {
           let job = await getAnnotationJob(next.current_job_id);
           if (!current()) return;
+          const wasActive = ["queued", "running"].includes(job.status);
           while (current() && ["queued", "running"].includes(job.status)) {
             setStatus(`Job ${job.status}…`);
             await new Promise<void>((resolve) => {
@@ -215,6 +220,20 @@ export function AnnotationWorkflowControls() {
             next = await fetchWorkflow(alias!);
             if (!current()) return;
             setLoaded({ key: contextKey, run: next });
+            if (wasActive || changedContext) setStatus("Job completed.");
+            // Old bookmarks still point at the imported draft. Reload the whole
+            // viewer so media, parquet rows, and editor atoms share the checkpoint.
+            if (
+              !dirty &&
+              !saving &&
+              episodeId !== null &&
+              next.current_repo_id?.startsWith("local/") &&
+              next.current_repo_id !== ident.repoId
+            ) {
+              window.location.replace(
+                `/${next.current_repo_id}/episode_${episodeId}${window.location.search || "?tab=annotations"}${window.location.hash}`,
+              );
+            }
           }
           if (job.status === "failed" || job.status === "interrupted")
             setStatus(
@@ -301,7 +320,7 @@ export function AnnotationWorkflowControls() {
   const mutate = async (
     work: () => Promise<WorkflowRun>,
     pending: string,
-    completed: string,
+    completed: string | ((next: WorkflowRun) => string),
     review = false,
   ) => {
     if (disabled || activeMutation.current) return;
@@ -319,7 +338,7 @@ export function AnnotationWorkflowControls() {
       const next = await work();
       if (!valid()) return;
       setRun(next);
-      setStatus(completed);
+      setStatus(typeof completed === "function" ? completed(next) : completed);
       notify(review);
     } catch (error) {
       if (valid())
@@ -471,9 +490,9 @@ export function AnnotationWorkflowControls() {
         </Link>
       )}
       <div className="workflow-episode-actions">
-        <h4>
-          Episode {inspectedEpisode}: {current?.decision ?? "pending"}
-        </h4>
+        <h4>Episode {inspectedEpisode}</h4>
+        <p>Generation: {current?.generation_status ?? "pending"}</p>
+        <p>Review decision: {current?.decision ?? "pending"}</p>
         {(current?.issues ?? []).map((issue, i) => (
           <div key={`${issue.code}-${i}`}>
             <strong>
@@ -523,6 +542,51 @@ export function AnnotationWorkflowControls() {
             Save the current episode before changing decisions or exporting.
           </p>
         )}
+      </div>
+      <div className="workflow-transition-actions">
+        <h4>Transition pauses</h4>
+        <p>
+          Detect Pose ↔ Planner pauses and merge them into Exclude for
+          unreviewed, retained episodes.
+        </p>
+        <label>
+          <input
+            type="checkbox"
+            checked={includeReviewedTransitions}
+            disabled={disabled}
+            onChange={(event) =>
+              setIncludeReviewedTransitions(event.target.checked)
+            }
+          />
+          Include reviewed episodes
+        </label>
+        {includeReviewedTransitions && (
+          <p>
+            Reviewed episodes with changed exclusions will need review again.
+          </p>
+        )}
+        <div className="workflow-action-buttons">
+          <button
+            disabled={disabled}
+            onClick={() =>
+              void mutate(
+                () =>
+                  detectWorkflowTransitions(alias, {
+                    expected_revision: run.revision,
+                    include_reviewed: includeReviewedTransitions,
+                  }),
+                "Detecting transition pauses…",
+                (next) =>
+                  next.transition_detection?.skipped_reason
+                    ? `Transition filter skipped: ${next.transition_detection.skipped_reason}`
+                    : `Updated exclusions in ${next.transition_detection?.episodes_changed ?? 0} episodes. Review them on the Exclude timeline.`,
+                true,
+              )
+            }
+          >
+            Detect transition pauses
+          </button>
+        </div>
       </div>
       <details className="workflow-details">
         <summary>Review queue ({queue.length} episodes)</summary>

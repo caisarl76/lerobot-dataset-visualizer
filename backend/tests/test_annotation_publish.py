@@ -82,6 +82,8 @@ def reviewed_run(tmp_path, monkeypatch):
 def test_export_blocks_unreviewed_or_unresolved_retained_episodes(reviewed_run, tmp_path, problem):
     run = reviewed_run
     root = Path(run["root"])
+    if problem == "prompt_mismatch":
+        run["episodes"]["0"]["decision"] = "pending"
     if problem == "unreviewed":
         history.write_reviews(root, {})
     elif problem == "pending_issue":
@@ -653,3 +655,19 @@ def test_v21_clipping_keeps_main_and_rich_frames_identical(reviewed_run, tmp_pat
         for column in ["frame_index", "timestamp", "index", "episode_index", "observation.state"]:
             assert legacy[column].to_pylist() == rich[column].to_pylist(), column
     assert source_inventory(source) == before
+
+
+def test_explicit_keep_and_current_review_accept_episode_specific_prompt(reviewed_run, tmp_path):
+    run = reviewed_run
+    root = Path(run["root"])
+    path = root / "meta/lerobot_annotations.json"
+    labels = json.loads(path.read_text())
+    atoms = labels["episodes"]["0"]["atoms"]
+    atoms[0]["content"] = "pick up the apple"
+    write_json(path, labels)
+    history.save_review(root, 0, atoms, True, history.annotation_hash(atoms))
+    run["episodes"]["0"]["issues"] = [{"code": "unexpected_subtask", "source": "deterministic"}]
+    result = publish.prepare_export(run, tmp_path / "export")
+    saved = json.loads((Path(result["rich_root"]) / "meta/lerobot_annotations.json").read_text())
+    assert saved["episodes"]["0"]["atoms"][0]["content"] == "pick up the apple"
+    assert run["episodes"]["0"]["issues"][0]["code"] == "unexpected_subtask"

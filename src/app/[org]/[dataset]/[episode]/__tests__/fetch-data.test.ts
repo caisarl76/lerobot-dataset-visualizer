@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { computeColumnMinMax } from "@/app/[org]/[dataset]/[episode]/fetch-data";
+import {
+  buildChartColumnDefsForFeatures,
+  computeColumnMinMax,
+} from "@/app/[org]/[dataset]/[episode]/fetch-data";
 import type { ChartRow } from "@/app/[org]/[dataset]/[episode]/fetch-data";
+import type { DatasetMetadata } from "@/utils/parquetUtils";
 
 // ---------------------------------------------------------------------------
 // computeColumnMinMax
@@ -110,6 +114,33 @@ describe("computeColumnMinMax — nested group values (grouped suffix format)", 
     expect(colMap["action | 0"].min).toBe(-1.0);
     expect(colMap["action | 0"].max).toBe(-1.0);
     expect(colMap["action | 1"].min).toBe(1.0);
+  });
+});
+
+describe("v2.x chart column selection", () => {
+  test("keeps float64 named vector joints for G1 replay datasets", () => {
+    const features = {
+      "observation.images.ego_view": {
+        dtype: "video",
+        shape: [480, 640, 3],
+        names: ["height", "width", "channel"],
+      },
+      "observation.state": {
+        dtype: "float64",
+        shape: [43],
+        names: ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+      },
+    } satisfies DatasetMetadata["features"];
+
+    expect(buildChartColumnDefsForFeatures(features, [])).toEqual([
+      {
+        key: "observation.state",
+        value: [
+          "observation.state | left_hip_pitch_joint",
+          "observation.state | right_hip_pitch_joint",
+        ],
+      },
+    ]);
   });
 });
 

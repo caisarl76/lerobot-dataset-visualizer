@@ -362,7 +362,9 @@ def prepare_export(run: dict, output: Path) -> dict:
             raise ValueError(f"Episode {ep} needs a current explicit human review")
         if states[ep].get("issues") and states[ep].get("decision") != "keep":
             raise ValueError(f"Episode {ep} has unresolved quality findings")
-        if check_prompt_sequence(atoms, run.get("subtask_prompts") or []):
+        # Generation labels are a review aid. A current human review plus an
+        # explicit Keep accepts episode-specific objects/actions without rewriting them.
+        if states[ep].get("decision") != "keep" and check_prompt_sequence(atoms, run.get("subtask_prompts") or []):
             raise ValueError(f"Episode {ep} still has a subtask prompt mismatch")
         times = record.frame_timestamps
         if not times or len(times) != record.row_count or any(not math.isfinite(t) for t in times):

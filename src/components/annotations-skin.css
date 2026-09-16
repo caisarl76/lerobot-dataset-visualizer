@@ -1460,3 +1460,21 @@
     margin-left: 0;
   }
 }
+
+.annotations-skin .workflow-transition-actions {
+  margin: 16px 0;
+  padding: 14px;
+  border: 1px solid var(--border-color, #435064);
+  border-radius: 8px;
+}
+.annotations-skin .workflow-transition-actions > label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+.annotations-skin .workflow-transition-actions input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #22d3ee;
+}
