@@ -278,9 +278,12 @@ test("publication history survives a different selected run whose detail has no 
   const ui = render(<DatasetMonitorRow {...props} />);
   expand(ui.container);
   expect(ui.getByRole("link", { name: /Open HF/ })).toBeTruthy();
-  fireEvent.change(ui.getByRole("combobox", { name: "Annotation run" }), {
-    target: { value: "run-one" },
-  });
+  fireEvent.change(
+    ui.getByRole("combobox", { name: "Annotation run for pnp_table_260909" }),
+    {
+      target: { value: "run-one" },
+    },
+  );
   expect(props.onSelectRun).toHaveBeenCalledWith("run-one");
   expect(props.onExpand).toHaveBeenCalledWith(true);
 });

@@ -94,17 +94,17 @@
   gap: 14px;
   margin: 24px 0 18px;
 }
-.search {
+.searchControl {
   flex: 1 1 240px;
 }
-.search,
+.searchControl,
 .filter {
   display: flex;
   flex-direction: column;
   gap: 6px;
   color: #b0becd;
 }
-.search input,
+.searchControl input,
 .filter select,
 .runSelect select {
   width: 100%;
@@ -563,7 +563,7 @@
   .toolbar {
     align-items: stretch;
   }
-  .search,
+  .searchControl,
   .filter {
     flex: 1 1 100%;
   }

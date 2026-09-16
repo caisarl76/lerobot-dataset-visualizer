@@ -644,7 +644,9 @@ export function DatasetMonitorRow({
         <div className={styles.detailContent}>
           {dataset.runs.length > 0 && (
             <div className={styles.runSelect}>
-              <label htmlFor={selectId}>Annotation run</label>
+              <label htmlFor={selectId}>
+                Annotation run for {dataset.name}
+              </label>
               <select
                 id={selectId}
                 value={selectedRunId ?? ""}

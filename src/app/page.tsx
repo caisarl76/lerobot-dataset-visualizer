@@ -412,6 +412,14 @@ function HomeInner() {
         >
           Prepare annotations
         </Link>
+        {localAllowed && (
+          <Link
+            href="/monitor"
+            className="mt-3 text-sm text-cyan-200/80 underline underline-offset-4 hover:text-white"
+          >
+            Monitor
+          </Link>
+        )}
       </div>
     </div>
   );

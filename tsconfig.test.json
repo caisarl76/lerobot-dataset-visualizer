@@ -23,7 +23,10 @@
     "src/components/__tests__/episode-exclusions.test.tsx",
     "src/components/__tests__/annotation-workflow-controls.test.tsx",
     "src/utils/__tests__/robotMotion.test.ts",
-    "src/components/__tests__/video-motion-sync.test.tsx"
+    "src/components/__tests__/video-motion-sync.test.tsx",
+    "src/utils/__tests__/monitorClient.test.ts",
+    "src/components/__tests__/dataset-monitor-row.test.tsx",
+    "src/app/monitor/__tests__/page.test.tsx"
   ],
   "include": ["src/**/*.ts", "src/**/*.tsx"],
   "exclude": ["node_modules", "src/**/__tests__/**"]
