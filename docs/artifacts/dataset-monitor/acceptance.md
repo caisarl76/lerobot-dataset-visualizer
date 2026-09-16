@@ -258,3 +258,9 @@ Additional Task 8 decisions:
   cost if wrong: overstated delivery claims. Actual review navigation and HF
   HTTP availability are recorded separately; clipboard verification remains
   limited to the stubbed browser handler.
+
+## Final closeout
+
+Whole-branch and scoped final reviews passed specification and quality. The minor current-job wording was corrected without changing behavior; see [final review](final-review.md). Final frontend checks: 46 passed / 204 assertions. The final canonical production build and deployed browser smoke check passed, including **Current workflow job: completed**, **71 / 71 reviewed**, and **34,594 frames**.
+
+Local page: http://127.0.0.1:3000/monitor. Feature branch `feat/dataset-monitor` and `.worktrees/dataset-monitor` are retained; the canonical service includes the feature while preserving its earlier unfinished edits. No remote Git push was performed.
