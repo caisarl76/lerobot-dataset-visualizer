@@ -190,3 +190,141 @@ filter settings and initially detected intervals for traceability.
 
 This detects transition-related low motion, not proven stale network packets.
 Review the excluded intervals before exporting the dataset.
+
+# Local dataset monitor
+
+Open [Monitor](http://127.0.0.1:3000/monitor) from the homepage to inspect local
+collection folders, annotation runs, prompt coverage, frozen training exports,
+and recorded Hugging Face publications. Monitoring is read-only: it does not
+import datasets, launch generation, change reviews or exclusions, export data,
+or upload to HF. **Prepare** only opens the existing preparation page with the
+source path filled in; importing remains an explicit action there.
+
+## Configuration and scope
+
+`deployment/start-annotation-local.sh` passes `LEROBOT_MONITOR_ROOT` to the backend,
+with `/home/jihun/work/GR00T-WholeBodyControl/outputs` as its default. That path
+currently resolves to `/mnt/data/jihun/datasets/G1_WBT_GR00T`. Override it before
+starting the local stack when a different collection root is needed:
+
+```bash
+LEROBOT_MONITOR_ROOT=/absolute/collection/root bash deployment/start-annotation-local.sh
+```
+
+The launcher refuses to replace an existing session. An already running backend
+must receive the setting on its next start. For an existing stack, first confirm
+that annotation generation/export/publication jobs are idle, build the UI, and
+restart only the annotation backend and UI with their existing environment plus
+this setting. Preserve the VLM tunnel, credentials, workspace, caches, provider
+settings, and unrelated services.
+
+The monitor is local-deployment functionality. With no backend root setting it
+shows an unconfigured state; it does not guess a root or accept paths from the
+browser. Existing annotation authentication and origin controls still apply.
+Local filesystem paths are shown inside that boundary, not made into a general
+filesystem browser.
+
+Discovery reads immediate child dataset directories using LeRobot v2.1, v3.0,
+and v3.1 metadata. Symlinks are resolved and deduplicated; candidates escaping
+the configured root are excluded. Hidden, staging, cache, workspace, and export
+infrastructure directories are excluded from collection discovery. Partial or
+malformed metadata stays visible with an Updating/diagnostic state. Exports
+outside the collection scan appear only through recorded workflow references.
+
+Relationships require recorded provenance. Confirmed single-parent derivatives
+are grouped; multi-source merges stay independent with their sources listed.
+Folder names alone do not establish relationships. Group cards count displayed
+collection groups and can overlap; source and derivative episode counts must
+not be added as a count of unique demonstrations.
+
+**Open review** uses the existing full `local/annotation-…` alias registered for
+the selected run's checkpoint and its first retained episode. The monitor reads
+the alias registry without adding entries. If the checkpoint has no registered
+alias or retained episode, it cannot offer that review link. It remembers the
+selected run per folder in browser storage; otherwise it chooses the most
+recent workflow activity, not the most recently published run.
+
+## Reading the counts and prompts
+
+Collected episodes come from the current source metadata. Every run counter is
+scoped to the selected run's checkpoint, without adding together separate runs.
+
+| Field | Meaning |
+| --- | --- |
+| Imported | Episode identities captured by the selected run. |
+| Accepted / Rejected / Pending | Explicit Keep / Delete / Pending decisions. |
+| Retained | All imported episodes except Delete, including Pending. |
+| Decision completion | `(Accepted + Rejected) / Imported`. |
+| Current reviewed / review rate | Retained episodes with matching saved annotation and exclusion review hashes; rate is `Current reviewed / Retained`. |
+| Accepted duration | Retained frames in Keep episodes divided by their FPS. |
+| Not imported | Current source episode IDs absent from the run's original source identities. |
+| Export frames/duration | Counts from the particular frozen export, independent of later edits. |
+
+A current review does not imply Keep: a reviewed Pending episode is still
+retained. Generation success does not imply human review, and accepted advisory
+findings remain distinct from unresolved findings. No run means Not imported;
+a known zero is different from unknown/unreadable evidence. Empty denominators
+show an em dash with No episodes/No retained episodes, not 100%. Incomplete
+counts and coverage remain visibly unknown or partial.
+
+Expanded prompt ratios use **current-reviewed, non-deleted episodes**, including
+reviewed Pending episodes. Counts follow the literal saved `subtask` prompt
+active at each actual source-frame timestamp. Half-open excluded frame intervals
+`[start_frame, end_frame)` are removed; a prompt starting inside a cut can remain
+active when retained frames resume. Ratios divide by all calculable eligible
+retained frames, including Unlabeled and Ambiguous buckets. Frame shares sum to
+100% apart from rounding; episode presence counts can overlap. Durations use
+the relevant episode FPS.
+
+Literal whitespace differences remain distinct and are marked in the prompt
+view. Missing labels do not fall back to `task_aug` or generic task prompts.
+Conflicting active labels are Ambiguous. Unreadable annotations or timestamps
+exclude the affected episode from the calculable denominator and make coverage
+incomplete; they do not establish a complete zero-frame distribution.
+
+## Freshness and publication history
+
+The page polls cached lightweight summaries every 30 seconds while visible and
+pauses while hidden. **Refresh** invalidates the lightweight summary cache.
+Expanded details are cached and invalidated when their relevant run, review,
+exclusion, or metadata signatures change. Updating snapshots preserve the last
+good display and timestamp rather than mixing partially written records.
+
+Source checks compare metadata identities and lengths; they do not hash or
+decode videos. New IDs show Not imported; missing IDs or changed lengths show
+Source changed. Unchanged metadata is not proof of identical source bytes; the
+existing export process remains responsible for full source validation.
+
+Publication history, current local changes, and source changes are separate.
+An old receipt stays visible after local edits. Frozen export review digests can
+establish Unpublished changes when linkage is available; missing history or a
+missing manifest makes freshness unverified. Saved receipts and completed
+publication jobs are the available history, not a reconstruction of every
+past upload. Recorded unpublished exports also remain visible. A missing local
+export is unavailable and has no working copy-path action.
+
+**Check HF** is an explicit read-only remote check of a recorded repository and
+revision using server-side credentials. It compares the current head with the
+recorded commit and reports match, changed/advanced, missing, unavailable, or
+access denied, with a check timestamp. It performs no upload or full content
+audit and does not run on periodic refresh. A failed check does not erase the
+historical receipt. Remote-check results are held in memory and reset on backend
+restart; publication receipts remain durable.
+
+## Verified reference dataset
+
+The 2026-09-16 reference is `pnp_table_260909`, run
+`b937e3f6925a4bafa5eb1bb70ea74ec8`: 87 collected/imported, 71 Keep, 16 Delete,
+0 Pending, and 71/71 retained episodes currently reviewed. The recorded export
+is GR00T v2.1 (`groot_v21`), subtask mode, 34,594 frames / 691.88 seconds.
+These values describe that observation, not a promise that later edits cannot
+change it.
+
+- [Current review](http://127.0.0.1:3000/local/annotation-99d858fff3f3e9ff/episode_1?tab=annotations).
+- [Recorded HF revision](https://huggingface.co/datasets/mncai/G1_Dex3_PickTable/tree/260915), commit `f3d31d6b481a61fc1779890df46be58fd38cd811`.
+- Available training export: `/mnt/data/jihun/datasets/G1_WBT_GR00T/official_annotations/workspace/drafts/8b78dd2573054344b16b77fd514ef6c7/pnp_table_260915`.
+
+Use the export path shown alongside its format, mode, and revision when training.
+The original 87-episode collection and the current editable checkpoint are
+separate artifacts. See the [acceptance record](../docs/artifacts/dataset-monitor/acceptance.md)
+for verification evidence and limitations.
