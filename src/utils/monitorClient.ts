@@ -86,7 +86,7 @@ export interface MonitorExport {
 export interface MonitorPrompts {
   eligible_episodes: number;
   evaluated_episodes: number;
-  unknown_episode_ids: number[];
+  unknown_episode_ids: string[];
   retained_frames: number;
   unlabeled_frames: number;
   ambiguous_frames: number;

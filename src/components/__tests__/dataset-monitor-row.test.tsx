@@ -121,7 +121,7 @@ function fixture(): DatasetMonitorRowProps {
     prompts: {
       eligible_episodes: 71,
       evaluated_episodes: 70,
-      unknown_episode_ids: [42],
+      unknown_episode_ids: ["42"],
       retained_frames: 100,
       unlabeled_frames: 10,
       ambiguous_frames: 5,
@@ -449,4 +449,39 @@ test("a cached detail cannot erase a newer summary remote check", () => {
   const ui = render(<DatasetMonitorRow {...props} />);
   expand(ui.container);
   expect(ui.getByText("Branch advanced/changed")).toBeTruthy();
+});
+
+test("normal edits preserve known unpublished state and receipt when the frozen export was removed", () => {
+  const props = fixture();
+  // Matches test_receipt_survives_normal_edit_that_removes_export on the backend.
+  props.dataset.runs[0].freshness = {
+    ...props.dataset.runs[0].freshness,
+    publication_state: "unpublished_changes",
+    local_changes: null,
+    verifiable: false,
+  };
+  props.dataset.exports = [];
+  props.dataset.publications[0] = {
+    ...props.dataset.publications[0],
+    export_path: null,
+    export_available: false,
+    manifest_sha256: null,
+  };
+  const ui = render(<DatasetMonitorRow {...props} />);
+  expect(ui.getByText("Unpublished changes")).toBeTruthy();
+  expect(ui.getByText("Digest comparison unverified")).toBeTruthy();
+  expand(ui.container);
+  expect(ui.getByText("recorded-commit")).toBeTruthy();
+  expect(
+    ui.getByRole("link", { name: /Open HF/ }).getAttribute("href"),
+  ).toContain("/tree/260915");
+  expect(ui.queryByRole("button", { name: /Copy training path/ })).toBeNull();
+});
+
+test("unknown prompt episode keys preserve both numeric strings and invalid keys", () => {
+  const props = fixture();
+  props.detail!.prompts!.unknown_episode_ids = ["42", "invalid-key"];
+  const ui = render(<DatasetMonitorRow {...props} />);
+  expand(ui.container);
+  expect(ui.getByText("Unknown episode IDs: 42, invalid-key")).toBeTruthy();
 });

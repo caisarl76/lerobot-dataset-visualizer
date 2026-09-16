@@ -35,7 +35,7 @@ const duration = (seconds: number | null | undefined): string => {
     return `${seconds.toLocaleString("en-US", { maximumFractionDigits: 2 })} s`;
   return `${Math.floor(seconds / 60)} min ${(seconds % 60).toLocaleString("en-US", { maximumFractionDigits: 1 })} s`;
 };
-const ids = (values: number[] | null): string =>
+const ids = (values: (number | string)[] | null): string =>
   values == null ? "Unknown" : values.length ? values.join(", ") : "None";
 const format = (value: string | null): string =>
   value === "groot_v21" ? "GR00T v2.1" : (value ?? "Unknown");
@@ -430,6 +430,9 @@ export function DatasetMonitorRow({
       ? detail
       : null;
   const metrics = run?.metrics;
+  const unpublishedChanges =
+    run?.freshness.local_changes === true ||
+    run?.freshness.publication_state === "unpublished_changes";
   const review = reviewUrl(run);
   const publications = mergeRecords(
     dataset.publications,
@@ -578,7 +581,7 @@ export function DatasetMonitorRow({
             {publications.length === 1 ? "publication" : "publications"}
           </strong>
           <span className={styles.muted}>
-            {run?.freshness.local_changes === true ? (
+            {unpublishedChanges ? (
               <span className={styles.warning}>Unpublished changes</span>
             ) : run?.freshness.local_changes === false &&
               run.freshness.verifiable ? (
@@ -587,6 +590,9 @@ export function DatasetMonitorRow({
               "Publication freshness unverified"
             )}
           </span>
+          {unpublishedChanges && !run?.freshness.verifiable && (
+            <span className={styles.muted}>Digest comparison unverified</span>
+          )}
         </div>
       </div>
       <div className={styles.attention}>
