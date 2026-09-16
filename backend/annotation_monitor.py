@@ -466,6 +466,10 @@ def attach_relationships(datasets: list[dict], runs: list[dict]) -> list[dict]:
                 by_path[next(iter(graph[path]))]["child_ids"].append(row["id"])
         if any(d["severity"] != "info" for d in row["diagnostics"]):
             row["state"] = "Updating"
+    # Preserve exactly the external paths traversed, including missing evidence,
+    # so callers can detect edits/repairs without inventing another lineage walk.
+    for row in datasets:
+        row["_provenance_paths"] = sorted(documents.keys() - by_path.keys())
     return datasets
 
 
@@ -1373,6 +1377,7 @@ class MonitorService:
         self._lock = RLock()
         self._snapshot = None
         self._snapshot_key = None
+        self._provenance_paths = set()
         self._details = OrderedDict()
         self._remote_checks = OrderedDict()
 
@@ -1399,6 +1404,8 @@ class MonitorService:
                 continue
             if _inside(path, self.root) and not _inside(path, self.workspace):
                 capture(path, lambda path=path: _metadata_signature(path))
+        for path in sorted(self._provenance_paths):
+            capture(path, lambda path=path: _metadata_signature(Path(path)))
         paths = [self.workspace / "local_datasets.json", self.workspace / "runs", self.workspace / "jobs"]
         paths.extend((self.workspace / "runs").glob("*/run.json"))
         paths.extend((self.workspace / "jobs").glob("*.json"))
@@ -1454,6 +1461,7 @@ class MonitorService:
         runs = read_runs(self.workspace)
         diagnostics = [run["_diagnostic"] for run in runs if "_diagnostic" in run]
         datasets = attach_relationships(datasets, runs)
+        self._provenance_paths = {path for row in datasets for path in row["_provenance_paths"]}
         for row in datasets:
             raw_runs = row["runs"]
             row["runs"], row["publications"], row["exports"] = [], [], []
@@ -1464,7 +1472,9 @@ class MonitorService:
                     publications = publication_records(run, self.workspace)
                     exports = export_records(run, self.workspace)
                     summary["detail_signature"] = hashlib.sha256(
-                        json.dumps([summary["detail_signature"], publications, exports], sort_keys=True).encode()
+                        json.dumps(
+                            [summary, row["state"], row["diagnostics"], publications, exports], sort_keys=True
+                        ).encode()
                     ).hexdigest()
                 except (KeyError, AttributeError, *_READ_ERRORS) as exc:
                     row["diagnostics"].append(_diag("invalid_run", f"Run {run['run_id']}: {exc}", "error"))
@@ -1551,7 +1561,7 @@ class MonitorService:
                 signature = summary["detail_signature"] if summary else None
                 if snapshot["updating"]:
                     break
-                if prior and prior["signature"] == signature:
+                if summary and prior and prior["signature"] == signature:
                     self._details.move_to_end(key)
                     return self._response(prior)
                 before = self._signature()

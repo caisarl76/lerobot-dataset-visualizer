@@ -373,3 +373,91 @@ def test_detail_refreshes_export_metadata_without_run_edit(service, review_fixtu
     second = service.detail(row["id"])
     assert second["exports"][0]["seconds"] == 2
     assert second["signature"] != first["signature"]
+
+
+def test_detail_tracks_dataset_diagnostics_after_corrupt_run(service, review_fixture):
+    dataset, _, workspace = review_fixture
+    first = service.detail(dataset["id"])
+    assert first["metrics"]["counts_complete"] is True
+    assert first["diagnostics"] == []
+    write_json(workspace / "runs/bad/run.json", {"source_root": dataset["canonical_path"]})
+    row = service.summary()["datasets"][0]
+    assert row["runs"][0]["metrics"]["counts_complete"] is False
+    second = service.detail(dataset["id"])
+    assert second["metrics"] == row["runs"][0]["metrics"]
+    assert any(d["code"] == "invalid_run" for d in second["diagnostics"])
+    assert second["signature"] != first["signature"]
+    (workspace / "runs/bad/run.json").unlink()
+    assert service.detail(dataset["id"])["metrics"]["counts_complete"] is True
+    assert service.detail(dataset["id"])["diagnostics"] == []
+
+
+def test_summary_tracks_external_provenance_retarget_and_removal(service, review_fixture):
+    dataset, _, workspace = review_fixture
+    source = Path(dataset["path"])
+    alternate = write_v21(source.parent / "alternate", [10])
+    child = write_v21(source.parent / "child", [10])
+    intermediate = workspace / "exports/intermediate"
+    evidence = write_json(intermediate / "meta/source_episode_mapping.json", {"original_root": str(source)})
+    write_json(child / "meta/source_episode_mapping.json", {"original_root": str(intermediate)})
+
+    def rows():
+        return {row["name"]: row for row in service.summary()["datasets"]}
+
+    initial = rows()
+    assert initial["child"]["parent_ids"] == [initial["source"]["id"]]
+    write_json(evidence, {"original_root": str(alternate)})
+    changed = rows()
+    assert changed["child"]["parent_ids"] == [changed["alternate"]["id"]]
+    assert changed["source"]["child_ids"] == []
+    assert changed["alternate"]["child_ids"] == [changed["child"]["id"]]
+    evidence.unlink()
+    removed = rows()
+    assert removed["child"]["provenance"]["status"] == "unknown"
+    assert removed["child"]["parent_ids"] == []
+    assert removed["alternate"]["child_ids"] == []
+    write_json(evidence, {"original_root": str(source)})
+    assert rows()["child"]["parent_ids"] == [initial["source"]["id"]]
+
+
+def test_no_run_detail_tracks_metadata_diagnostics(service, review_fixture):
+    dataset, _, _ = review_fixture
+    root = write_v21(Path(dataset["path"]).parent / "unprepared", [10])
+    row = next(d for d in service.summary()["datasets"] if d["name"] == "unprepared")
+    first = service.detail(row["id"])
+    assert first["run_id"] is None and first["diagnostics"] == []
+    info = root / "meta/info.json"
+    saved = info.read_text()
+    info.write_text("{")
+    second = service.detail(row["id"])
+    assert second["run_id"] is None
+    assert any(d["code"] == "invalid_metadata" for d in second["diagnostics"])
+    info.write_text(saved)
+    assert service.detail(row["id"])["diagnostics"] == []
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_changing_external_provenance_preserves_consistent_snapshot(service, review_fixture, monkeypatch, warm):
+    dataset, _, workspace = review_fixture
+    source = Path(dataset["path"])
+    alternate = write_v21(source.parent / "alternate", [10])
+    child = write_v21(source.parent / "child", [10])
+    intermediate = workspace / "exports/intermediate"
+    evidence = write_json(intermediate / "meta/source_episode_mapping.json", {"original_root": str(source)})
+    write_json(child / "meta/source_episode_mapping.json", {"original_root": str(intermediate)})
+    old = service.summary() if warm else None
+    original = monitor.summarize_run
+    calls = []
+
+    def change_after_relationships(*args):
+        result = original(*args)
+        calls.append(1)
+        write_json(evidence, {"original_root": str(alternate if len(calls) % 2 else source)})
+        return result
+
+    monkeypatch.setattr(monitor, "summarize_run", change_after_relationships)
+    current = service.summary(refresh=True)
+    assert len(calls) == 2
+    assert current["updating"] is True
+    assert current["scanned_at"] == (old["scanned_at"] if old else None)
+    assert current["datasets"] == (old["datasets"] if old else [])
