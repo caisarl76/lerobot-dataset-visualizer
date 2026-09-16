@@ -551,7 +551,7 @@ def test_summary_reads_alias_and_persisted_job_without_mutation(review_fixture):
     result = summarize_run(dataset, run, workspace)
     after = {p: p.read_bytes() for p in workspace.parent.rglob("*") if p.is_file()}
     assert before == after
-    assert result["job"] == job
+    assert result["job"] == {"job_id": job["job_id"], "status": job["status"]}
     assert result["current_repo_id"] == "local/exact-current"
 
 
@@ -809,3 +809,27 @@ def test_summary_malformed_review_fields_are_unknown(review_fixture, field, valu
     result = summarize_run(dataset, run, workspace)
     assert result["metrics"]["reviewed"] is None
     assert result["metrics"]["counts_complete"] is False
+
+
+@pytest.mark.parametrize("error", [None, "Export failed"])
+def test_summary_job_omits_large_result_without_mutating_persisted_bytes(review_fixture, error):
+    dataset, run, workspace = review_fixture
+    run["current_job_id"] = "c" * 32
+    job = {
+        "job_id": run["current_job_id"],
+        "status": "failed" if error else "completed",
+        "result": {
+            "old_to_new": {str(ep): ep for ep in range(10_000)},
+            "managed_changes": [f"data/episode_{ep:06d}.parquet" for ep in range(10_000)],
+        },
+    }
+    expected = {"job_id": job["job_id"], "status": job["status"]}
+    if error is not None:
+        job["error"] = expected["error"] = error
+    path = write_json(workspace / "jobs" / (run["current_job_id"] + ".json"), job)
+    before = path.read_bytes()
+    result = summarize_run(dataset, run, workspace)
+    assert result["job"] == expected
+    assert "result" not in result["job"]
+    assert len(json.dumps(result["job"])) < 200
+    assert path.read_bytes() == before

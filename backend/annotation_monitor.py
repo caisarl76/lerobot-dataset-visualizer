@@ -760,7 +760,8 @@ def _current_job(run: dict, workspace: Path, diagnostics: list) -> dict | None:
     try:
         if not _inside(path, workspace):
             raise ValueError("job path escapes workspace")
-        return _json_object(path)
+        job = _json_object(path)
+        return {key: job[key] for key in ("job_id", "status", "error") if key in job}
     except _READ_ERRORS as exc:
         diagnostics.append(_diag("invalid_job", f"{path}: {exc}"))
         return None
