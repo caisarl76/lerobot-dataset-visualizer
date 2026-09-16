@@ -379,3 +379,57 @@ def test_projected_metadata_reads_do_not_read_frame_data(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pq, "read_table", metadata_only)
     assert discover_datasets(tmp_path, tmp_path / "workspace")[0]["collected"] == 1
+
+
+@pytest.mark.parametrize("indirect", [False, True])
+def test_mixed_confirmed_and_unresolved_provenance_never_nests(tmp_path, indirect):
+    root = tmp_path / "collection"
+    source = write_v21(root / "source", [2])
+    child = write_v21(root / "child", [2])
+    evidence_root = tmp_path / "staging" if indirect else child
+    write_json(
+        evidence_root / "meta/source_episode_mapping.json",
+        {"original_root": str(source), "run_id": "missing-run"},
+    )
+    if indirect:
+        write_json(
+            child / "meta/groot_instruction_export.json",
+            {"source_root": str(evidence_root)},
+        )
+    rows = discover(root, tmp_path / "workspace")
+    assert rows["child"]["provenance"]["status"] == "unknown"
+    assert "unresolved_provenance" in codes(rows["child"])
+    assert rows["child"]["parent_ids"] == []
+    assert rows["source"]["child_ids"] == []
+
+
+@pytest.mark.parametrize("suffix", [".tmp", ".staging"])
+def test_alias_cannot_discover_canonical_temporary_directory(tmp_path, suffix):
+    root = tmp_path / "collection"
+    target = write_v21(root / f"import{suffix}", [2])
+    write_v21(root / "healthy", [2])
+    (root / "alias").symlink_to(target, target_is_directory=True)
+    assert [row["name"] for row in discover_datasets(root, tmp_path / "workspace")] == ["healthy"]
+
+
+def test_looping_child_symlink_does_not_hide_healthy_collections(tmp_path):
+    root = tmp_path / "collection"
+    write_v21(root / "healthy", [2])
+    (root / "bad-link").symlink_to("bad-link")
+    rows = discover_datasets(root, tmp_path / "workspace")
+    assert [row["name"] for row in rows] == ["healthy"]
+    assert rows[0]["state"] == "Ready"
+
+
+def test_confirmed_source_with_unreadable_competing_provenance_stays_ungrouped(
+    tmp_path,
+):
+    source = write_v21(tmp_path / "source", [2])
+    child = write_v21(tmp_path / "child", [2])
+    write_json(child / "meta/source_episode_mapping.json", {"original_root": str(source)})
+    (child / "meta/merge_manifest.json").write_text('{"sources":')
+    rows = discover(tmp_path, tmp_path / "workspace")
+    assert rows["child"]["provenance"]["status"] == "unknown"
+    assert "invalid_provenance" in codes(rows["child"])
+    assert rows["child"]["parent_ids"] == []
+    assert rows["source"]["child_ids"] == []

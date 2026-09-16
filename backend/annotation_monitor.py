@@ -45,12 +45,12 @@ def _json_object(path: Path) -> dict:
     return value
 
 
-def _signature(root: Path, paths) -> tuple:
+def _signature(root: Path, paths, *, follow_symlinks: bool = True) -> tuple:
     """Directory entries and relevant file stats, without reading frame/video data."""
     entries = []
     for path in sorted(set(paths)):
         try:
-            stat = path.stat()
+            stat = path.stat(follow_symlinks=follow_symlinks)
             entries.append((str(path.relative_to(root)), stat.st_size, stat.st_mtime_ns))
         except FileNotFoundError:
             entries.append((str(path.relative_to(root)), None, None))
@@ -210,7 +210,7 @@ def discover_datasets(root: Path, workspace: Path) -> list[dict]:
     try:
         for attempt in range(2):
             children = sorted(root.iterdir())
-            before = _signature(root, [root, *children])
+            before = _signature(root, [root, *children], follow_symlinks=False)
             rows, seen = [], set()
             for path in children:
                 try:
@@ -226,6 +226,7 @@ def discover_datasets(root: Path, workspace: Path) -> list[dict]:
                     if (
                         canonical.name.startswith(".")
                         or canonical.name.lower() in _INFRASTRUCTURE
+                        or canonical.name.endswith((".tmp", ".staging"))
                         or any(_inside(path, x) for x in excluded)
                     ):
                         continue
@@ -241,7 +242,7 @@ def discover_datasets(root: Path, workspace: Path) -> list[dict]:
                             state="Updating", diagnostics=[_diag("invalid_metadata", f"{path}: {exc}", "error")]
                         )
                         rows.append(row)
-            after = _signature(root, [root, *root.iterdir()])
+            after = _signature(root, [root, *root.iterdir()], follow_symlinks=False)
             if before == after:
                 return rows
             if attempt == 1:
@@ -390,9 +391,10 @@ def attach_relationships(datasets: list[dict], runs: list[dict]) -> list[dict]:
     def resolve(path, stack, diagnostics):
         if path in stack:
             diagnostics.append(_diag("provenance_cycle", f"Cycle in provenance at {path}"))
-            return set(), True
+            return set(), True, False
         groups = evidence(path, diagnostics)
         resolved, conflict = [], False
+        unresolved = any(d["code"] == "invalid_provenance" for d in diagnostics)
         for group in groups:
             sources = set()
             complete = True
@@ -403,20 +405,21 @@ def attach_relationships(datasets: list[dict], runs: list[dict]) -> list[dict]:
                 elif candidate in by_path:
                     sources.add(candidate)
                 else:
-                    upstream, bad = resolve(candidate, stack | {path}, diagnostics)
+                    upstream, bad, unknown = resolve(candidate, stack | {path}, diagnostics)
                     conflict |= bad
                     sources.update(upstream)
-                    complete &= bool(upstream) and not bad
+                    complete &= bool(upstream) and not bad and not unknown
             if complete and sources:
                 resolved.append(sources)
             else:
+                unresolved = True
                 diagnostics.append(
                     _diag("unresolved_provenance", f"{path}: recorded source could not be confirmed")
                 )
         if resolved and any(sources != resolved[0] for sources in resolved[1:]):
             conflict = True
             diagnostics.append(_diag("conflicting_provenance", f"{path}: recorded source identities disagree"))
-        return set().union(*resolved), conflict
+        return set().union(*resolved), conflict, unresolved
 
     for path, row in by_path.items():
         row["parent_ids"], row["child_ids"] = [], []
@@ -431,9 +434,9 @@ def attach_relationships(datasets: list[dict], runs: list[dict]) -> list[dict]:
         for failure in failures:
             if failure.get("_source_root") == path:
                 row["diagnostics"].append(failure["_diagnostic"])
-        sources, conflict = resolve(path, set(), row["diagnostics"])
+        sources, conflict, unresolved = resolve(path, set(), row["diagnostics"])
         row["provenance"] = {
-            "status": "conflict" if conflict else "confirmed" if sources else "unknown",
+            "status": "conflict" if conflict else "confirmed" if sources and not unresolved else "unknown",
             "sources": sorted(sources),
         }
 
