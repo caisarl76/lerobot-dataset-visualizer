@@ -160,7 +160,7 @@ def _read_dataset(path: Path) -> dict:
             info = {}
             try:
                 info = _json_object(path / "meta/info.json")
-                if info.get("codebase_version") not in {"v2.1", "v3.0"}:
+                if info.get("codebase_version") not in {"v2.1", "v3.0", "v3.1"}:
                     raise ValueError("missing or unsupported codebase_version")
                 if not _nonnegative_int(info.get("total_episodes")):
                     raise ValueError("total_episodes must be a nonnegative integer")

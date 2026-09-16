@@ -17,15 +17,17 @@ def atom(text, timestamp=0.0, **extra):
     return dict(role="assistant", style="subtask", content=text, timestamp=timestamp, **extra)
 
 
-@pytest.fixture(params=["v2.1", "v3.0"])
+@pytest.fixture(params=["v2.1", "v3.0", "v3.1"])
 def prompt_fixture(tmp_path, request):
     def make(*, lengths=(10,), labels=None, exclusions=None, fps=10, name="case"):
         root = (write_v21 if request.param == "v2.1" else write_v3)(tmp_path / name, list(lengths))
         info = json.loads((root / "meta/info.json").read_text())
+        info["codebase_version"] = request.param
         info["fps"] = fps
         write_json(root / "meta/info.json", info)
         run_path = write_run(tmp_path / (name + "-workspace"), root, root, list(range(len(lengths))))
         run = json.loads(run_path.read_text())
+        run["source_format"] = request.param
         labels = labels if labels is not None else [[atom("A"), atom("B", 0.3)] for _ in lengths]
         exclusions = (
             exclusions if exclusions is not None else [[{"start_frame": 2, "end_frame": 5}] for _ in lengths]
@@ -487,3 +489,26 @@ def test_editor_current_review_stays_eligible_when_raw_prompt_is_invalid(prompt_
     assert sidecar_prompts["complete"] is True
     assert counts(sidecar_prompts) == {"42" if field == "content" else "A": 10 if value is False else 7}
     assert reviews_path.read_bytes() == reviewed_bytes
+
+
+def test_supported_versions_discover_current_reviews_and_prompt_frames(prompt_fixture):
+    run = prompt_fixture()
+    root = Path(run["root"])
+    workspace = root.parent / (root.name + "-workspace")
+    dataset = next(
+        row for row in monitor.discover_datasets(root.parent, workspace)
+        if row["canonical_path"] == str(root.resolve())
+    )
+    assert dataset["state"] == "Ready"
+    assert dataset["collected"] == 1
+    assert dataset["episode_lengths"] == {"0": 10}
+    summary = monitor.summarize_run(dataset, run, workspace)
+    assert summary["metrics"]["imported"] == summary["metrics"]["retained"] == 1
+    assert summary["metrics"]["reviewed"] == 1
+    assert summary["metrics"]["review_rate"] == 1
+    result = monitor.prompt_distribution(run)
+    assert result["eligible_episodes"] == result["evaluated_episodes"] == 1
+    assert result["complete"] is True
+    assert result["retained_frames"] == 7
+    assert counts(result) == {"A": 2, "B": 5}
+    assert_partition(result)
