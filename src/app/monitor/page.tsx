@@ -84,54 +84,103 @@ function DatasetEntry({
   onSelectRun,
   onCheckPublication,
   refreshVersion,
+  summaryVersion,
 }: {
   dataset: MonitorDataset;
   run?: MonitorRun;
   onSelectRun: (id: string) => void;
   onCheckPublication: (id: string) => Promise<RemoteCheck>;
   refreshVersion: number;
+  summaryVersion: number;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [detail, setDetail] = useState<MonitorDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [retryVersion, setRetryVersion] = useState(0);
+  const needsRetry = useRef(false);
   const runId = run?.run_id;
   const signature = run?.detail_signature;
   useEffect(() => {
-    setDetail(null);
+    setDetail((previous) =>
+      expanded &&
+      previous?.dataset_id === dataset.id &&
+      previous.run_id === runId
+        ? previous
+        : null,
+    );
     setError(null);
     setLoading(false);
+    needsRetry.current = false;
     if (!expanded || !runId) return;
     const controller = new AbortController();
     setLoading(true);
     void fetchMonitorDetail(dataset.id, runId, controller.signal)
       .then((result) => {
+        if (controller.signal.aborted) return;
         if (
-          !controller.signal.aborted &&
-          result.dataset_id === dataset.id &&
-          result.run_id === runId &&
-          result.signature === signature
-        )
-          setDetail(result);
+          result.dataset_id !== dataset.id ||
+          result.run_id !== runId ||
+          (!result.updating && result.signature !== signature)
+        ) {
+          needsRetry.current = true;
+          setError("Detail snapshot changed; waiting for the next refresh.");
+          return;
+        }
+        needsRetry.current = result.updating;
+        setDetail((previous) =>
+          result.updating &&
+          result.signature === null &&
+          previous?.dataset_id === dataset.id &&
+          previous.run_id === runId &&
+          previous.signature !== null
+            ? {
+                ...previous,
+                updating: true,
+                diagnostics: [
+                  ...previous.diagnostics.filter(
+                    (old) =>
+                      !result.diagnostics.some(
+                        (item) => item.code === old.code,
+                      ),
+                  ),
+                  ...result.diagnostics,
+                ],
+              }
+            : result,
+        );
       })
       .catch((reason) => {
-        if (!controller.signal.aborted)
+        if (!controller.signal.aborted) {
+          needsRetry.current = true;
           setError(
             reason instanceof Error
               ? reason.message
               : "Could not load details.",
           );
+        }
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [dataset.id, runId, signature, expanded, refreshVersion]);
+  }, [dataset.id, runId, signature, expanded, refreshVersion, retryVersion]);
+  useEffect(() => {
+    // A stale/failed detail gets one retry after a later successful summary.
+    // Detail completion never triggers this effect, so Updating cannot spin.
+    if (needsRetry.current && isVisible()) {
+      needsRetry.current = false;
+      setRetryVersion((value) => value + 1);
+    }
+  }, [summaryVersion]);
   return (
     <DatasetMonitorRow
       dataset={dataset}
       selectedRunId={runId ?? null}
       detail={detail}
+      detailStale={
+        !!detail && (loading || !!error || detail.signature !== signature)
+      }
       loading={loading}
       error={error}
       onSelectRun={onSelectRun}
@@ -149,6 +198,7 @@ export default function MonitorPage() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [summaryVersion, setSummaryVersion] = useState(0);
   const refresh = useRef<(manual?: boolean) => void>(() => {});
   const checks = useRef(new Map<string, RemoteCheck>());
   const checkControllers = useRef(new Set<AbortController>());
@@ -210,6 +260,7 @@ export default function MonitorPage() {
           }),
         }));
         setSnapshot({ ...result, datasets });
+        setSummaryVersion((value) => value + 1);
         setSelections((previous) => {
           const next = Object.fromEntries(
             datasets.flatMap((dataset) => {
@@ -387,6 +438,7 @@ export default function MonitorPage() {
           onSelectRun={(id) => selectRun(dataset.id, id)}
           onCheckPublication={checkPublication}
           refreshVersion={refreshVersion}
+          summaryVersion={summaryVersion}
         />
         {descendants.length > 0 && (
           <div className={styles.derivatives}>

@@ -205,7 +205,8 @@ test("ignores late detail responses after run and signature changes and aborts c
   await waitFor(() =>
     expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(3),
   );
-  expect(ui.queryByText(/Loaded two-sig/)).toBeNull();
+  expect(!!ui.queryByText(/Loaded two-sig/)).toBe(true);
+  expect(!!ui.queryByText(/Stale details/)).toBe(true);
   const signal = (client.fetchMonitorDetail as ReturnType<typeof mock>).mock
     .calls[2][2] as AbortSignal;
   await toggle(ui.container, false);
@@ -484,4 +485,210 @@ test("backend configuration failures explain the backend connection without clai
     ),
   );
   expect(!!ui.queryByText(/No datasets found/)).toBe(false);
+});
+
+function promptDetail(): client.MonitorDetail {
+  return {
+    ...detail(),
+    scanned_at: "2026-09-16T00:15:00Z",
+    prompts: {
+      eligible_episodes: 8,
+      evaluated_episodes: 8,
+      unknown_episode_ids: [],
+      retained_frames: 100,
+      unlabeled_frames: 0,
+      ambiguous_frames: 0,
+      complete: true,
+      rows: [
+        {
+          text: "Retained prompt evidence",
+          frames: 100,
+          seconds: 2,
+          episodes: 8,
+          ratio: 1,
+        },
+      ],
+    },
+  };
+}
+async function visibleRefresh() {
+  await act(async () => {
+    visible = false;
+    document.dispatchEvent(new window.Event("visibilitychange"));
+    visible = true;
+    document.dispatchEvent(new window.Event("visibilitychange"));
+  });
+}
+
+test("updating prior-signature detail retains prompts, timestamp and diagnostic and recovers on later same-signature summary", async () => {
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(promptDetail());
+  const ui = await ready();
+  await toggle(ui.container);
+  const next = summary();
+  next.datasets[0].runs[0].detail_signature = "new-sig";
+  spyOn(client, "fetchMonitorSummary").mockResolvedValue(next);
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue({
+    ...promptDetail(),
+    updating: true,
+    diagnostics: [
+      {
+        code: "snapshot_changing",
+        message:
+          "Metadata is changing; retry after the current update finishes.",
+        severity: "warning",
+      },
+    ],
+  });
+  await visibleRefresh();
+  await waitFor(() =>
+    expect(
+      !!ui.queryByText(
+        /Updating · showing the last consistent detail snapshot from 2026-09-16T00:15:00Z/,
+      ),
+    ).toBe(true),
+  );
+  expect(!!ui.queryByText("Retained prompt evidence")).toBe(true);
+  expect(!!ui.queryByText(/Metadata is changing/)).toBe(true);
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(2);
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue({
+    ...promptDetail(),
+    signature: "new-sig",
+    diagnostics: [
+      { code: "ok", message: "Recovered detail", severity: "info" },
+    ],
+  });
+  await visibleRefresh();
+  await waitFor(() => expect(!!ui.queryByText(/Recovered detail/)).toBe(true));
+  expect(!!ui.queryByText(/Updating ·/)).toBe(false);
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(3);
+  await visibleRefresh();
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(3);
+});
+
+test("first-load Updating with null signature is visible and retries only on later summary", async () => {
+  const pending: client.MonitorDetail = {
+    ...detail(),
+    signature: null,
+    scanned_at: null,
+    updating: true,
+    diagnostics: [
+      {
+        code: "snapshot_changing",
+        message: "Metadata is changing",
+        severity: "warning",
+      },
+    ],
+  };
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(pending);
+  const ui = await ready();
+  await toggle(ui.container);
+  expect(
+    !!ui.queryByText(
+      /Updating · no consistent detail snapshot is available yet/,
+    ),
+  ).toBe(true);
+  expect(!!ui.queryByText(/Metadata is changing/)).toBe(true);
+  await act(async () => {});
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(1);
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(promptDetail());
+  await visibleRefresh();
+  await waitFor(() =>
+    expect(!!ui.queryByText("Retained prompt evidence")).toBe(true),
+  );
+  await toggle(ui.container, false);
+  await visibleRefresh();
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(2);
+});
+
+test("manual detail revalidation preserves same-run prompts while pending and after failure then retries next summary", async () => {
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(promptDetail());
+  const ui = await ready();
+  await toggle(ui.container);
+  let reject!: (reason: Error) => void;
+  spyOn(client, "fetchMonitorDetail").mockReturnValue(
+    new Promise((_resolve, fail) => {
+      reject = fail;
+    }),
+  );
+  fireEvent.click(ui.getByRole("button", { name: "Refresh" }));
+  await waitFor(() =>
+    expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(2),
+  );
+  expect(!!ui.queryByText("Retained prompt evidence")).toBe(true);
+  expect(
+    !!ui.queryByText(
+      /Stale details · showing the last consistent detail snapshot from 2026-09-16T00:15:00Z/,
+    ),
+  ).toBe(true);
+  await act(async () => reject(new Error("Detail unavailable")));
+  expect(!!ui.queryByText("Retained prompt evidence")).toBe(true);
+  expect(!!ui.queryByText("Detail unavailable")).toBe(true);
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(promptDetail());
+  await visibleRefresh();
+  await waitFor(() =>
+    expect(!!ui.queryByText("Detail unavailable")).toBe(false),
+  );
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(3);
+});
+
+test("an Updating response cannot carry another run's retained snapshot into the new run", async () => {
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(promptDetail());
+  const ui = await ready();
+  await toggle(ui.container);
+  const pending = deferred<client.MonitorDetail>();
+  spyOn(client, "fetchMonitorDetail").mockReturnValueOnce(pending.promise);
+  fireEvent.click(ui.getByRole("button", { name: "Refresh" }));
+  await waitFor(() =>
+    expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(2),
+  );
+  fireEvent.change(ui.getByLabelText("Annotation run for source"), {
+    target: { value: "two" },
+  });
+  await act(async () => pending.resolve({ ...promptDetail(), updating: true }));
+  expect(!!ui.queryByText("Retained prompt evidence")).toBe(false);
+  expect(!!ui.queryByText(/Loaded one-sig/)).toBe(false);
+});
+
+test("a null-signature Updating response retains the browser's same-run last good snapshot", async () => {
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(promptDetail());
+  const ui = await ready();
+  await toggle(ui.container);
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue({
+    ...detail(),
+    signature: null,
+    updating: true,
+    diagnostics: [
+      {
+        code: "snapshot_changing",
+        message: "No stable server snapshot yet",
+        severity: "warning",
+      },
+    ],
+  });
+  fireEvent.click(ui.getByRole("button", { name: "Refresh" }));
+  await waitFor(() =>
+    expect(!!ui.queryByText(/No stable server snapshot yet/)).toBe(true),
+  );
+  expect(!!ui.queryByText("Retained prompt evidence")).toBe(true);
+  expect(
+    !!ui.queryByText(
+      /Updating · showing the last consistent detail snapshot from 2026-09-16T00:15:00Z/,
+    ),
+  ).toBe(true);
+});
+
+test("a non-Updating mismatched signature is rejected and retried after the next summary", async () => {
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue({
+    ...detail("one", "unrelated"),
+    prompts: promptDetail().prompts,
+  });
+  const ui = await ready();
+  await toggle(ui.container);
+  expect(!!ui.queryByText("Retained prompt evidence")).toBe(false);
+  expect(!!ui.queryByText(/Detail snapshot changed/)).toBe(true);
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(1);
+  spyOn(client, "fetchMonitorDetail").mockResolvedValue(promptDetail());
+  await visibleRefresh();
+  expect(!!ui.queryByText("Retained prompt evidence")).toBe(true);
+  expect(client.fetchMonitorDetail).toHaveBeenCalledTimes(2);
 });

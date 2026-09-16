@@ -17,6 +17,7 @@ export interface DatasetMonitorRowProps {
   dataset: MonitorDataset;
   selectedRunId: string | null;
   detail: MonitorDetail | null;
+  detailStale?: boolean;
   loading: boolean;
   error: string | null;
   onSelectRun: (runId: string) => void;
@@ -413,6 +414,7 @@ export function DatasetMonitorRow({
   dataset,
   selectedRunId,
   detail,
+  detailStale = false,
   loading,
   error,
   onSelectRun,
@@ -426,7 +428,9 @@ export function DatasetMonitorRow({
   const currentDetail =
     detail?.dataset_id === dataset.id &&
     detail.run_id === (run?.run_id ?? null) &&
-    detail.signature === (run?.detail_signature ?? null)
+    (detail.updating ||
+      detailStale ||
+      detail.signature === (run?.detail_signature ?? null))
       ? detail
       : null;
   const metrics = run?.metrics;
@@ -678,7 +682,19 @@ export function DatasetMonitorRow({
           )}
           {currentDetail?.updating && (
             <p role="status" className={styles.warning}>
-              Updating · showing the last consistent detail snapshot from{" "}
+              {currentDetail.signature === null ? (
+                "Updating · no consistent detail snapshot is available yet."
+              ) : (
+                <>
+                  Updating · showing the last consistent detail snapshot from{" "}
+                  {currentDetail.scanned_at ?? "an unknown time"}.
+                </>
+              )}
+            </p>
+          )}
+          {currentDetail && detailStale && !currentDetail.updating && (
+            <p role="status" className={styles.warning}>
+              Stale details · showing the last consistent detail snapshot from{" "}
               {currentDetail.scanned_at ?? "an unknown time"}.
             </p>
           )}
