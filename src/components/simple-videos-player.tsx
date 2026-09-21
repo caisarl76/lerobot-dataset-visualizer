@@ -6,6 +6,7 @@ import { FaExpand, FaCompress, FaTimes, FaEye } from "react-icons/fa";
 import type { VideoInfo } from "@/types";
 import { proxyHfUrl } from "@/utils/auth";
 import { VideoOverlayCanvas } from "./video-overlay-canvas";
+import { ColormappedVideo } from "./colormapped-video";
 
 const THRESHOLDS = {
   VIDEO_SEGMENT_BOUNDARY: 0.05,
@@ -412,7 +413,7 @@ export const SimpleVideosPlayer = ({
                   ref={videoRefCallbacksRef.current[idx]}
                   className={`w-full object-contain ${
                     isEnlarged ? "max-h-[90vh] max-w-[90vw]" : ""
-                  }`}
+                  } ${info.isGrayscale ? "opacity-0" : ""}`}
                   muted
                   preload="auto"
                   crossOrigin="anonymous"
@@ -420,6 +421,14 @@ export const SimpleVideosPlayer = ({
                   <source src={proxyHfUrl(info.url)} type="video/mp4" />
                   Your browser does not support the video tag.
                 </video>
+                {/* Grayscale feeds: the hidden <video> above still decodes and
+                    drives timing; this canvas paints its frames recolored with
+                    the viridis colormap. */}
+                <ColormappedVideo
+                  videoEl={videoEls[idx] ?? null}
+                  active={info.isGrayscale}
+                  range={info.colormapRange}
+                />
                 {/* VQA bbox/keypoint overlay. Reads atoms + drawMode from
                     AnnotationsContext; pointer-events fall through when
                     not in draw mode so video controls remain usable. */}
