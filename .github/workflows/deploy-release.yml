@@ -11,8 +11,14 @@ on:
   # to run this workflow manually from the Actions tab
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   sync-to-hub:
+    # Forks must configure their own Space before enabling deployment.
+    if: github.repository == 'huggingface/lerobot-dataset-visualizer'
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -20,10 +26,12 @@ jobs:
           fetch-depth: 0
           lfs: true
           ref: main
+
       - name: Sync to HF Space
-        uses: huggingface/hub-sync@4d340790b2a7cc86e598dce1c29a0c7c6adf3d62 # main
+        uses: huggingface/hub-sync@fdffea8e04104d0bd4e3181c5feb3025f0433ff5 # v0.3.0
         with:
           github_repo_id: huggingface/lerobot-dataset-visualizer
           huggingface_repo_id: lerobot/visualize_dataset
           repo_type: space
+          space_sdk: docker
           hf_token: ${{ secrets.HF_TOKEN }}

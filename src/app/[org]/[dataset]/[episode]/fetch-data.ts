@@ -16,11 +16,6 @@ import {
   processChartDataGroups,
   groupRowBySuffix,
 } from "@/utils/dataProcessing";
-import {
-  buildV3VideoPath,
-  buildV3DataPath,
-  buildV3EpisodesMetadataPath,
-} from "@/utils/stringFormatting";
 import { bigIntToNumber } from "@/utils/typeGuards";
 import {
   isGrayscaleShape,
@@ -28,8 +23,367 @@ import {
   depthEncodingFromFeature,
 } from "@/utils/colormaps";
 import type { VideoInfo, AdjacentEpisodeVideos } from "@/types";
+import {
+  LeRobotDataset,
+  formatPathTemplate,
+  episodesMetadataPath,
+} from "@huggingface/lerobot";
+import type { LeRobotEpisode } from "@huggingface/lerobot";
 
 const SERIES_NAME_DELIMITER = CHART_CONFIG.SERIES_NAME_DELIMITER;
+
+// The package assumes a Hub endpoint ending in /datasets. Local datasets and
+// arbitrary legacy bases retain the existing URL/auth helpers and metadata reader.
+const DATASET_BASE = (
+  process.env.NEXT_PUBLIC_DATASET_URL ||
+  process.env.DATASET_URL ||
+  "https://huggingface.co/datasets"
+).replace(/\/+$/, "");
+
+function needsLegacyLoader(repoId: string, version: string): boolean {
+  return (
+    version === "v3.1" ||
+    repoId.startsWith("local/") ||
+    !DATASET_BASE.endsWith("/datasets")
+  );
+}
+
+function leRobotDataset(repoId: string): LeRobotDataset {
+  return new LeRobotDataset(repoId, {
+    endpoint: DATASET_BASE.replace(/\/datasets$/, ""),
+    additionalFetchHeaders: authHeaders(
+      `${DATASET_BASE}/${repoId}/resolve/main/meta/info.json`,
+    ),
+  });
+}
+
+/** Normalize the layouts unsupported by the package without exposing backend URLs. */
+function legacyEpisode(
+  repoId: string,
+  version: string,
+  info: DatasetMetadata,
+  row: Record<string, unknown>,
+): LeRobotEpisode {
+  const metadata = parseEpisodeRowSimple(row);
+  const pathVars = {
+    chunk_index: metadata.data_chunk_index,
+    file_index: metadata.data_file_index,
+  };
+  return {
+    index: metadata.episode_index,
+    length: metadata.length,
+    durationSec: metadata.length / info.fps,
+    tasks: metadata.tasks ?? [],
+    data: {
+      url: buildVersionedUrl(
+        repoId,
+        version,
+        formatPathTemplate(info.data_path, pathVars),
+      ),
+      fromRow: metadata.dataset_from_index,
+      toRow: metadata.dataset_to_index,
+    },
+    videos: info.video_path
+      ? Object.entries(info.features)
+          .filter(([, feature]) => feature.dtype === "video")
+          .map(([cameraKey]) => {
+            const prefix = `videos/${cameraKey}/`;
+            return {
+              cameraKey,
+              url: buildVersionedUrl(
+                repoId,
+                version,
+                formatPathTemplate(info.video_path, {
+                  video_key: cameraKey,
+                  chunk_index: Number(
+                    metadata[`${prefix}chunk_index`] ??
+                      metadata.video_chunk_index,
+                  ),
+                  file_index: Number(
+                    metadata[`${prefix}file_index`] ??
+                      metadata.video_file_index,
+                  ),
+                }),
+              ),
+              fromSec: Number(
+                metadata[`${prefix}from_timestamp`] ??
+                  metadata.video_from_timestamp,
+              ),
+              toSec: Number(
+                metadata[`${prefix}to_timestamp`] ??
+                  metadata.video_to_timestamp,
+              ),
+            };
+          })
+      : [],
+  };
+}
+
+/** Read a single index range on the Hub, retaining v3.1/local compatibility. */
+async function loadLeRobotEpisode(
+  repoId: string,
+  version: string,
+  info: DatasetMetadata,
+  episodeId: number,
+): Promise<LeRobotEpisode> {
+  if (!needsLegacyLoader(repoId, version)) {
+    const [episode] = await leRobotDataset(repoId).episodes({
+      offset: episodeId,
+      limit: 1,
+    });
+    if (episode) return episode;
+    if (version !== "v3.0") {
+      throw new Error(`Episode ${episodeId} not found in ${repoId}`);
+    }
+  }
+  // The package caps v3 index traversal at 64 files. Preserve larger indexes.
+  for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
+    for (const row of rows) {
+      if (parseEpisodeRowSimple(row).episode_index === episodeId) {
+        return legacyEpisode(repoId, version, info, row);
+      }
+    }
+  }
+  throw new Error(`Episode ${episodeId} not found in ${repoId}`);
+}
+
+async function loadLeRobotEpisodes(
+  repoId: string,
+  version: string,
+  info: DatasetMetadata,
+): Promise<LeRobotEpisode[]> {
+  if (!needsLegacyLoader(repoId, version)) {
+    const episodes = await leRobotDataset(repoId).episodes({
+      offset: 0,
+      limit: info.total_episodes,
+    });
+    if (episodes.length === info.total_episodes) return episodes;
+    // A capped package result must not silently truncate statistics/overviews.
+  }
+  const episodes: LeRobotEpisode[] = [];
+  for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
+    episodes.push(
+      ...rows.map((row) => legacyEpisode(repoId, version, info, row)),
+    );
+  }
+  return episodes;
+}
+
+async function loadVideosV2(
+  repoId: string,
+  version: string,
+  info: DatasetMetadata,
+  episodeId: number,
+): Promise<VideoInfo[]> {
+  if (!info.video_path) return [];
+  // V2 URLs need no episode index; avoid the package's JSONL size limit.
+  return Object.entries(info.features)
+    .filter(([, feature]) => feature.dtype === "video")
+    .map(([cameraKey, feature]) => ({
+      filename: cameraKey,
+      url: buildVersionedUrl(
+        repoId,
+        version,
+        formatStringWithVars(info.video_path, {
+          video_key: cameraKey,
+          episode_chunk: Math.floor(
+            episodeId / Math.max(1, info.chunks_size || 1000),
+          )
+            .toString()
+            .padStart(PADDING.CHUNK_INDEX, "0"),
+          episode_index: episodeId
+            .toString()
+            .padStart(PADDING.EPISODE_INDEX, "0"),
+        }),
+      ),
+      isGrayscale: isGrayscaleShape(feature.shape),
+    }));
+}
+
+async function* iterateEpisodeMetadataFilesV3(
+  repoId: string,
+  version: string,
+): AsyncGenerator<Record<string, unknown>[], void, unknown> {
+  let chunkIndex = 0;
+  let fileIndex = 0;
+
+  while (true) {
+    const path = episodesMetadataPath(chunkIndex, fileIndex);
+    const url = buildVersionedUrl(repoId, version, path);
+    let rows: Record<string, unknown>[];
+    try {
+      const buf = await fetchParquetFile(url);
+      rows = await readParquetAsObjects(buf, []);
+    } catch {
+      if (fileIndex === 0) return;
+      chunkIndex++;
+      fileIndex = 0;
+      continue;
+    }
+
+    if (rows.length === 0) {
+      if (fileIndex === 0) return;
+      chunkIndex++;
+      fileIndex = 0;
+      continue;
+    }
+
+    yield rows;
+    fileIndex++;
+  }
+}
+
+function parseEpisodeRowSimple(
+  row: Record<string, unknown>,
+): EpisodeMetadataV3 {
+  // v3.0 uses named keys in the episode metadata
+  if (row && typeof row === "object") {
+    // Check if this is v3.0 format with named keys
+    if ("episode_index" in row) {
+      // v3.0 format - use named keys
+      // Convert BigInt values to numbers
+      const toBigIntSafe = (value: unknown): number => {
+        if (typeof value === "bigint") return Number(value);
+        if (typeof value === "number") return value;
+        if (typeof value === "string") return parseInt(value) || 0;
+        return 0;
+      };
+
+      const toNumSafe = (value: unknown): number => {
+        if (typeof value === "number") return value;
+        if (typeof value === "bigint") return Number(value);
+        if (typeof value === "string") return parseFloat(value) || 0;
+        return 0;
+      };
+
+      // Handle video metadata - look for video-specific keys
+      const videoKeys = Object.keys(row).filter(
+        (key) => key.includes("videos/") && key.includes("/chunk_index"),
+      );
+      let videoChunkIndex = 0,
+        videoFileIndex = 0,
+        videoFromTs = 0,
+        videoToTs = 30;
+      if (videoKeys.length > 0) {
+        const videoBaseName = videoKeys[0].replace("/chunk_index", "");
+        videoChunkIndex = toBigIntSafe(row[`${videoBaseName}/chunk_index`]);
+        videoFileIndex = toBigIntSafe(row[`${videoBaseName}/file_index`]);
+        videoFromTs = toNumSafe(row[`${videoBaseName}/from_timestamp`]);
+        videoToTs = toNumSafe(row[`${videoBaseName}/to_timestamp`]) || 30;
+      }
+
+      // lerobot writes episode.tasks as list[str] (v3.0 multi-task support).
+      const rawTasks = row["tasks"];
+      const tasks = Array.isArray(rawTasks)
+        ? rawTasks.filter((t): t is string => typeof t === "string")
+        : undefined;
+
+      const episodeData: EpisodeMetadataV3 = {
+        episode_index: toBigIntSafe(row["episode_index"]),
+        data_chunk_index: toBigIntSafe(row["data/chunk_index"]),
+        data_file_index: toBigIntSafe(row["data/file_index"]),
+        dataset_from_index: toBigIntSafe(row["dataset_from_index"]),
+        dataset_to_index: toBigIntSafe(row["dataset_to_index"]),
+        length: toBigIntSafe(row["length"]),
+        video_chunk_index: videoChunkIndex,
+        video_file_index: videoFileIndex,
+        video_from_timestamp: videoFromTs,
+        video_to_timestamp: videoToTs,
+        ...(tasks && tasks.length > 0 ? { tasks } : {}),
+      };
+
+      // Store per-camera metadata for extractVideoInfoV3WithSegmentation
+      Object.keys(row).forEach((key) => {
+        if (key.startsWith("videos/")) {
+          const val = row[key];
+          episodeData[key] =
+            typeof val === "bigint"
+              ? Number(val)
+              : typeof val === "number" || typeof val === "string"
+                ? val
+                : 0;
+        }
+      });
+
+      return episodeData as EpisodeMetadataV3;
+    } else {
+      // Fallback to numeric keys for compatibility
+      const toNum = (v: unknown, fallback = 0): number =>
+        typeof v === "number"
+          ? v
+          : typeof v === "bigint"
+            ? Number(v)
+            : fallback;
+      return {
+        episode_index: toNum(row["0"]),
+        data_chunk_index: toNum(row["1"]),
+        data_file_index: toNum(row["2"]),
+        dataset_from_index: toNum(row["3"]),
+        dataset_to_index: toNum(row["4"]),
+        video_chunk_index: toNum(row["5"]),
+        video_file_index: toNum(row["6"]),
+        video_from_timestamp: toNum(row["7"]),
+        video_to_timestamp: toNum(row["8"], 30),
+        length: toNum(row["9"], 30),
+      };
+    }
+  }
+
+  // Fallback if parsing fails
+  const fallback = {
+    episode_index: 0,
+    data_chunk_index: 0,
+    data_file_index: 0,
+    dataset_from_index: 0,
+    dataset_to_index: 0,
+    video_chunk_index: 0,
+    video_file_index: 0,
+    video_from_timestamp: 0,
+    video_to_timestamp: 30,
+    length: 30,
+  };
+
+  return fallback;
+}
+
+function toVideosInfo(
+  episode: LeRobotEpisode,
+  info: DatasetMetadata,
+  segmented: boolean,
+): VideoInfo[] {
+  return episode.videos.map((video) => ({
+    filename: video.cameraKey,
+    url: video.url,
+    isGrayscale: isGrayscaleShape(info.features[video.cameraKey]?.shape ?? []),
+    ...(segmented
+      ? {
+          isSegmented: true,
+          segmentStart: video.fromSec,
+          segmentEnd: video.toSec,
+          segmentDuration: video.toSec - video.fromSec,
+        }
+      : {}),
+  }));
+}
+
+/** Adapts the package's episode onto the shape the chart loader already consumes. */
+function toEpisodeMetadataV3(episode: LeRobotEpisode): EpisodeMetadataV3 {
+  const primary = episode.videos[0];
+  return {
+    episode_index: episode.index,
+    data_chunk_index: 0,
+    data_file_index: 0,
+    dataset_from_index: episode.data.fromRow,
+    dataset_to_index: episode.data.toRow,
+    /// Unused downstream: the package resolves the video URL itself.
+    video_chunk_index: 0,
+    video_file_index: 0,
+    video_from_timestamp: primary?.fromSec ?? 0,
+    video_to_timestamp: primary?.toSec ?? episode.durationSec,
+    length: episode.length,
+    tasks: episode.tasks,
+  };
+}
 
 export type CameraInfo = { name: string; width: number; height: number };
 
@@ -488,45 +842,14 @@ export async function getAdjacentEpisodesVideoInfo(
       const episodeId = currentEpisodeId + offset;
       if (episodeId >= 0 && episodeId < totalEpisodes) {
         try {
-          let videosInfo: VideoInfo[] = [];
-
-          if (version === "v3.0" || version === "v3.1") {
-            const episodeMetadata = await loadEpisodeMetadataV3Simple(
-              repoId,
-              version,
-              episodeId,
-            );
-            videosInfo = extractVideoInfoV3WithSegmentation(
-              repoId,
-              version,
-              info,
-              episodeMetadata,
-            );
-          } else {
-            // For v2.x, use simpler video info extraction
-            if (info.video_path) {
-              const chunkSize = Math.max(1, info.chunks_size || 1000);
-              const episode_chunk = Math.floor(episodeId / chunkSize);
-              videosInfo = Object.entries(info.features)
-                .filter(([, value]) => value.dtype === "video")
-                .map(([key, value]) => {
-                  const videoPath = formatStringWithVars(info.video_path!, {
-                    video_key: key,
-                    episode_chunk: episode_chunk
-                      .toString()
-                      .padStart(PADDING.CHUNK_INDEX, "0"),
-                    episode_index: episodeId
-                      .toString()
-                      .padStart(PADDING.EPISODE_INDEX, "0"),
-                  });
-                  return {
-                    filename: key,
-                    url: buildVersionedUrl(repoId, version, videoPath),
-                    isGrayscale: isGrayscaleShape(value.shape),
-                  };
-                });
-            }
-          }
+          const videosInfo =
+            version === "v3.0" || version === "v3.1"
+              ? toVideosInfo(
+                  await loadLeRobotEpisode(repoId, version, info, episodeId),
+                  info,
+                  true,
+                )
+              : await loadVideosV2(repoId, version, info, episodeId);
 
           adjacentVideos.push({ episodeId, videosInfo });
         } catch {
@@ -577,27 +900,7 @@ async function getEpisodeDataV2(
           .filter((x) => !isNaN(x));
 
   // Videos information
-  const videosInfo =
-    info.video_path !== null
-      ? Object.entries(info.features)
-          .filter(([, value]) => value.dtype === "video")
-          .map(([key, value]) => {
-            const videoPath = formatStringWithVars(info.video_path!, {
-              video_key: key,
-              episode_chunk: episode_chunk
-                .toString()
-                .padStart(PADDING.CHUNK_INDEX, "0"),
-              episode_index: episodeId
-                .toString()
-                .padStart(PADDING.EPISODE_INDEX, "0"),
-            });
-            return {
-              filename: key,
-              url: buildVersionedUrl(repoId, version, videoPath),
-              isGrayscale: isGrayscaleShape(value.shape),
-            };
-          })
-      : [];
+  const videosInfo = await loadVideosV2(repoId, version, info, episodeId);
 
   // Exclude specific columns
   const excludedColumns = EXCLUDED_COLUMNS.V2 as readonly string[];
@@ -805,20 +1108,14 @@ async function getEpisodeDataV3(
 
   const episodes = Array.from({ length: info.total_episodes }, (_, i) => i);
 
-  // Load episode metadata to get timestamps for episode 0
-  const episodeMetadata = await loadEpisodeMetadataV3Simple(
-    repoId,
-    version,
-    episodeId,
-  );
-
-  // Create video info with segmentation using the metadata
-  const videosInfo = extractVideoInfoV3WithSegmentation(
+  const leRobotEpisode = await loadLeRobotEpisode(
     repoId,
     version,
     info,
-    episodeMetadata,
+    episodeId,
   );
+  const episodeMetadata = toEpisodeMetadataV3(leRobotEpisode);
+  const videosInfo = toVideosInfo(leRobotEpisode, info, true);
 
   // Load episode data for charts
   const {
@@ -828,7 +1125,13 @@ async function getEpisodeDataV3(
     task,
     languageAtoms,
     frameTimestamps,
-  } = await loadEpisodeDataV3(repoId, version, info, episodeMetadata);
+  } = await loadEpisodeDataV3(
+    repoId,
+    version,
+    info,
+    episodeMetadata,
+    leRobotEpisode.data.url,
+  );
 
   const duration = episodeMetadata.length
     ? episodeMetadata.length / info.fps
@@ -855,6 +1158,7 @@ async function loadEpisodeDataV3(
   version: string,
   info: DatasetMetadata,
   episodeMetadata: EpisodeMetadataV3,
+  dataUrl: string,
 ): Promise<{
   chartDataGroups: ChartRow[][];
   flatChartData: Record<string, number>[];
@@ -863,13 +1167,7 @@ async function loadEpisodeDataV3(
   languageAtoms?: import("@/types/language.types").LanguageAtom[];
   frameTimestamps?: number[];
 }> {
-  // Build data file path using chunk and file indices
-  const dataChunkIndex = bigIntToNumber(episodeMetadata.data_chunk_index, 0);
-  const dataFileIndex = bigIntToNumber(episodeMetadata.data_file_index, 0);
-  const dataPath = buildV3DataPath(dataChunkIndex, dataFileIndex);
-
   try {
-    const dataUrl = buildVersionedUrl(repoId, version, dataPath);
     const parquetFile = await fetchParquetFile(dataUrl);
     const v3DataColumns = Array.from(
       new Set([
@@ -1325,242 +1623,6 @@ function processEpisodeDataForCharts(
   return { chartDataGroups, flatChartData: chartData, ignoredColumns };
 }
 
-// Video info extraction with segmentation for v3.0
-function extractVideoInfoV3WithSegmentation(
-  repoId: string,
-  version: string,
-  info: DatasetMetadata,
-  episodeMetadata: EpisodeMetadataV3,
-): VideoInfo[] {
-  // Get video features from dataset info
-  const videoFeatures = Object.entries(info.features).filter(
-    ([, value]) => value.dtype === "video",
-  );
-
-  const videosInfo = videoFeatures.map(([videoKey, videoFeature]) => {
-    // Check if we have per-camera metadata in the episode row
-    const cameraSpecificKeys = Object.keys(episodeMetadata).filter((key) =>
-      key.startsWith(`videos/${videoKey}/`),
-    );
-
-    let chunkIndex: number,
-      fileIndex: number,
-      segmentStart: number,
-      segmentEnd: number;
-
-    const toNum = (v: string | number | string[] | undefined): number => {
-      if (typeof v === "string") return parseFloat(v) || 0;
-      if (typeof v === "number") return v;
-      return 0;
-    };
-
-    if (cameraSpecificKeys.length > 0) {
-      chunkIndex = toNum(episodeMetadata[`videos/${videoKey}/chunk_index`]);
-      fileIndex = toNum(episodeMetadata[`videos/${videoKey}/file_index`]);
-      segmentStart =
-        toNum(episodeMetadata[`videos/${videoKey}/from_timestamp`]) || 0;
-      segmentEnd =
-        toNum(episodeMetadata[`videos/${videoKey}/to_timestamp`]) || 30;
-    } else {
-      chunkIndex = episodeMetadata.video_chunk_index || 0;
-      fileIndex = episodeMetadata.video_file_index || 0;
-      segmentStart = episodeMetadata.video_from_timestamp || 0;
-      segmentEnd = episodeMetadata.video_to_timestamp || 30;
-    }
-
-    // Convert BigInt to number for timestamps
-    const startNum = bigIntToNumber(segmentStart);
-    const endNum = bigIntToNumber(segmentEnd);
-
-    const videoPath = buildV3VideoPath(
-      videoKey,
-      bigIntToNumber(chunkIndex, 0),
-      bigIntToNumber(fileIndex, 0),
-    );
-    const fullUrl = buildVersionedUrl(repoId, version, videoPath);
-
-    return {
-      filename: videoKey,
-      url: fullUrl,
-      // Enable segmentation with timestamps from metadata
-      isSegmented: true,
-      segmentStart: startNum,
-      segmentEnd: endNum,
-      segmentDuration: endNum - startNum,
-      isGrayscale: isGrayscaleShape(videoFeature.shape),
-    };
-  });
-
-  return videosInfo;
-}
-
-// Walks v3.0 episode-metadata parquet files across chunks/files. A new chunk
-// begins when the current chunk's files run out (404 or empty); iteration ends
-// when file-000 of the next chunk 404s. `chunks_size` caps files per chunk, so
-// large datasets can spill past chunk-000.
-async function* iterateEpisodeMetadataFilesV3(
-  repoId: string,
-  version: string,
-): AsyncGenerator<Record<string, unknown>[], void, unknown> {
-  let chunkIndex = 0;
-  let fileIndex = 0;
-
-  while (true) {
-    const path = buildV3EpisodesMetadataPath(chunkIndex, fileIndex);
-    const url = buildVersionedUrl(repoId, version, path);
-    let rows: Record<string, unknown>[];
-    try {
-      const buf = await fetchParquetFile(url);
-      rows = await readParquetAsObjects(buf, []);
-    } catch {
-      if (fileIndex === 0) return;
-      chunkIndex++;
-      fileIndex = 0;
-      continue;
-    }
-
-    if (rows.length === 0) {
-      if (fileIndex === 0) return;
-      chunkIndex++;
-      fileIndex = 0;
-      continue;
-    }
-
-    yield rows;
-    fileIndex++;
-  }
-}
-
-// Metadata loading for v3.0 episodes
-async function loadEpisodeMetadataV3Simple(
-  repoId: string,
-  version: string,
-  episodeId: number,
-): Promise<EpisodeMetadataV3> {
-  for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
-    for (const row of rows) {
-      if (parseEpisodeRowSimple(row).episode_index === episodeId) {
-        return parseEpisodeRowSimple(row);
-      }
-    }
-  }
-  throw new Error(`Episode ${episodeId} not found in metadata`);
-}
-
-// Simple parser for episode row - focuses on key fields for episodes
-function parseEpisodeRowSimple(
-  row: Record<string, unknown>,
-): EpisodeMetadataV3 {
-  // v3.0 uses named keys in the episode metadata
-  if (row && typeof row === "object") {
-    // Check if this is v3.0 format with named keys
-    if ("episode_index" in row) {
-      // v3.0 format - use named keys
-      // Convert BigInt values to numbers
-      const toBigIntSafe = (value: unknown): number => {
-        if (typeof value === "bigint") return Number(value);
-        if (typeof value === "number") return value;
-        if (typeof value === "string") return parseInt(value) || 0;
-        return 0;
-      };
-
-      const toNumSafe = (value: unknown): number => {
-        if (typeof value === "number") return value;
-        if (typeof value === "bigint") return Number(value);
-        if (typeof value === "string") return parseFloat(value) || 0;
-        return 0;
-      };
-
-      // Handle video metadata - look for video-specific keys
-      const videoKeys = Object.keys(row).filter(
-        (key) => key.includes("videos/") && key.includes("/chunk_index"),
-      );
-      let videoChunkIndex = 0,
-        videoFileIndex = 0,
-        videoFromTs = 0,
-        videoToTs = 30;
-      if (videoKeys.length > 0) {
-        const videoBaseName = videoKeys[0].replace("/chunk_index", "");
-        videoChunkIndex = toBigIntSafe(row[`${videoBaseName}/chunk_index`]);
-        videoFileIndex = toBigIntSafe(row[`${videoBaseName}/file_index`]);
-        videoFromTs = toNumSafe(row[`${videoBaseName}/from_timestamp`]);
-        videoToTs = toNumSafe(row[`${videoBaseName}/to_timestamp`]) || 30;
-      }
-
-      // lerobot writes episode.tasks as list[str] (v3.0 multi-task support).
-      const rawTasks = row["tasks"];
-      const tasks = Array.isArray(rawTasks)
-        ? rawTasks.filter((t): t is string => typeof t === "string")
-        : undefined;
-
-      const episodeData: EpisodeMetadataV3 = {
-        episode_index: toBigIntSafe(row["episode_index"]),
-        data_chunk_index: toBigIntSafe(row["data/chunk_index"]),
-        data_file_index: toBigIntSafe(row["data/file_index"]),
-        dataset_from_index: toBigIntSafe(row["dataset_from_index"]),
-        dataset_to_index: toBigIntSafe(row["dataset_to_index"]),
-        length: toBigIntSafe(row["length"]),
-        video_chunk_index: videoChunkIndex,
-        video_file_index: videoFileIndex,
-        video_from_timestamp: videoFromTs,
-        video_to_timestamp: videoToTs,
-        ...(tasks && tasks.length > 0 ? { tasks } : {}),
-      };
-
-      // Store per-camera metadata for extractVideoInfoV3WithSegmentation
-      Object.keys(row).forEach((key) => {
-        if (key.startsWith("videos/")) {
-          const val = row[key];
-          episodeData[key] =
-            typeof val === "bigint"
-              ? Number(val)
-              : typeof val === "number" || typeof val === "string"
-                ? val
-                : 0;
-        }
-      });
-
-      return episodeData as EpisodeMetadataV3;
-    } else {
-      // Fallback to numeric keys for compatibility
-      const toNum = (v: unknown, fallback = 0): number =>
-        typeof v === "number"
-          ? v
-          : typeof v === "bigint"
-            ? Number(v)
-            : fallback;
-      return {
-        episode_index: toNum(row["0"]),
-        data_chunk_index: toNum(row["1"]),
-        data_file_index: toNum(row["2"]),
-        dataset_from_index: toNum(row["3"]),
-        dataset_to_index: toNum(row["4"]),
-        video_chunk_index: toNum(row["5"]),
-        video_file_index: toNum(row["6"]),
-        video_from_timestamp: toNum(row["7"]),
-        video_to_timestamp: toNum(row["8"], 30),
-        length: toNum(row["9"], 30),
-      };
-    }
-  }
-
-  // Fallback if parsing fails
-  const fallback = {
-    episode_index: 0,
-    data_chunk_index: 0,
-    data_file_index: 0,
-    dataset_from_index: 0,
-    dataset_to_index: 0,
-    video_chunk_index: 0,
-    video_file_index: 0,
-    video_from_timestamp: 0,
-    video_to_timestamp: 30,
-    length: 30,
-  };
-
-  return fallback;
-}
-
 // ─── Stats computation ───────────────────────────────────────────
 
 /**
@@ -1617,29 +1679,14 @@ export async function loadAllEpisodeLengthsV3(
   fps: number,
 ): Promise<EpisodeLengthStats | null> {
   try {
-    const allEpisodes: { index: number; length: number }[] = [];
-    let fileIndex = 0;
-    const chunkIndex = 0;
-
-    while (true) {
-      const path = `meta/episodes/chunk-${chunkIndex.toString().padStart(3, "0")}/file-${fileIndex.toString().padStart(3, "0")}.parquet`;
-      const url = buildVersionedUrl(repoId, version, path);
-      try {
-        const buf = await fetchParquetFile(url);
-        const rows = await readParquetAsObjects(buf, []);
-        if (rows.length === 0 && fileIndex > 0) break;
-        for (const row of rows) {
-          const parsed = parseEpisodeRowSimple(row);
-          allEpisodes.push({
-            index: parsed.episode_index,
-            length: parsed.length,
-          });
-        }
-        fileIndex++;
-      } catch {
-        break;
-      }
-    }
+    const { info } = await getDatasetVersionAndInfo(repoId);
+    const allEpisodes = (
+      await loadLeRobotEpisodes(
+        repoId,
+        version,
+        info as unknown as DatasetMetadata,
+      )
+    ).map((episode) => ({ index: episode.index, length: episode.length }));
 
     if (allEpisodes.length === 0) return null;
 
@@ -1761,35 +1808,15 @@ export async function loadAllEpisodeFrameInfo(
   );
 
   if (version === "v3.0" || version === "v3.1") {
-    for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
-      for (const row of rows) {
-        const epIdx = Number(row["episode_index"] ?? 0);
-        if (sampledEpisodeSet && !sampledEpisodeSet.has(epIdx)) continue;
-        for (const cam of cameras) {
-          const cIdx = Number(
-            row[`videos/${cam}/chunk_index`] ?? row["video_chunk_index"] ?? 0,
-          );
-          const fIdx = Number(
-            row[`videos/${cam}/file_index`] ?? row["video_file_index"] ?? 0,
-          );
-          const fromTs = Number(
-            row[`videos/${cam}/from_timestamp`] ??
-              row["video_from_timestamp"] ??
-              0,
-          );
-          const toTs = Number(
-            row[`videos/${cam}/to_timestamp`] ??
-              row["video_to_timestamp"] ??
-              30,
-          );
-          const videoPath = `videos/${cam}/chunk-${cIdx.toString().padStart(3, "0")}/file-${fIdx.toString().padStart(3, "0")}.mp4`;
-          framesByCamera[cam].push({
-            episodeIndex: epIdx,
-            videoUrl: buildVersionedUrl(repoId, version, videoPath),
-            firstFrameTime: fromTs,
-            lastFrameTime: Math.max(0, toTs - 0.05),
-          });
-        }
+    for (const episode of await loadLeRobotEpisodes(repoId, version, info)) {
+      if (sampledEpisodeSet && !sampledEpisodeSet.has(episode.index)) continue;
+      for (const video of episode.videos) {
+        framesByCamera[video.cameraKey]?.push({
+          episodeIndex: episode.index,
+          videoUrl: video.url,
+          firstFrameTime: video.fromSec,
+          lastFrameTime: Math.max(0, video.toSec - 0.05),
+        });
       }
     }
     return { cameras, framesByCamera };
@@ -1923,29 +1950,25 @@ export async function loadCrossEpisodeActionVariance(
   // Collect episode metadata
   type EpMeta = {
     index: number;
-    chunkIdx: number;
-    fileIdx: number;
+    /** v3 only; v2 derives its per-episode path from the index. */
+    dataUrl?: string;
     from: number;
     to: number;
   };
   const allEps: EpMeta[] = [];
 
   if (version === "v3.0" || version === "v3.1") {
-    for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
-      for (const row of rows) {
-        const parsed = parseEpisodeRowSimple(row);
-        allEps.push({
-          index: parsed.episode_index,
-          chunkIdx: parsed.data_chunk_index,
-          fileIdx: parsed.data_file_index,
-          from: parsed.dataset_from_index,
-          to: parsed.dataset_to_index,
-        });
-      }
+    for (const episode of await loadLeRobotEpisodes(repoId, version, info)) {
+      allEps.push({
+        index: episode.index,
+        dataUrl: episode.data.url,
+        from: episode.data.fromRow,
+        to: episode.data.toRow,
+      });
     }
   } else {
     for (let i = 0; i < info.total_episodes; i++) {
-      allEps.push({ index: i, chunkIdx: 0, fileIdx: 0, from: 0, to: 0 });
+      allEps.push({ index: i, from: 0, to: 0 });
     }
   }
 
@@ -1978,7 +2001,7 @@ export async function loadCrossEpisodeActionVariance(
   if (version === "v3.0" || version === "v3.1") {
     const byFile = new Map<string, EpMeta[]>();
     for (const ep of sampled) {
-      const key = `${ep.chunkIdx}-${ep.fileIdx}`;
+      const key = ep.dataUrl ?? "";
       if (!byFile.has(key)) byFile.set(key, []);
       byFile.get(key)!.push(ep);
     }
@@ -1986,13 +2009,10 @@ export async function loadCrossEpisodeActionVariance(
     const fileResults = await Promise.all(
       [...byFile.values()].map(async (eps) => {
         const ep0 = eps[0];
-        const dataPath = `data/chunk-${ep0.chunkIdx.toString().padStart(3, "0")}/file-${ep0.fileIdx.toString().padStart(3, "0")}.parquet`;
         const fileEpActions: { index: number; actions: number[][] }[] = [];
         const fileEpStates: (number[][] | null)[] = [];
         try {
-          const buf = await fetchParquetFile(
-            buildVersionedUrl(repoId, version, dataPath),
-          );
+          const buf = await fetchParquetFile(ep0.dataUrl ?? "");
           const rows = await readParquetAsObjects(
             buf,
             stateKey ? ["index", actionKey, stateKey] : ["index", actionKey],
@@ -2576,16 +2596,13 @@ export async function loadEpisodeFlatChartData(
     return flatChartData;
   }
 
-  const episodeMetadata = await loadEpisodeMetadataV3Simple(
-    repoId,
-    version,
-    episodeId,
-  );
+  const episode = await loadLeRobotEpisode(repoId, version, info, episodeId);
   const { flatChartData } = await loadEpisodeDataV3(
     repoId,
     version,
     info,
-    episodeMetadata,
+    toEpisodeMetadataV3(episode),
+    episode.data.url,
   );
   return flatChartData;
 }

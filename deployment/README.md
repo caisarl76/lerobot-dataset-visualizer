@@ -328,3 +328,25 @@ Use the export path shown alongside its format, mode, and revision when training
 The original 87-episode collection and the current editable checkpoint are
 separate artifacts. See the [acceptance record](../docs/artifacts/dataset-monitor/acceptance.md)
 for verification evidence and limitations.
+
+## Fork deployment workflow
+
+The upstream GitHub Actions Space deployment is restricted to
+`huggingface/lerobot-dataset-visualizer`. Pushing to `caisarl76` or `genonai`
+does not deploy to upstream's `lerobot/visualize_dataset` Space. Local service
+startup is unchanged. To deploy a fork to a Space, explicitly configure its
+repository identity, Space destination, credentials, and job condition first.
+
+## Upstream episode-loader compatibility
+
+The September 21, 2026 merge includes Hugging Face upstream through `80b0f987`.
+Remote v3.0 datasets use `@huggingface/lerobot` for indexed episode lookup.
+Local datasets, v3.1, and custom dataset roots retain the compatible metadata
+reader and destination-scoped authentication. Video URLs remain appropriate
+for browser access; internal backend credentials are not serialized into them.
+
+The pinned JavaScript package currently limits index traversal to 64 files.
+Missing v3.0 episodes or incomplete index listings fall back to the existing
+reader. V2 video URLs continue to use metadata path templates directly, avoiding
+the package's capped JSONL reader. Real-Parquet regression fixtures exercise
+these cases, including camera-specific segment offsets and global frame indices.
