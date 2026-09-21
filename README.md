@@ -57,6 +57,10 @@ This tool is designed to help robotics researchers and practitioners quickly ins
 
 ## Getting Started
 
+For the complete local annotation, review, export, and monitoring workflow, follow
+the [teammate local setup guide](docs/local-setup.md). It uses portable paths and
+an existing VLM endpoint.
+
 ### Prerequisites
 
 This project uses [Bun](https://bun.sh) as its package manager. If you don't have it installed:
